@@ -1,0 +1,1 @@
+Place alt clip model here.
