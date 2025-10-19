@@ -5,11 +5,11 @@ FROM openvino/dev-py:latest AS builder
 WORKDIR /builder
 
 # 安装模型转换所需的依赖
-COPY scripts/requirements_convert.txt.
+COPY scripts/requirements_convert.txt .
 RUN pip install --no-cache-dir -r requirements_convert.txt
 
 # 复制并执行模型转换脚本
-COPY scripts/convert_models.py.
+COPY scripts/convert_models.py .
 # 脚本将自动下载并转换模型到 /models/alt-clip/openvino
 RUN python convert_models.py --output_dir /models/alt-clip/openvino
 
@@ -20,7 +20,7 @@ FROM openvino/runtime:latest
 WORKDIR /app
 
 # 安装运行时依赖
-COPY requirements.txt.
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 从构建阶段复制转换好的Alt-CLIP OpenVINO IR模型
