@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
+numpy
+opencv-python-headless
+openvino
+insightface
+rapidocr-openvino

@@ -1,0 +1,5 @@
+openvino-dev[pytorch]
+transformers
+sentencepiece
+onnx
+onnxsim

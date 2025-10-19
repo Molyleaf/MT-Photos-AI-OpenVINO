@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.idea/
+
+# Models - 模型文件通常很大，不建议加入Git
+models/alt-clip/
+models/insightface/
+
+# Docker
+.dockerignore
