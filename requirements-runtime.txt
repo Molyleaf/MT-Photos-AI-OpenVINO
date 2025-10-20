@@ -5,5 +5,3 @@ transformers==4.57.1
 opencv-python==4.12.0.88
 fastapi==0.119.1
 pydantic==2.12.3
-torch==2.9.0
-onnxscript==0.5.4

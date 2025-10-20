@@ -2,11 +2,25 @@
 # 使用包含所有转换所需工具的开发镜像
 FROM openvino/ubuntu24_dev:2025.3.0 AS builder
 
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /builder
 
 # 优先复制依赖和脚本文件，以便利用 Docker 的层缓存机制
 COPY requirements.txt .
 COPY scripts/convert_models.py ./scripts/
+
+USER root
+
+RUN apt update
+
+# 系统依赖
+RUN apt install -y \
+    python3-dev g++ && \
+    rm -rf /var/lib/apt/lists/*
 
 # 安装模型转换过程需要的所有依赖，并使用国内镜像源加速
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements.txt
@@ -23,12 +37,26 @@ FROM openvino/ubuntu24_runtime:2025.3.0
 
 WORKDIR /app
 
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # 复制运行时环境所需的依赖文件
-COPY requirements.txt .
+COPY requirements-runtime.txt .
+
+USER root
+
+RUN apt update
+
+# 系统依赖
+RUN apt install -y \
+    python3-dev g++ && \
+    rm -rf /var/lib/apt/lists/*
 
 # 仅安装运行时必要的依赖，以保持镜像的轻量
 # 这里排除了 torch, onnx 等只在构建阶段需要的库
-RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements-runtime.txt
 
 # 从构建器阶段复制已经转换好的 OpenVINO IR 模型
 COPY --from=builder /builder/models/alt-clip/openvino /models/alt-clip/openvino
