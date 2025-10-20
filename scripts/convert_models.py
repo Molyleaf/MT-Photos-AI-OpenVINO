@@ -7,26 +7,26 @@ from pathlib import Path
 
 def convert_alt_clip_to_openvino(output_dir: Path):
     """
-    Downloads the Alt-CLIP model, converts it to ONNX, and then to OpenVINO IR.
+    下载 Alt-CLIP 模型，并将其转换为 ONNX，最终转换为 OpenVINO IR 格式。
     """
     model_name = "BAAI/AltCLIP-m18"
-    print(f"Loading model: {model_name}")
+    print(f"正在加载模型: {model_name}")
     processor = AltCLIPProcessor.from_pretrained(model_name)
     model = AltCLIPModel.from_pretrained(model_name)
-    model.eval()
+    model.eval() # 设置为评估模式
 
-    # --- Directory Setup ---
+    # --- 目录设置 ---
     onnx_dir = output_dir / "onnx"
     openvino_dir = output_dir / "openvino"
     onnx_dir.mkdir(parents=True, exist_ok=True)
     openvino_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Vision Model Conversion ---
-    print("Converting Vision model...")
+    # --- 视觉模型转换 ---
+    print("正在转换视觉模型...")
     vision_onnx_path = onnx_dir / "clip_vision.onnx"
     vision_ov_path = openvino_dir / "clip_vision.xml"
 
-    # Fake input for a vision model
+    # 视觉模型的伪输入数据
     dummy_vision_input = torch.randn(1, 3, 224, 224)
 
     torch.onnx.export(
@@ -41,20 +41,20 @@ def convert_alt_clip_to_openvino(output_dir: Path):
             "image_embeds": {0: "batch_size"},
         },
     )
-    print(f"Vision model saved to ONNX: {vision_onnx_path}")
+    print(f"视觉模型已保存为 ONNX: {vision_onnx_path}")
 
-    # ONNX to OpenVINO IR for Vision Model
+    # 将视觉模型的 ONNX 格式转换为 OpenVINO IR 格式
     ov_vision_model = ov.convert_model(str(vision_onnx_path))
     ov.save_model(ov_vision_model, vision_ov_path, compress_to_fp16=True)
-    print(f"Vision model saved to OpenVINO IR: {vision_ov_path}")
+    print(f"视觉模型已保存为 OpenVINO IR: {vision_ov_path}")
 
 
-    # --- Text Model Conversion ---
-    print("Converting Text model...")
+    # --- 文本模型转换 ---
+    print("正在转换文本模型...")
     text_onnx_path = onnx_dir / "clip_text.onnx"
     text_ov_path = openvino_dir / "clip_text.xml"
 
-    # Dummy input for text model
+    # 文本模型的伪输入数据
     dummy_text_input_ids = torch.randint(0, 1000, (1, 77))
     dummy_text_attention_mask = torch.ones(1, 77, dtype=torch.long)
 
@@ -71,28 +71,29 @@ def convert_alt_clip_to_openvino(output_dir: Path):
             "text_embeds": {0: "batch_size"},
         },
     )
-    print(f"Text model saved to ONNX: {text_onnx_path}")
+    print(f"文本模型已保存为 ONNX: {text_onnx_path}")
 
-    # ONNX to OpenVINO IR for Text Model
+    # 将文本模型的 ONNX 格式转换为 OpenVINO IR 格式
     ov_text_model = ov.convert_model(str(text_onnx_path))
     ov.save_model(ov_text_model, text_ov_path, compress_to_fp16=True)
-    print(f"Text model saved to OpenVINO IR: {text_ov_path}")
+    print(f"文本模型已保存为 OpenVINO IR: {text_ov_path}")
 
-    # --- Save processor files ---
+    # --- 保存 processor 配置文件 ---
     processor.save_pretrained(openvino_dir)
-    print(f"Processor files saved to: {openvino_dir}")
+    print(f"Processor 配置文件已保存至: {openvino_dir}")
 
-    print("\nConversion complete.")
+    print("\n模型转换完成。")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert Alt-CLIP model to OpenVINO format.")
+    parser = argparse.ArgumentParser(description="将 Alt-CLIP 模型转换为 OpenVINO 格式。")
     parser.add_argument(
         "--output_dir",
         type=str,
         default="./models/alt-clip",
-        help="The directory to save the converted models.",
+        help="用于保存转换后模型的目录。",
     )
     args = parser.parse_args()
 
     convert_alt_clip_to_openvino(Path(args.output_dir))
+
