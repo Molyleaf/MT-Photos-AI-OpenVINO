@@ -1,11 +1,11 @@
 import os
-import cv2
+from typing import List, Any, Dict
+
 import numpy as np
 import openvino as ov
 from insightface.app import FaceAnalysis
 from rapidocr_openvino import RapidOCR
 from transformers import AltCLIPProcessor
-from typing import List, Any, Dict
 
 # --- 全局变量 ---
 # 决定推理设备。如果未指定，则默认为 CPU。

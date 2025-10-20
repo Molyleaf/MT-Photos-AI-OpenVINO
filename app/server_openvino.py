@@ -1,14 +1,14 @@
 import os
+from typing import List
+
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Request
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-import io
-from typing import Optional, List, Dict, Any
 
 # 导入模型管理类
-from common.models import models, AIModels
+from common.models import models
 
 # --- API 密钥认证 ---
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY")

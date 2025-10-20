@@ -1,9 +1,10 @@
-import torch
-import openvino as ov
-from transformers import AltCLIPModel, AltCLIPProcessor
-import os
 import argparse
 from pathlib import Path
+
+import openvino as ov
+import torch
+from transformers import AltCLIPModel, AltCLIPProcessor
+
 
 def convert_alt_clip_to_openvino(output_dir: Path):
     """

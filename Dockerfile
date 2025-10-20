@@ -1,6 +1,6 @@
 # ---- 阶段 1: 模型转换构建器 ----
 # 使用包含所有转换所需工具的开发镜像
-FROM openvino/ubuntu24_dev:latest AS builder
+FROM openvino/ubuntu24_dev:2025.3.0 AS builder
 
 WORKDIR /builder
 
@@ -9,7 +9,7 @@ COPY requirements.txt .
 COPY scripts/convert_models.py ./scripts/
 
 # 安装模型转换过程需要的所有依赖，并使用国内镜像源加速
-RUN pip install --no-cache-dir -i https://mirrors.nju.edu.cn/pypi/web/simple -r requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements.txt
 
 # 运行模型转换脚本
 # 该脚本会从 Hugging Face 下载 BAAI/AltCLIP-m18 模型，
@@ -19,7 +19,7 @@ RUN python scripts/convert_models.py --output_dir /builder/models/alt-clip
 
 # ---- 阶段 2: 最终运行时镜像 ----
 # 使用轻量级的运行时镜像作为最终的应用镜像
-FROM ubuntu24_runtime:latest
+FROM openvino/ubuntu24_runtime:2025.3.0
 
 WORKDIR /app
 
@@ -28,7 +28,7 @@ COPY requirements.txt .
 
 # 仅安装运行时必要的依赖，以保持镜像的轻量
 # 这里排除了 torch, onnx 等只在构建阶段需要的库
-RUN pip install --no-cache-dir -i https://mirrors.nju.edu.cn/pypi/web/simple -r requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements.txt
 
 # 从构建器阶段复制已经转换好的 OpenVINO IR 模型
 COPY --from=builder /builder/models/alt-clip/openvino /models/alt-clip/openvino

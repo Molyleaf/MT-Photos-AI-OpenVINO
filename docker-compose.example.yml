@@ -2,7 +2,7 @@ services:
   mt-photos-ai-openvino:
     build:
       context: .
-      dockerfile: openvino/Dockerfile
+      dockerfile: Dockerfile
     container_name: mt-photos-ai-openvino
     ports:
       - "8060:8060"
