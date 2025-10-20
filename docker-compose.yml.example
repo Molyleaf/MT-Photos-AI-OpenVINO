@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  mt-photos-ai-openvino:
+    build:
+      context: .
+      dockerfile: openvino/Dockerfile
+    container_name: mt-photos-ai-openvino
+    ports:
+      - "8060:8060"
+    volumes:
+      # Mount the models directory to persist downloaded models
+      # and allow easy updates without rebuilding the image.
+      # Note: The Dockerfile already copies the models in,
+      # this is useful if you manage models outside the build process.
+      - ./models:/models
+    environment:
+      # --- IMPORTANT ---
+      # SET YOUR SECRET API KEY HERE
+      - API_AUTH_KEY=your_secret_key_change_me
+
+      # --- INFERENCE DEVICE ---
+      # Options: "CPU", "GPU", "AUTO", "AUTO:GPU,CPU"
+      # "AUTO:GPU,CPU" will prioritize GPU and fallback to CPU.
+      - INFERENCE_DEVICE=AUTO:GPU,CPU
+    devices:
+      # This is required to give the container access to the host's GPU (iGPU).
+      # On Linux, this is typically /dev/dri.
+      - /dev/dri:/dev/dri
+    restart: unless-stopped

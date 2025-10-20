@@ -1,88 +1,128 @@
+# server.py
+# FastAPI server for MT-Photos AI Unified
+
 import os
-import io
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Request
-from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
-from typing import Optional, Dict
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Request
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+import io
+from typing import Optional, List, Dict, Any
 
-from app.common.models import ModelManager
+# Import the model management class
+from common.models import models, AIModels
 
-# 加载环境变量
-load_dotenv()
+# --- API Key Authentication ---
+API_AUTH_KEY = os.environ.get("API_AUTH_KEY")
+API_KEY_NAME = "api-key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-API_AUTH_KEY = os.getenv("API_AUTH_KEY")
-if not API_AUTH_KEY:
-    raise ValueError("API_AUTH_KEY environment variable not set!")
+async def get_api_key(api_key_header: str = Depends(api_key_header)):
+    """Dependency to validate the API key."""
+    if not API_AUTH_KEY: # If no key is set, allow access
+        return
+    if api_key_header != API_AUTH_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+        )
 
-# 初始化 FastAPI 应用
-app = FastAPI(title="MT-Photos Unified AI Service (OpenVINO)")
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="MT-Photos AI Unified Server (OpenVINO)",
+    description="A high-performance, unified AI service for photo analysis, accelerated by OpenVINO.",
+    version="1.0.0",
+    dependencies=[Depends(get_api_key)]
+)
 
-# 在应用启动时加载模型
-@app.on_event("startup")
-def load_models_on_startup():
-    app.state.model_manager = ModelManager(models_root_dir="./models")
-
-# API 密钥验证依赖
-async def verify_api_key(api_key: Optional[str] = Header(None)):
-    if api_key!= API_AUTH_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
+# --- Pydantic Models for Request/Response ---
 class TextClipRequest(BaseModel):
     text: str
 
-# --- API 端点定义 ---
+class CheckResponse(BaseModel):
+    result: str
 
-@app.post("/check", dependencies=)
+class OCRResult(BaseModel):
+    texts: List[str]
+    scores: List[float]
+    boxes: List[List[List[int]]]
+
+class OCRResponse(BaseModel):
+    result: OCRResult
+
+class ClipResponse(BaseModel):
+    results: List[float]
+
+class FacialArea(BaseModel):
+    x: int
+    y: int
+    w: int
+    h: int
+
+class RepresentResult(BaseModel):
+    embedding: List[float]
+    facial_area: FacialArea
+    face_confidence: float
+
+class RepresentResponse(BaseModel):
+    detector_backend: str = "insightface"
+    recognition_model: str = "buffalo_l"
+    result: List[RepresentResult]
+
+# --- Helper Function ---
+async def read_image_from_upload(file: UploadFile) -> np.ndarray:
+    """Reads an uploaded image file and converts it to a CV2 image."""
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+    return img
+
+# --- API Endpoints ---
+@app.on_event("startup")
+async def startup_event():
+    """Check if models were loaded on startup."""
+    if models is None:
+        # This will prevent the app from starting if models fail to load
+        raise RuntimeError("FATAL: AI models could not be initialized. Check logs for errors.")
+
+@app.post("/check", response_model=CheckResponse)
 async def check_service():
-    """健康检查和API密钥验证端点"""
+    """Checks service availability and API key validity."""
     return {"result": "pass"}
 
-@app.post("/ocr", dependencies=)
-async def ocr_endpoint(request: Request, file: UploadFile = File(...)):
-    """从图像中提取文本 (OCR)"""
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+@app.post("/ocr", response_model=OCRResponse)
+async def ocr_endpoint(file: UploadFile = File(...)):
+    """Performs OCR on an uploaded image."""
+    image = await read_image_from_upload(file)
+    ocr_results = models.get_ocr_results(image)
+    return {"result": ocr_results}
 
-    model_manager: ModelManager = request.app.state.model_manager
-    result = model_manager.get_ocr_results(img)
-    return result
+@app.post("/clip/img", response_model=ClipResponse)
+async def clip_image_endpoint(file: UploadFile = File(...)):
+    """Extracts a feature vector from an uploaded image."""
+    image = await read_image_from_upload(file)
+    # Convert from BGR (cv2 default) to RGB for CLIP model
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    embedding = models.get_image_embedding(image_rgb)
+    return {"results": embedding}
 
-@app.post("/clip/img", dependencies=)
-async def clip_image_endpoint(request: Request, file: UploadFile = File(...)):
-    """提取图像的CLIP特征向量"""
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+@app.post("/clip/txt", response_model=ClipResponse)
+async def clip_text_endpoint(request: TextClipRequest):
+    """Extracts a feature vector from a text string."""
+    embedding = models.get_text_embedding(request.text)
+    return {"results": embedding}
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    model_manager: ModelManager = request.app.state.model_manager
-    result = model_manager.get_image_embedding(img_rgb)
-    return result
+@app.post("/represent", response_model=RepresentResponse)
+async def represent_endpoint(file: UploadFile = File(...)):
+    """Detects faces and extracts feature vectors from an uploaded image."""
+    image = await read_image_from_upload(file)
+    face_results = models.get_face_representation(image)
+    return {"result": face_results}
 
-@app.post("/clip/txt", dependencies=)
-async def clip_text_endpoint(request: Request, payload: TextClipRequest):
-    """提取文本的CLIP特征向量"""
-    model_manager: ModelManager = request.app.state.model_manager
-    result = model_manager.get_text_embedding(payload.text)
-    return result
-
-@app.post("/represent", dependencies=)
-async def represent_endpoint(request: Request, file: UploadFile = File(...)):
-    """人脸检测和识别"""
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
-
-    model_manager: ModelManager = request.app.state.model_manager
-    result = model_manager.get_face_representation(img)
-    return result
+# --- Main entry point for Uvicorn ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8060)

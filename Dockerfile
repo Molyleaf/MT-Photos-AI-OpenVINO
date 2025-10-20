@@ -1,38 +1,53 @@
-# ---- Stage 1: Model Conversion Builder ----
-# 使用包含完整开发工具的镜像作为构建环境
+# ---- Stage 1: Model Conversion ----
+# Use a development image that includes all necessary tools for conversion
 FROM openvino/dev-py:latest AS builder
 
 WORKDIR /builder
 
-# 安装模型转换所需的依赖
-COPY scripts/requirements_convert.txt .
-RUN pip install --no-cache-dir -r requirements_convert.txt
+# Copy requirements and model conversion script first to leverage Docker layer caching
+COPY openvino/requirements.txt .
+COPY scripts/convert_models.py ./scripts/
 
-# 复制并执行模型转换脚本
-COPY scripts/convert_models.py .
-# 脚本将自动下载并转换模型到 /models/alt-clip/openvino
-RUN python convert_models.py --output_dir /models/alt-clip/openvino
+# Install all dependencies needed for the conversion process
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Run the conversion script.
+# This will download the BAAI/AltCLIP-m18 model from Hugging Face,
+# convert it to ONNX, and then to OpenVINO IR FP16 format.
+# The output will be in /builder/models/alt-clip/openvino
+RUN python scripts/convert_models.py --output_dir /builder/models/alt-clip
 
 # ---- Stage 2: Final Runtime Image ----
-# 使用轻量级的OpenVINO运行时镜像作为最终基础
-FROM openvino/runtime:latest
+# Use a lightweight runtime image for the final application
+FROM openvino/runtime:2023.3
 
 WORKDIR /app
 
-# 安装运行时依赖
-COPY requirements.txt .
+# Copy requirements for the runtime environment
+COPY openvino/requirements.txt .
+
+# Install only the runtime dependencies
+# We exclude torch, onnx, etc., to keep the image small
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 从构建阶段复制转换好的Alt-CLIP OpenVINO IR模型
-COPY --from=builder /models/alt-clip/openvino /app/models/alt-clip/openvino
+# Copy the converted OpenVINO IR models from the builder stage
+COPY --from=builder /builder/models/alt-clip/openvino /models/alt-clip/openvino
 
-# 复制应用程序源代码
-# 注意：这里假设你的项目根目录是构建上下文(.)
-COPY app/ /app/app/
+# Copy the pre-downloaded InsightFace models
+# These should be placed in the `models` directory in your project root
+COPY models/insightface/buffalo_l /models/insightface/buffalo_l
 
-# 暴露服务端口
+# Copy the application source code
+COPY app/server_openvino.py .
+COPY app/common/ /app/common/
+
+# Expose the port the server will run on
 EXPOSE 8060
 
-# 设置默认启动命令
-# 注意：模型将从容器内的 /models 目录加载，这需要通过-v挂载
-CMD ["uvicorn", "app.server_openvino:app", "--host", "0.0.0.0", "--port", "8060"]
+# Set the default command to run the application
+# Use an environment variable for the API key for security
+ENV API_AUTH_KEY=""
+# Use an environment variable to control the inference device (e.g., "CPU", "GPU", "AUTO")
+ENV INFERENCE_DEVICE="AUTO"
+
+CMD ["uvicorn", "server_openvino.py", "--host", "0.0.0.0", "--port", "8060"]

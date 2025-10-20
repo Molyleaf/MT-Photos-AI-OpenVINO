@@ -1,9 +1,11 @@
 fastapi
-uvicorn[standard]
-python-dotenv
+uvicorn
 python-multipart
 numpy
 opencv-python-headless
-openvino
+openvino>=2023.3.0
 insightface
 rapidocr-openvino
+transformers
+torch
+onnx
