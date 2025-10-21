@@ -31,7 +31,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
 app = FastAPI(
     title="MT-Photos AI 统一服务 (OpenVINO 版本)",
     description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。",
-    version="1.0.0",
+    version="1.0.9",
     dependencies=[Depends(get_api_key)] # 对所有端点应用 API 密钥认证
 )
 
