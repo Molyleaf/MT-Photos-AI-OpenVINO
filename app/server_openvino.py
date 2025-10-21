@@ -9,8 +9,8 @@ from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
-# 导入模型管理类
-from common.models import models
+# <--- 关键修改: 导入 AIModels 类本身，以及 models 占位符 --->
+from common.models import AIModels, models
 
 # --- API 密钥认证 ---
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt-photos-ai-openvino")
@@ -80,12 +80,21 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     return img
 
 # --- API 端点定义 ---
+
+# <--- 关键修改: 重写 startup_event 以执行模型加载 --->
 @app.on_event("startup")
 async def startup_event():
-    """在应用启动时检查模型是否已成功加载。"""
-    if models is None:
-        # 如果模型加载失败，将阻止应用启动
-        raise RuntimeError("严重错误: AI 模型无法初始化。请检查日志获取详细错误信息。")
+    """在应用启动时加载 AI 模型。"""
+    global models # 声明我们要修改全局变量 models
+    print("应用启动... 开始加载 AI 模型。")
+    try:
+        models = AIModels()
+        print("AI 模型加载成功。")
+    except Exception as e:
+        # 如果这里出错，错误会非常清晰地打印出来，并阻止应用启动
+        print(f"严重错误: AI 模型无法初始化。错误详情: {e}")
+        # 使用 from e 可以保留原始错误的堆栈信息，便于调试
+        raise RuntimeError(f"AI 模型初始化失败: {e}") from e
 
 @app.post("/check", response_model=CheckResponse)
 async def check_service():
@@ -125,4 +134,3 @@ async def represent_endpoint(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8060)
-

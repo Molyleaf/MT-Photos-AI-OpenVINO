@@ -13,6 +13,14 @@ COPY requirements.txt .
 
 USER root
 
+# 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型
+# 请确保在运行 `docker build` 之前，这些模型文件存在于您项目的 `./models/alt-clip/openvino` 目录下
+COPY models/alt-clip/openvino /models/alt-clip/openvino
+
+# 复制预先下载好的 InsightFace 模型
+# 在项目构建前，需要将这些模型文件放置在项目根目录的 models/insightface/buffalo_l 目录下
+COPY models/insightface /models/insightface
+
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
     rm -rf /etc/apt/sources.list.d/
@@ -22,21 +30,15 @@ COPY sources.list /etc/apt/sources.list
 RUN apt update
 
 # 系统依赖
-RUN apt install -y \
-    python3-dev g++ && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y \
+    python3-dev \
+    g++ \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
 
 RUN pip install --no-cache-dir -r requirements.txt
-
-# 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型
-# 请确保在运行 `docker build` 之前，这些模型文件存在于您项目的 `./models/alt-clip/openvino` 目录下
-COPY models/alt-clip/openvino /models/alt-clip/openvino
-
-# 复制预先下载好的 InsightFace 模型
-# 在项目构建前，需要将这些模型文件放置在项目根目录的 models/insightface/buffalo_l 目录下
-COPY models/insightface /models/insightface
 
 # 复制应用程序的源代码
 COPY app/server_openvino.py .

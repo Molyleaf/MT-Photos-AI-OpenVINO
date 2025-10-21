@@ -35,15 +35,15 @@ class AIModels:
         print("所有模型已成功加载。")
 
     def _load_insightface(self) -> FaceAnalysis:
-        """加载用于人脸识别的 InsightFace 模型 (使用 OpenVINO 加速)。""" # <- 更新注释
+        """加载用于人脸识别的 InsightFace 模型 (使用 OpenVINO 加速)。"""
         print(f"正在从以下路径加载 InsightFace 模型: {self.insightface_path}")
-        print("为 InsightFace 启用 OpenVINO Execution Provider...") # <- 添加日志
+        print("为 InsightFace 启用 OpenVINO Execution Provider...")
         try:
             # 指定使用 OpenVINOExecutionProvider 来利用 OpenVINO 进行推理
             app = FaceAnalysis(
                 name = MODEL_NAME,
                 root=os.path.dirname(self.insightface_path),
-                providers=['OpenVINOExecutionProvider'] # <--- 核心修改
+                providers=['OpenVINOExecutionProvider']
             )
             app.prepare(ctx_id=0, det_size=(640, 640))
             return app
@@ -127,14 +127,10 @@ class AIModels:
         inputs = self.clip_processor(images=image, return_tensors="np")
         pixel_values = inputs['pixel_values']
 
-        # 编译后的模型只有一个输入
         infer_request = self.clip_vision_model.create_infer_request()
-        # 输入张量名称 'pixel_values' 是在模型导出时定义的
         results = infer_request.infer({self.clip_vision_model.inputs[0].any_name: pixel_values})
-        # 输出张量名称为 'image_embeds'
         embedding = results[self.clip_vision_model.outputs[0]]
 
-        # 对特征向量进行归一化
         embedding = embedding / np.linalg.norm(embedding)
 
         return embedding.flatten().tolist()
@@ -145,26 +141,17 @@ class AIModels:
         input_ids = inputs['input_ids']
         attention_mask = inputs['attention_mask']
 
-        # 编译后的模型有两个输入
         infer_request = self.clip_text_model.create_infer_request()
-        # 输入张量名称为 'input_ids' 和 'attention_mask'
         results = infer_request.infer({
             self.clip_text_model.inputs[0].any_name: input_ids,
             self.clip_text_model.inputs[1].any_name: attention_mask
         })
-        # 输出张量名称为 'text_embeds'
         embedding = results[self.clip_text_model.outputs[0]]
 
-        # 对特征向量进行归一化
         embedding = embedding / np.linalg.norm(embedding)
 
         return embedding.flatten().tolist()
 
-# 在应用启动时，实例化一次模型管理类
-try:
-    models = AIModels()
-except Exception as e:
-    print(f"初始化 AI 模型失败: {e}")
-    # 在这里可以选择退出程序或进行其他错误处理
-    models = None
-
+# <--- 关键修改: 移除了在这里初始化模型的代码 --->
+# 现在只定义一个占位符，它将在主应用的启动事件中被填充
+models: AIModels | None = None
