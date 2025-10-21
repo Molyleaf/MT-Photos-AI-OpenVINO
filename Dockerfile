@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 复制运行时环境所需的依赖文件
 COPY requirements.txt .
 
-USER root [cite: 4]
+USER root
 
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
