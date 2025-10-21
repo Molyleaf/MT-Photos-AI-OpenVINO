@@ -35,7 +35,7 @@ def convert_alt_clip_to_openvino(output_dir: Path):
         model.vision_model,
         dummy_vision_input,
         str(vision_onnx_path),
-        opset_version=17,
+        opset_version=18,
         input_names=["pixel_values"],
         output_names=["image_embeds"],
         dynamic_axes={
@@ -64,7 +64,7 @@ def convert_alt_clip_to_openvino(output_dir: Path):
         model.text_model,
         (dummy_text_input_ids, dummy_text_attention_mask),
         str(text_onnx_path),
-        opset_version=17,
+        opset_version=18,
         input_names=["input_ids", "attention_mask"],
         output_names=["text_embeds"],
         dynamic_axes={
@@ -88,14 +88,23 @@ def convert_alt_clip_to_openvino(output_dir: Path):
 
 
 if __name__ == "__main__":
+    # --- 路径修改开始 ---
+    # 获取项目根目录 (即 scripts 文件夹的上一级目录)
+    # Path(__file__) -> 当前脚本的路径
+    # .parent -> scripts 目录
+    # .parent -> 项目根目录
+    project_root = Path(__file__).parent.parent
+    default_output_path = project_root / "models" / "alt-clip"
+    # --- 路径修改结束 ---
+
     parser = argparse.ArgumentParser(description="将 Alt-CLIP 模型转换为 OpenVINO 格式。")
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./models/alt-clip",
+        default=str(default_output_path), # <-- 使用新的默认路径
         help="用于保存转换后模型的目录。",
     )
     args = parser.parse_args()
 
+    # 确保路径是 Path 对象
     convert_alt_clip_to_openvino(Path(args.output_dir))
-
