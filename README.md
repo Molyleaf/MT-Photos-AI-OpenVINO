@@ -12,7 +12,7 @@ ONNX 版本稍后做，欢迎 PR。
 请使用最新的Docker镜像，旧版可能有bug。
 https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 
-''' docker pull molyleaf/mt-photos-ai-openvino:latest '''
+``` docker pull molyleaf/mt-photos-ai-openvino:latest ```
 
 ## 以下是AI写的
 
