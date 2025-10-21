@@ -72,7 +72,7 @@ class AIModels:
                 raise FileNotFoundError("未找到 Alt-CLIP 的 OpenVINO 模型文件。")
 
             # 加载 tokenizer 和 processor
-            processor = AltCLIPProcessor.from_pretrained(self.alt_clip_path)
+            processor = AltCLIPProcessor.from_pretrained(self.alt_clip_path, use_fast=True)
 
             # 编译模型到目标设备，并使用吞吐量性能提示
             vision_compiled = self.core.compile_model(
@@ -152,6 +152,5 @@ class AIModels:
 
         return embedding.flatten().tolist()
 
-# <--- 关键修改: 移除了在这里初始化模型的代码 --->
 # 现在只定义一个占位符，它将在主应用的启动事件中被填充
 models: AIModels | None = None

@@ -19,7 +19,8 @@ COPY models/alt-clip/openvino /models/alt-clip/openvino
 
 # 复制预先下载好的 InsightFace 模型
 # 在项目构建前，需要将这些模型文件放置在项目根目录的 models/insightface/buffalo_l 目录下
-COPY models/insightface /models/insightface
+# 将 insightface 模型复制到库所期望的 "models" 子目录中
+COPY models/insightface /models/insightface/models
 
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
@@ -30,10 +31,14 @@ COPY sources.list /etc/apt/sources.list
 RUN apt update
 
 # 系统依赖
-RUN apt update && apt install -y \
+RUN apt update && apt install -y --no-install-recommends \
     python3-dev \
     g++ \
     libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
