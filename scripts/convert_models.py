@@ -7,6 +7,7 @@ import openvino as ov
 import torch
 from transformers import AltCLIPModel, AltCLIPProcessor
 
+
 def convert_alt_clip_to_openvino(output_dir: Path):
     """
     下载 Alt-CLIP 模型，并将其转换为 ONNX，最终转换为 OpenVINO IR 格式。

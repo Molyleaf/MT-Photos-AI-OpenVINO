@@ -78,14 +78,38 @@ class AIModels:
                 results.append(result)
         return results
 
-    def get_ocr_results(self, image: np.ndarray) -> Dict[str, Any]:
+    # -------------------- [开始修改] --------------------
+    def get_ocr_results(self, image: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        运行 OCR 并返回一个包含文本、置信度和 x,y,w,h 矩形框的字典列表，以匹配客户端需求。
+        """
         result, _ = self.ocr_engine(image)
         if not result:
-            return {"texts": [], "scores": [], "boxes": []}
-        texts = [item[1] for item in result]
-        scores = [item[2] for item in result]
-        boxes = [np.array(item[0]).astype(int).tolist() for item in result]
-        return {"texts": texts, "scores": scores, "boxes": boxes}
+            return []
+
+        ocr_results = []
+        for item in result:
+            # item[0] 是一个包含四个点的列表, e.g., [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+            box_points = np.array(item[0])
+
+            # 计算简单的水平矩形边界框 (x, y, w, h)
+            x = int(np.min(box_points[:, 0]))
+            y = int(np.min(box_points[:, 1]))
+            w = int(np.max(box_points[:, 0]) - x)
+            h = int(np.max(box_points[:, 1]) - y)
+
+            ocr_results.append({
+                "text": item[1],
+                "score": float(item[2]),
+                "box": {
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h
+                }
+            })
+        return ocr_results
+    # -------------------- [结束修改] --------------------
 
     def get_image_embedding(self, image: np.ndarray) -> List[float]:
         inputs = self.clip_processor(images=image, return_tensors="pt")

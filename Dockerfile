@@ -38,6 +38,13 @@ RUN apt update && apt install -y --no-install-recommends \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
+#     # -- 开始添加 --
+#        # 添加 Intel GPU 驱动相关的用户空间组件
+#        intel-opencl-icd \
+#        libigc-dev \
+#        libigdfcl-dev \
+#        libva-dev \
+
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
 
 RUN pip install --no-cache-dir -r requirements.txt
@@ -45,6 +52,22 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制应用程序的源代码
 COPY app/server_openvino.py .
 COPY app/common/ /app/common/
+
+RUN groupadd -g 991 render || true
+# 将 root 用户添加到 render 组中。如果你的应用最终以非 root 用户运行，请替换 'root'
+RUN usermod -a -G render root
+
+RUN apt install intel-opencl-icd \
+                libigc-dev \
+                libigdfcl-dev \
+                libva-dev \
+                intel-gpu-tools \
+                clinfo \
+                vainfo
+
+RUN apt remove g++ \
+    apt autoremove \
+    apt autoclean \
 
 # 暴露服务运行的端口
 EXPOSE 8060
