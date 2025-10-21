@@ -1,7 +1,0 @@
-numpy==2.2.6
-openvino==2025.3.0
-insightface==0.7.3
-transformers==4.57.1
-opencv-python==4.12.0.88
-fastapi==0.119.1
-pydantic==2.12.3

@@ -10,7 +10,11 @@ venv/
 .idea/
 
 # Models - 模型文件通常很大，不建议加入Git
-models/alt-clip/*.onnx
+models/alt-clip/onnx/*.onnx
+models/alt-clip/onnx/*.data
+models/alt-clip/openvino/*.bin
+models/alt-clip/openvino/*.xml
+models/alt-clip/openvino/*.json
 models/insightface/antelopev2/*.onnx
 models/insightface/buffalo_l/*.onnx
 

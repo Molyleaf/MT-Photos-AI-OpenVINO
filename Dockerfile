@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # 复制运行时环境所需的依赖文件
-COPY requirements-runtime.txt .
+COPY requirements.txt .
 
 USER root [cite: 4]
 
@@ -29,7 +29,7 @@ RUN apt install -y \
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
 
 # 仅安装运行时必要的依赖
-RUN pip install --no-cache-dir -r requirements-runtime.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型
 # 请确保在运行 `docker build` 之前，这些模型文件存在于您项目的 `./models/alt-clip/openvino` 目录下

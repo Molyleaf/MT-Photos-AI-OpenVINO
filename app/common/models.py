@@ -1,3 +1,5 @@
+# app/common/models.py
+
 import os
 from typing import List, Any, Dict
 
@@ -13,6 +15,7 @@ from transformers import AltCLIPProcessor
 INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "CPU")
 # 存放所有模型文件的基础路径
 MODEL_BASE_PATH = os.environ.get("MODEL_PATH", "/models")
+MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
 
 class AIModels:
     """一个用于加载和管理所有AI模型的类。"""
@@ -21,7 +24,7 @@ class AIModels:
         self.core = ov.Core()
 
         # --- 模型路径定义 ---
-        self.insightface_path = os.path.join(MODEL_BASE_PATH, "insightface", "buffalo_l")
+        self.insightface_path = os.path.join(MODEL_BASE_PATH, "insightface", MODEL_NAME)
         self.alt_clip_path = os.path.join(MODEL_BASE_PATH, "alt-clip", "openvino")
 
         # --- 加载所有模型 ---
@@ -32,12 +35,16 @@ class AIModels:
         print("所有模型已成功加载。")
 
     def _load_insightface(self) -> FaceAnalysis:
-        """加载用于人脸识别的 InsightFace 模型。"""
+        """加载用于人脸识别的 InsightFace 模型 (使用 OpenVINO 加速)。""" # <- 更新注释
         print(f"正在从以下路径加载 InsightFace 模型: {self.insightface_path}")
+        print("为 InsightFace 启用 OpenVINO Execution Provider...") # <- 添加日志
         try:
-            # 默认的 CPU provider 通常足够。
-            # 如果你有特定编译版本的 insightface，可以指定 providers=['OpenVINOExecutionProvider']
-            app = FaceAnalysis(name="buffalo_l", root=os.path.dirname(self.insightface_path))
+            # 指定使用 OpenVINOExecutionProvider 来利用 OpenVINO 进行推理
+            app = FaceAnalysis(
+                name = MODEL_NAME,
+                root=os.path.dirname(self.insightface_path),
+                providers=['OpenVINOExecutionProvider'] # <--- 核心修改
+            )
             app.prepare(ctx_id=0, det_size=(640, 640))
             return app
         except Exception as e:

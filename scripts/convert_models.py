@@ -1,3 +1,5 @@
+# scripts/convert_models.py
+
 import argparse
 from pathlib import Path
 
@@ -5,14 +7,13 @@ import openvino as ov
 import torch
 from transformers import AltCLIPModel, AltCLIPProcessor
 
-
 def convert_alt_clip_to_openvino(output_dir: Path):
     """
     下载 Alt-CLIP 模型，并将其转换为 ONNX，最终转换为 OpenVINO IR 格式。
     """
     model_name = "BAAI/AltCLIP-m18"
     print(f"正在加载模型: {model_name}")
-    processor = AltCLIPProcessor.from_pretrained(model_name)
+    processor = AltCLIPProcessor.from_pretrained(model_name, use_fast=True)
     model = AltCLIPModel.from_pretrained(model_name)
     model.eval() # 设置为评估模式
 
@@ -34,7 +35,7 @@ def convert_alt_clip_to_openvino(output_dir: Path):
         model.vision_model,
         dummy_vision_input,
         str(vision_onnx_path),
-        opset_version=14,
+        opset_version=17,
         input_names=["pixel_values"],
         output_names=["image_embeds"],
         dynamic_axes={
@@ -63,7 +64,7 @@ def convert_alt_clip_to_openvino(output_dir: Path):
         model.text_model,
         (dummy_text_input_ids, dummy_text_attention_mask),
         str(text_onnx_path),
-        opset_version=14,
+        opset_version=17,
         input_names=["input_ids", "attention_mask"],
         output_names=["text_embeds"],
         dynamic_axes={
