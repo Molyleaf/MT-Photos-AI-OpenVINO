@@ -15,6 +15,12 @@ COPY scripts/convert_models.py ./scripts/
 
 USER root
 
+# 更换 APT 源
+RUN rm -f /etc/apt/sources.list \
+    rm -rf /etc/apt/sources.list.d/
+
+COPY sources.list /etc/apt/sources.list
+
 RUN apt update
 
 # 系统依赖
@@ -22,8 +28,16 @@ RUN apt install -y \
     python3-dev g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装模型转换过程需要的所有依赖，并使用国内镜像源加速
-RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements.txt
+RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --upgrade \
+    openvino \
+    onnx \
+    onnxruntime \
+    "torch>=2.1" \
+    "transformers>=4.35"
 
 # 运行模型转换脚本
 # 该脚本会从 Hugging Face 下载 BAAI/AltCLIP-m18 模型，
@@ -47,6 +61,12 @@ COPY requirements-runtime.txt .
 
 USER root
 
+# 更换 APT 源
+RUN rm -f /etc/apt/sources.list \
+    rm -rf /etc/apt/sources.list.d/
+
+COPY sources.list /etc/apt/sources.list
+
 RUN apt update
 
 # 系统依赖
@@ -56,7 +76,7 @@ RUN apt install -y \
 
 # 仅安装运行时必要的依赖，以保持镜像的轻量
 # 这里排除了 torch, onnx 等只在构建阶段需要的库
-RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/web/simple -r requirements-runtime.txt
+RUN pip install --no-cache-dir -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple -r requirements-runtime.txt
 
 # 从构建器阶段复制已经转换好的 OpenVINO IR 模型
 COPY --from=builder /builder/models/alt-clip/openvino /models/alt-clip/openvino

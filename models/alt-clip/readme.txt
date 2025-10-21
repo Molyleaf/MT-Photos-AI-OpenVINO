@@ -1,1 +1,1 @@
-Place alt clip model here.
+empty folder for building.
