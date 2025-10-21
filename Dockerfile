@@ -10,13 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # 复制运行时环境所需的依赖文件
 COPY requirements.txt .
-
 USER root
-
 # 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型
 # 请确保在运行 `docker build` 之前，这些模型文件存在于您项目的 `./models/alt-clip/openvino` 目录下
 COPY models/alt-clip/openvino /models/alt-clip/openvino
-
 # 复制预先下载好的 InsightFace 模型
 # 在项目构建前，需要将这些模型文件放置在项目根目录的 models/insightface/buffalo_l 目录下
 # 将 insightface 模型复制到库所期望的 "models" 子目录中

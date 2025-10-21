@@ -1,25 +1,20 @@
-# app/server_openvino.py
-
 import os
 from typing import List
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Response
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
-# <--- 关键修改: 导入 AIModels 类本身，以及 models 占位符 --->
 from common.models import AIModels, models
 
-# --- API 密钥认证 ---
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt-photos-ai-openvino")
 API_KEY_NAME = "api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(api_key_header: str = Depends(api_key_header)):
-    """用于验证 API 密钥的依赖项。"""
-    if not API_AUTH_KEY: # 如果环境变量中未设置密钥，则允许访问
+    if not API_AUTH_KEY:
         return
     if api_key_header != API_AUTH_KEY:
         raise HTTPException(
@@ -27,15 +22,13 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
             detail="无效的 API 密钥",
         )
 
-# --- FastAPI 应用初始化 ---
 app = FastAPI(
     title="MT-Photos AI 统一服务 (OpenVINO 版本)",
     description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。",
-    version="1.0.9",
-    dependencies=[Depends(get_api_key)] # 对所有端点应用 API 密钥认证
+    version="1.0.0",
+    dependencies=[Depends(get_api_key)]
 )
 
-# --- Pydantic 模型，用于定义请求和响应的数据结构 ---
 class TextClipRequest(BaseModel):
     text: str
 
@@ -69,9 +62,7 @@ class RepresentResponse(BaseModel):
     recognition_model: str = "buffalo_l"
     result: List[RepresentResult]
 
-# --- 辅助函数 ---
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
-    """从上传的文件中读取数据并将其转换为 CV2 图像对象。"""
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -79,58 +70,47 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
         raise HTTPException(status_code=400, detail="无效的图像文件")
     return img
 
-# --- API 端点定义 ---
-
-# <--- 关键修改: 重写 startup_event 以执行模型加载 --->
 @app.on_event("startup")
 async def startup_event():
-    """在应用启动时加载 AI 模型。"""
-    global models # 声明我们要修改全局变量 models
+    global models
     print("应用启动... 开始加载 AI 模型。")
     try:
         models = AIModels()
         print("AI 模型加载成功。")
     except Exception as e:
-        # 如果这里出错，错误会非常清晰地打印出来，并阻止应用启动
         print(f"严重错误: AI 模型无法初始化。错误详情: {e}")
-        # 使用 from e 可以保留原始错误的堆栈信息，便于调试
         raise RuntimeError(f"AI 模型初始化失败: {e}") from e
 
 @app.post("/check", response_model=CheckResponse)
 async def check_service():
-    """检查服务可用性和 API 密钥有效性。"""
     return {"result": "pass"}
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(file: UploadFile = File(...)):
-    """对上传的图像执行 OCR。"""
     image = await read_image_from_upload(file)
     ocr_results = models.get_ocr_results(image)
-    return {"result": ocr_results}
+    return {"result": oocr_results}
 
 @app.post("/clip/img", response_model=ClipResponse)
 async def clip_image_endpoint(file: UploadFile = File(...)):
-    """从上传的图像中提取特征向量。"""
     image = await read_image_from_upload(file)
-    # 将图像从 BGR (cv2 默认格式) 转换为 RGB (CLIP 模型需要)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     embedding = models.get_image_embedding(image_rgb)
     return {"results": embedding}
 
 @app.post("/clip/txt", response_model=ClipResponse)
 async def clip_text_endpoint(request: TextClipRequest):
-    """从文本字符串中提取特征向量。"""
     embedding = models.get_text_embedding(request.text)
     return {"results": embedding}
 
 @app.post("/represent", response_model=RepresentResponse)
 async def represent_endpoint(file: UploadFile = File(...)):
-    """从上传的图像中检测人脸并提取特征向量。"""
     image = await read_image_from_upload(file)
     face_results = models.get_face_representation(image)
+    if not face_results:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     return {"result": face_results}
 
-# --- Uvicorn 服务器的程序入口 ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8060)
