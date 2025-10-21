@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from common.models import models
 
 # --- API 密钥认证 ---
-API_AUTH_KEY = os.environ.get("API_AUTH_KEY")
+API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt-photos-ai-openvino")
 API_KEY_NAME = "api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 

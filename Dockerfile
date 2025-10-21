@@ -46,9 +46,6 @@ COPY app/common/ /app/common/
 # 暴露服务运行的端口
 EXPOSE 8060
 
-# 设置运行应用所需的默认环境变量
-# 使用环境变量来设置 API 密钥，增强安全性
-ENV API_AUTH_KEY=""
 # 使用环境变量来控制推理设备 (例如: "CPU", "GPU", "AUTO")
 ENV INFERENCE_DEVICE="AUTO"
 
