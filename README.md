@@ -3,13 +3,14 @@
 使用 AltCLIP + Insightface + RapidOCR + Openvino 的一站式 AI 服务。
 ONNX 版本稍后做，欢迎 PR。
 
-| 环境变量               | 描述                                                                                       | 默认值   |
-|--------------------|------------------------------------------------------------------------------------------| -------- |
-| `API_AUTH_KEY`     | 用于保护 API 端点的密钥。                                                                     | `mt-photos-ai-openvino`   |
-| `INFERENCE_DEVICE` | 指定 OpenVINO 的推理设备，可选值如 `"CPU"`, `"GPU"`, `"AUTO"`。`AUTO` 会自动选择最佳设备。                      | `"AUTO"` |
-| `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"` |
+| 环境变量               | 描述                                                                                       | 默认值                       |
+|--------------------|------------------------------------------------------------------------------------------|---------------------------|
+| `API_AUTH_KEY`     | 用于保护 API 端点的密钥。                                                                          | `"mt-photos-ai-openvino"` |
+| `INFERENCE_DEVICE` | 指定 OpenVINO 的推理设备，可选值如 `"CPU"`, `"GPU"`, `"AUTO"`。`AUTO` 会自动选择最佳设备。                      | `"AUTO"`                  |
+| `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"`             |
 
 请使用最新的Docker镜像，旧版可能有bug。
+
 https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 
 ``` docker pull molyleaf/mt-photos-ai-openvino:latest ```
