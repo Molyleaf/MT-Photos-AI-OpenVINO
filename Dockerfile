@@ -1,51 +1,3 @@
-# ---- 阶段 1: 模型转换构建器 ----
-# 使用包含所有转换所需工具的开发镜像
-FROM openvino/ubuntu24_dev:2025.3.0 AS builder
-
-ARG DEBIAN_FRONTEND=noninteractive
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /builder
-
-# 优先复制依赖和脚本文件，以便利用 Docker 的层缓存机制
-COPY requirements.txt .
-COPY scripts/convert_models.py ./scripts/
-
-USER root
-
-# 更换 APT 源
-RUN rm -f /etc/apt/sources.list \
-    rm -rf /etc/apt/sources.list.d/
-
-COPY sources.list /etc/apt/sources.list
-
-RUN apt update
-
-# 系统依赖
-RUN apt install -y \
-    python3-dev g++ && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
-
-RUN pip install --no-cache-dir -r requirements.txt
-
-RUN pip install --upgrade \
-    openvino \
-    onnx \
-    onnxruntime \
-    "torch>=2.1" \
-    "transformers>=4.35"
-
-# 运行模型转换脚本
-# 该脚本会从 Hugging Face 下载 BAAI/AltCLIP-m18 模型，
-# 先将其转换为 ONNX 格式，然后转换为 OpenVINO IR FP16 格式。
-# 转换后的模型将输出到 /builder/models/alt-clip/openvino 目录
-RUN python scripts/convert_models.py --output_dir /builder/models/alt-clip
-
-# ---- 阶段 2: 最终运行时镜像 ----
 # 使用轻量级的运行时镜像作为最终的应用镜像
 FROM openvino/ubuntu24_runtime:2025.3.0
 
@@ -59,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 复制运行时环境所需的依赖文件
 COPY requirements-runtime.txt .
 
-USER root
+USER root [cite: 4]
 
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
@@ -72,18 +24,20 @@ RUN apt update
 # 系统依赖
 RUN apt install -y \
     python3-dev g++ && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
 
-# 仅安装运行时必要的依赖，以保持镜像的轻量
-# 这里排除了 torch, onnx 等只在构建阶段需要的库
-RUN pip install --no-cache-dir -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple -r requirements-runtime.txt
+RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
 
-# 从构建器阶段复制已经转换好的 OpenVINO IR 模型
-COPY --from=builder /builder/models/alt-clip/openvino /models/alt-clip/openvino
+# 仅安装运行时必要的依赖
+RUN pip install --no-cache-dir -r requirements-runtime.txt
+
+# 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型
+# 请确保在运行 `docker build` 之前，这些模型文件存在于您项目的 `./models/alt-clip/openvino` 目录下
+COPY models/alt-clip/openvino /models/alt-clip/openvino
 
 # 复制预先下载好的 InsightFace 模型
 # 在项目构建前，需要将这些模型文件放置在项目根目录的 models/insightface/buffalo_l 目录下
-COPY models/insightface/buffalo_l /models/insightface/buffalo_l
+COPY models/insightface /models/insightface
 
 # 复制应用程序的源代码
 COPY app/server_openvino.py .
