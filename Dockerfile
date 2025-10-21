@@ -49,5 +49,5 @@ EXPOSE 8060
 ENV INFERENCE_DEVICE="AUTO"
 
 # 设置容器启动时执行的默认命令
-CMD ["uvicorn", "server_openvino.py", "--host", "0.0.0.0", "--port", "8060"]
+CMD ["uvicorn", "server_openvino:app", "--host", "0.0.0.0", "--port", "8060"]
 
