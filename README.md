@@ -10,6 +10,9 @@ ONNX 版本稍后做，欢迎 PR。
 | `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"` |
 
 请使用最新的Docker镜像，旧版可能有bug。
+https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
+
+''' docker pull molyleaf/mt-photos-ai-openvino:latest '''
 
 ## 以下是AI写的
 
