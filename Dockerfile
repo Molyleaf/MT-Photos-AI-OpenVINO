@@ -24,11 +24,10 @@ RUN apt update
 # 系统依赖
 RUN apt install -y \
     python3-dev g++ && \
-    rm -rf /var/lib/apt/lists/* \
+    rm -rf /var/lib/apt/lists/*
 
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/
 
-# 仅安装运行时必要的依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制您在本地提前转换好的 Alt-CLIP OpenVINO IR 模型

@@ -1,1 +1,0 @@
-Place buffalo_l 的五个 .onnx here.
