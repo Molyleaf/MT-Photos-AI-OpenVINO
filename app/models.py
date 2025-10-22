@@ -5,7 +5,7 @@ import logging
 
 import numpy as np
 import openvino as ov
-from insightface.app import FaceAnalysis
+from insightface.app import FaceAnalysis # 确保导入正确
 from rapidocr_openvino import RapidOCR
 from PIL import Image
 
@@ -34,10 +34,6 @@ CONTEXT_LENGTH = 52
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 新增：导入 server_openvino.py 中的 Pydantic 模型 ---
-# 这样做是为了确保返回的数据结构与 FastAPI 的期望完全一致
-# 注意：在实际项目中，更好的做法是将 Pydantic 模型定义在一个单独的文件中，
-# 然后让 models.py 和 server_openvino.py 都从该文件导入。
-# 但为了简单起见，我们暂时在这里重新定义（或确保它们一致）。
 from pydantic import BaseModel
 
 class OCRBox(BaseModel):
@@ -89,21 +85,21 @@ class AIModels:
         norm[norm < 1e-6] = 1e-6
         return vector / norm
 
+    # --- 修正：将 providers 移到 FaceAnalysis 构造函数 ---
     def _load_insightface(self) -> FaceAnalysis:
         """加载 InsightFace 人脸识别模型。"""
         try:
             logging.info(f"正在从以下路径加载 InsightFace 模型: {self.insightface_root}")
-            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root)
-            # --- 修正：显式指定 providers ---
-            # 避免 UserWarning: Specified provider 'CUDAExecutionProvider' ...
-            # OpenVINOExecutionProvider 可能需要额外配置，先用 CPU
-            face_app.prepare(ctx_id=0, det_size=(640, 640), providers=['CPUExecutionProvider'])
-            # --- 结束修正 ---
+            # 将 providers 参数传递给构造函数
+            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=['CPUExecutionProvider'])
+            # prepare 不再需要 providers 参数
+            face_app.prepare(ctx_id=0, det_size=(640, 640))
             logging.info("InsightFace 模型加载成功。")
             return face_app
         except Exception as e:
             logging.error(f"加载 InsightFace 模型失败: {e}", exc_info=True)
             raise
+    # --- 结束修正 ---
 
     def _load_rapidocr(self) -> RapidOCR:
         """加载 RapidOCR 模型。"""
@@ -138,7 +134,6 @@ class AIModels:
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config)
 
             # --- 验证步骤 ---
-            # (验证代码不变)
             vision_output_partial_shape = vision_compiled.outputs[0].get_partial_shape()
             if vision_output_partial_shape.rank.get_length() != 2 or vision_output_partial_shape[1].get_length() != CLIP_EMBEDDING_DIMS:
                 raise RuntimeError(f"视觉模型输出维度不匹配！")
@@ -155,37 +150,30 @@ class AIModels:
             logging.error(f"加载 Chinese-CLIP 模型时发生严重错误: {e}", exc_info=True)
             raise
 
-    # --- 修正：get_face_representation 返回值结构 ---
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         """使用 InsightFace 提取人脸特征，返回符合 RepresentResult 结构的列表。"""
         try:
             faces = self.face_analyzer.get(image)
             results = []
             for face in faces:
-                # face.bbox 是 [x1, y1, x2, y2]
                 bbox = face.bbox.astype(int)
                 x1, y1, x2, y2 = bbox
-                # 转换为 FacialArea (x, y, w, h)
                 facial_area = FacialArea(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
-
                 results.append(RepresentResult(
                     embedding=[float(x) for x in face.normed_embedding],
                     facial_area=facial_area,
-                    face_confidence=float(face.det_score) # 添加 face_confidence
+                    face_confidence=float(face.det_score)
                 ))
             return results
         except Exception as e:
             logging.warning(f"处理人脸识别时出错: {e}", exc_info=True)
             return []
-    # --- 结束修正 ---
 
-    # --- 修正：get_ocr_results 返回值结构 ---
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
         """使用 RapidOCR 提取文本，返回符合 OCRResult 结构的对象。"""
         try:
             ocr_result, _ = self.ocr_engine(image)
             if ocr_result is None:
-                # 返回空的 OCRResult 对象
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             texts = []
@@ -194,10 +182,7 @@ class AIModels:
             for res in ocr_result:
                 texts.append(res[1])
                 scores.append(float(res[2]))
-                # res[0] 是 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
                 points = np.array(res[0], dtype=np.int32)
-                x_coords = points[:, 0]
-                y_coords = points[:, 1]
                 x_min, y_min = np.min(points, axis=0)
                 x_max, y_max = np.max(points, axis=0)
                 width = x_max - x_min
@@ -207,9 +192,7 @@ class AIModels:
             return OCRResult(texts=texts, scores=scores, boxes=boxes)
         except Exception as e:
             logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)
-            # 返回空的 OCRResult 对象
             return OCRResult(texts=[], scores=[], boxes=[])
-    # --- 结束修正 ---
 
     def get_image_embedding(self, image: Image.Image, filename: str = "unknown") -> List[float]:
         """为图像生成 768 维的 CLIP 嵌入向量 (已归一化)。"""
