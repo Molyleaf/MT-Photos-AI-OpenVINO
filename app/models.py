@@ -78,21 +78,20 @@ class AIModels:
             vision_compiled = self.core.compile_model(vision_model_path, INFERENCE_DEVICE, config)
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config)
 
-            # --- 最终验证步骤 ---
-            # 验证视觉模型的输出维度
-            vision_output_shape = vision_compiled.outputs[0].shape
-            if len(vision_output_shape) != 2 or vision_output_shape[1] != CLIP_EMBEDDING_DIMS:
+            # --- 最终验证步骤 (已修复) ---
+            # 使用 get_partial_shape() 来安全地处理动态维度
+            vision_output_partial_shape = vision_compiled.outputs[0].get_partial_shape()
+            if vision_output_partial_shape.rank.get_length() != 2 or vision_output_partial_shape[1].get_length() != CLIP_EMBEDDING_DIMS:
                 raise RuntimeError(
                     f"视觉模型输出维度不匹配！期望维度: (*, {CLIP_EMBEDDING_DIMS}), "
-                    f"实际加载的模型输出维度: {vision_output_shape}。请确保您使用了正确的模型文件！"
+                    f"实际加载的模型输出维度: {vision_output_partial_shape}。请确保您使用了正确的模型文件！"
                 )
 
-            # 验证文本模型的输出维度
-            text_output_shape = text_compiled.outputs[0].shape
-            if len(text_output_shape) != 2 or text_output_shape[1] != CLIP_EMBEDDING_DIMS:
+            text_output_partial_shape = text_compiled.outputs[0].get_partial_shape()
+            if text_output_partial_shape.rank.get_length() != 2 or text_output_partial_shape[1].get_length() != CLIP_EMBEDDING_DIMS:
                 raise RuntimeError(
                     f"文本模型输出维度不匹配！期望维度: (*, {CLIP_EMBEDDING_DIMS}), "
-                    f"实际加载的模型输出维度: {text_output_shape}。请确保您使用了正确的模型文件！"
+                    f"实际加载的模型输出维度: {text_output_partial_shape}。请确保您使用了正确的模型文件！"
                 )
 
             logging.info(f"Alt-CLIP 模型维度验证通过 (期望维度: {CLIP_EMBEDDING_DIMS})。")
