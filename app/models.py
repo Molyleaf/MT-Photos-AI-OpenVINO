@@ -30,7 +30,6 @@ class AIModels:
         self.alt_clip_path = os.path.join(MODEL_BASE_PATH, "alt-clip", "openvino")
 
         # --- 模型加载 ---
-        # 每个加载函数现在都更健壮，包含详细的日志和错误处理
         self.face_analyzer = self._load_insightface()
         self.ocr_engine = self._load_rapidocr()
         self.clip_processor, self.clip_vision_model, self.clip_text_model = self._load_alt_clip()
@@ -40,7 +39,6 @@ class AIModels:
     def _load_insightface(self) -> FaceAnalysis:
         logging.info(f"正在从以下根路径加载 InsightFace 模型: {self.insightface_root}")
         try:
-            # 指定使用 OpenVINOExecutionProvider
             app = FaceAnalysis(
                 name=MODEL_NAME,
                 root=self.insightface_root,
@@ -72,19 +70,32 @@ class AIModels:
             if not os.path.exists(vision_model_path) or not os.path.exists(text_model_path):
                 raise FileNotFoundError(f"未在 '{self.alt_clip_path}' 路径下找到 Alt-CLIP 的 OpenVINO 模型文件。请确保已运行正确的模型转换脚本。")
 
-            # 为服务器环境优化性能提示
             config = {"PERFORMANCE_HINT": "THROUGHPUT"}
             logging.info(f"使用性能提示 '{config['PERFORMANCE_HINT']}' 编译 Alt-CLIP 模型...")
 
-            # 1. 加载 Processor (用于数据预处理)
             processor = AltCLIPProcessor.from_pretrained(self.alt_clip_path, use_fast=True)
 
-            # 2. 编译视觉模型
             vision_compiled = self.core.compile_model(vision_model_path, INFERENCE_DEVICE, config)
-
-            # 3. 编译文本模型
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config)
 
+            # --- 最终验证步骤 ---
+            # 验证视觉模型的输出维度
+            vision_output_shape = vision_compiled.outputs[0].shape
+            if len(vision_output_shape) != 2 or vision_output_shape[1] != CLIP_EMBEDDING_DIMS:
+                raise RuntimeError(
+                    f"视觉模型输出维度不匹配！期望维度: (*, {CLIP_EMBEDDING_DIMS}), "
+                    f"实际加载的模型输出维度: {vision_output_shape}。请确保您使用了正确的模型文件！"
+                )
+
+            # 验证文本模型的输出维度
+            text_output_shape = text_compiled.outputs[0].shape
+            if len(text_output_shape) != 2 or text_output_shape[1] != CLIP_EMBEDDING_DIMS:
+                raise RuntimeError(
+                    f"文本模型输出维度不匹配！期望维度: (*, {CLIP_EMBEDDING_DIMS}), "
+                    f"实际加载的模型输出维度: {text_output_shape}。请确保您使用了正确的模型文件！"
+                )
+
+            logging.info(f"Alt-CLIP 模型维度验证通过 (期望维度: {CLIP_EMBEDDING_DIMS})。")
             logging.info("Alt-CLIP 模型及 Processor 加载成功。")
             return processor, vision_compiled, text_compiled
         except Exception as e:
@@ -98,7 +109,6 @@ class AIModels:
 
         results = []
         for face in faces:
-            # 确保人脸检测结果有效
             if face.bbox is not None and face.embedding is not None and face.det_score is not None:
                 bbox = face.bbox.astype(int)
                 x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
@@ -129,53 +139,42 @@ class AIModels:
 
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         try:
-            # 使用 processor 进行图像预处理，返回 PyTorch 张量
             inputs = self.clip_processor(images=image, return_tensors="pt")
-            # 转换为 NumPy 数组以适配 OpenVINO
             pixel_values = inputs['pixel_values'].numpy()
 
-            # OpenVINO 推理
             infer_request = self.clip_vision_model.create_infer_request()
             results = infer_request.infer({self.clip_vision_model.inputs[0].any_name: pixel_values})
 
-            # 获取唯一的输出
             embedding = results[self.clip_vision_model.outputs[0]]
 
-            # L2 归一化
             norm = np.linalg.norm(embedding)
             if norm > 1e-6:
                 normalized_embedding = embedding / norm
             else:
                 normalized_embedding = embedding
 
-            # 转换为 Python 列表并返回
             final_embedding = [float(x) for x in normalized_embedding.flatten()]
 
             return final_embedding
 
         except Exception as e:
             logging.error(f"在 get_image_embedding 中处理 '{filename}' 时发生严重错误: {e}", exc_info=True)
-            # 在出错时返回一个符合维度的零向量，以防止客户端崩溃
             return [0.0] * CLIP_EMBEDDING_DIMS
 
     def get_text_embedding(self, text: str) -> List[float]:
         try:
-            # 使用 processor 进行文本预处理 (tokenize)
             inputs = self.clip_processor(text=text, return_tensors="pt", padding=True, truncation=True)
             input_ids = inputs['input_ids'].numpy()
             attention_mask = inputs['attention_mask'].numpy()
 
-            # OpenVINO 推理
             infer_request = self.clip_text_model.create_infer_request()
             results = infer_request.infer({
                 self.clip_text_model.inputs[0].any_name: input_ids,
                 self.clip_text_model.inputs[1].any_name: attention_mask
             })
 
-            # 获取唯一的输出
             embedding = results[self.clip_text_model.outputs[0]]
 
-            # L2 归一化
             norm = np.linalg.norm(embedding)
             if norm > 1e-6:
                 normalized_embedding = embedding / norm
