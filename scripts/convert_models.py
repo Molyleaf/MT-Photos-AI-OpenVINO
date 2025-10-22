@@ -21,21 +21,36 @@ MODEL_ARCH = "ViT-L-14"
 # ViT-L-14 的原生维度就是 768
 NATIVE_DIMS = 768
 
-# --- 新增: 动态路径定义 ---
+# --- 动态路径定义 ---
 # 获取此脚本所在的目录 (e.g., .../mt-photos-ai-openvino/scripts)
 SCRIPT_DIR = Path(__file__).resolve().parent
 # 获取项目根目录 (e.g., .../mt-photos-ai-openvino)
 PROJECT_ROOT = SCRIPT_DIR.parent
-# 动态计算 Chinese-CLIP 转换脚本的路径
-# (e.g., .../mt-photos-ai-openvino/chinese-clip/cn_clip/deploy/pytorch_to_onnx.py)
-ONNX_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "pytorch_to_onnx.py"
+
+# --- 修正: 路径指向您所描述的 cn_clip 内部路径 ---
+# (e.g., .../mt-photos-ai-openvino/scripts/cn_clip/deploy/pytorch_to_onnx.py)
+ONNX_SCRIPT_PATH = SCRIPT_DIR / "cn_clip" / "deploy" / "pytorch_to_onnx.py"
+# --- 结束修正 ---
+
+# --- 新增: 定义 cn_clip 文件夹的路径 ---
+CN_CLIP_DIR = SCRIPT_DIR / "cn_clip"
 # --- 结束新增 ---
 
-def run_command(cmd: list):
-    """辅助函数：运行 shell 命令并记录输出。"""
+def run_command(cmd: list, env: dict = None):
+    """
+    辅助函数：运行 shell 命令并记录输出。
+    --- 修正: 增加 env 参数 ---
+    """
     # 将所有 Path 对象转换为字符串，以便 subprocess 可以处理
     str_cmd = [str(item) for item in cmd]
     logging.info(f"正在运行命令: {' '.join(str_cmd)}")
+
+    # 合并当前环境变量和传入的自定义环境变量
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+        logging.info(f"设置环境变量: {env}")
+
     try:
         process = subprocess.run(
             str_cmd,
@@ -43,7 +58,8 @@ def run_command(cmd: list):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            encoding='utf-8'
+            encoding='utf-8',
+            env=merged_env # --- 修正: 传递环境变量 ---
         )
         logging.info(f"命令输出:\n{process.stdout}")
     except subprocess.CalledProcessError as e:
@@ -80,7 +96,12 @@ def convert_models():
     # --- 修改: 使用动态路径并检查脚本是否存在 ---
     if not ONNX_SCRIPT_PATH.exists():
         logging.error(f"找不到 ONNX 转换脚本: {ONNX_SCRIPT_PATH}")
-        logging.error("请确保 'chinese-clip' 仓库已克隆到项目根目录 (与 'scripts' 目录同级)。")
+        logging.error("请确保 'pytorch_to_onnx.py' 位于 'scripts/cn_clip/deploy/' 目录下。")
+        sys.exit(1)
+
+    if not CN_CLIP_DIR.exists():
+        logging.error(f"找不到 'cn_clip' 目录: {CN_CLIP_DIR}")
+        logging.error("请确保 'cn_clip' 文件夹完整位于 'scripts' 目录下。")
         sys.exit(1)
 
     cmd_onnx = [
@@ -89,23 +110,40 @@ def convert_models():
         "--model-arch", MODEL_ARCH,
         "--save-onnx-path", onnx_save_prefix, # 使用包含路径的前缀
         "--convert-text",
-        "--convert-vision"
+        "--convert-vision",
+        "--download-root", PROJECT_ROOT / "cache" # 指定下载缓存位置
     ]
-    # --- 结束修改 ---
+
+    # --- 新增: 设置 PYTHONPATH ---
+    # 告诉子脚本去 'scripts/cn_clip' 目录寻找 'clip' 模块
+    # 同时添加 'scripts' 目录，以便 'cn_clip.clip' 能被找到
+    python_path = f"{str(CN_CLIP_DIR)}{os.pathsep}{str(SCRIPT_DIR)}"
+
+    # 将现有的 PYTHONPATH 也包含进来
+    existing_python_path = os.environ.get('PYTHONPATH', '')
+    if existing_python_path:
+        python_path = f"{python_path}{os.pathsep}{existing_python_path}"
+
+    custom_env = {"PYTHONPATH": python_path}
+    # --- 结束新增 ---
 
     try:
-        run_command(cmd_onnx)
+        # --- 修正: 传递自定义环境变量 ---
+        run_command(cmd_onnx, env=custom_env)
+        # --- 结束修正 ---
         logging.info("ONNX 模型转换成功。")
     except Exception as e:
         logging.error(f"ONNX 转换失败: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 步骤 2: 转换 ONNX (FP16) -> OpenVINO IR (FP16) ---
+    # --- 步骤 2: 转换 ONNX -> OpenVINO IR (FP16) ---
     logging.info("--- 步骤 2: 转换 ONNX -> OpenVINO IR (FP16) ---")
 
-    # 官方脚本输出的 FP16 ONNX 文件路径
-    text_onnx_path = onnx_temp_dir / f"vit-l-14.txt.fp16.onnx"
-    vision_onnx_path = onnx_temp_dir / f"vit-l-14.img.fp16.onnx"
+    # --- 修正：使用 FP32 ONNX 模型作为输入 ---
+    # 官方脚本输出的 FP32 ONNX 文件路径
+    text_onnx_path = onnx_temp_dir / f"vit-l-14.txt.fp32.onnx"
+    vision_onnx_path = onnx_temp_dir / f"vit-l-14.img.fp32.onnx"
+    # --- 结束修正 ---
 
     # 最终 OpenVINO IR 的输出路径
     ov_text_path = ov_save_path / "openvino_text_fp16.xml"
@@ -122,11 +160,13 @@ def convert_models():
         # 转换文本模型
         logging.info(f"正在转换文本模型: {text_onnx_path} -> {ov_text_path}")
         ov_text_model = ov.convert_model(text_onnx_path)
+        # 我们在这里（保存时）进行 FP16 转换
         ov.save_model(ov_text_model, ov_text_path, compress_to_fp16=True)
 
         # 转换图像模型
         logging.info(f"正在转换图像模型: {vision_onnx_path} -> {ov_vision_path}")
         ov_vision_model = ov.convert_model(vision_onnx_path)
+        # 我们在这里（保存时）进行 FP16 转换
         ov.save_model(ov_vision_model, ov_vision_path, compress_to_fp16=True)
 
         logging.info("OpenVINO IR 模型已成功保存。")
