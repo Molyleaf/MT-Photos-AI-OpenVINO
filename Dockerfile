@@ -34,7 +34,7 @@ RUN apt update && apt install -y --no-install-recommends \
     intel-opencl-icd \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/ \
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
     && pip install --no-cache-dir -r requirements-docker.txt \
     && apt remove g++ -y \
     && apt autoremove -y \

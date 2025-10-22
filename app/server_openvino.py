@@ -1,3 +1,4 @@
+# app/server_openvino.py
 import os
 from contextlib import asynccontextmanager
 from typing import List
@@ -8,12 +9,12 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+from PIL import Image # --- 新增导入 ---
 
 # 导入我们重构后的模型处理模块
 import models as ai_models
 
 # --- 日志配置 ---
-# 配置日志记录器，以便我们可以看到详细的调试信息
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- API 密钥认证 ---
@@ -143,7 +144,12 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         image = await read_image_from_upload(file)
         # 将 BGR 图像转换为 RGB 格式，因为 CLIP 模型是用 RGB 图像训练的
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        embedding = models_instance.get_image_embedding(image_rgb, file.filename)
+
+        # --- MODIFIED: 转换为 PIL Image ---
+        # 新的 get_image_embedding 需要 PIL Image 对象
+        image_pil = Image.fromarray(image_rgb)
+        embedding = models_instance.get_image_embedding(image_pil, file.filename)
+        # --- END MODIFIED ---
 
         response_data = {"results": embedding}
         logging.info(f"成功为 '{file.filename}' 生成 embedding。向量长度: {len(embedding)}")

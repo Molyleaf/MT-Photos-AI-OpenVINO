@@ -1,196 +1,185 @@
+# /app/convert_models.py
 import argparse
-from pathlib import Path
 import logging
+import os
+import subprocess
 import sys
-import torch
-import openvino as ov
-from transformers import AutoProcessor, AutoModel
+from pathlib import Path
 
-# 配置日志
+# 导入 openvino，确保已安装
+try:
+    import openvino as ov
+except ImportError:
+    logging.error("OpenVINO 库未找到。请运行: pip install openvino openvino-dev")
+    sys.exit(1)
+
+# --- 配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 修改：包装类现在包含 编码器 + 投影层 ---
-class VisionModelWrapper(torch.nn.Module):
+# 对应 'chinese-clip-vit-large-patch14'
+MODEL_ARCH = "ViT-L-14"
+# ViT-L-14 的原生维度就是 768
+NATIVE_DIMS = 768
+
+# --- 新增: 动态路径定义 ---
+# 获取此脚本所在的目录 (e.g., .../mt-photos-ai-openvino/scripts)
+SCRIPT_DIR = Path(__file__).resolve().parent
+# 获取项目根目录 (e.g., .../mt-photos-ai-openvino)
+PROJECT_ROOT = SCRIPT_DIR.parent
+# 动态计算 Chinese-CLIP 转换脚本的路径
+# (e.g., .../mt-photos-ai-openvino/chinese-clip/cn_clip/deploy/pytorch_to_onnx.py)
+ONNX_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "pytorch_to_onnx.py"
+# --- 结束新增 ---
+
+def run_command(cmd: list):
+    """辅助函数：运行 shell 命令并记录输出。"""
+    # 将所有 Path 对象转换为字符串，以便 subprocess 可以处理
+    str_cmd = [str(item) for item in cmd]
+    logging.info(f"正在运行命令: {' '.join(str_cmd)}")
+    try:
+        process = subprocess.run(
+            str_cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8'
+        )
+        logging.info(f"命令输出:\n{process.stdout}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"命令执行失败! 返回码: {e.returncode}")
+        logging.error(f"错误输出:\n{e.stdout}")
+        raise
+
+def convert_models():
     """
-    包装视觉模型及其投影层，
-    使其 forward 时返回 [batch_size, 1024] 的最终投影特征。
+    执行 Pytorch -> ONNX -> OpenVINO IR (FP16) 的完整转换流程。
     """
-    def __init__(self, vision_model, visual_projection):
-        super().__init__()
-        self.vision_model = vision_model
-        self.visual_projection = visual_projection
 
-    def forward(self, pixel_values):
-        # 1. 编码器输出 (得到 [?, 1280] 维的 pooler_output)
-        outputs = self.vision_model(pixel_values=pixel_values)
-        pooled_output = outputs.pooler_output
-        # 2. 投影层 (将 [?, 1280] 转换为 [?, 1024])
-        projected_output = self.visual_projection(pooled_output)
-        return projected_output
+    # --- 修改: 根据您的需求设置路径 ---
+    # 基础路径: ../models/chinese-clip/ (相对于 scripts 目录)
+    models_base_dir = PROJECT_ROOT / "models" / "chinese-clip"
 
-class TextModelWrapper(torch.nn.Module):
-    """
-    包装文本模型及其投影层，
-    使其 forward 时返回 [batch_size, 1024] 的最终投影特征。
-    """
-    def __init__(self, text_model, text_projection):
-        super().__init__()
-        self.text_model = text_model
-        self.text_projection = text_projection
+    ov_save_path = models_base_dir / "openvino"
+    onnx_temp_dir = models_base_dir / "onnx"
 
-    def forward(self, input_ids):
-        # 1. 编码器输出 (得到 [?, 1024] 维的 pooler_output)
-        outputs = self.text_model(input_ids=input_ids)
-        pooled_output = outputs.pooler_output
-        # 2. 投影层 (将 [?, 1024] 转换为 [?, 1024])
-        projected_output = self.text_projection(pooled_output)
-        return projected_output
-# --- 结束修改 ---
+    # 修正: ONNX 保存前缀必须是完整路径，否则会保存到当前工作目录
+    onnx_save_prefix = onnx_temp_dir / "vit-l-14"
 
+    # 在运行前创建所需目录
+    ov_save_path.mkdir(parents=True, exist_ok=True)
+    onnx_temp_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"ONNX 模型将保存到: {onnx_temp_dir}")
+    logging.info(f"OpenVINO 模型将保存到: {ov_save_path}")
+    # --- 结束修改 ---
 
-def convert_model_manual(output_dir_str: str):
-    model_name = "BAAI/AltCLIP-m18"
-    output_dir = Path(output_dir_str)
+    logging.info(f"--- 步骤 1: 转换 Pytorch -> ONNX (FP16) ---")
+    logging.info(f"模型架构: {MODEL_ARCH}")
+    logging.info(f"ONNX 临时保存路径前缀: {onnx_save_prefix}")
 
-    logging.info(f"开始从 '{model_name}' 手动转换模型...")
-    logging.info(f"模型将被保存到: {output_dir}")
+    # --- 修改: 使用动态路径并检查脚本是否存在 ---
+    if not ONNX_SCRIPT_PATH.exists():
+        logging.error(f"找不到 ONNX 转换脚本: {ONNX_SCRIPT_PATH}")
+        logging.error("请确保 'chinese-clip' 仓库已克隆到项目根目录 (与 'scripts' 目录同级)。")
+        sys.exit(1)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd_onnx = [
+        "python",
+        ONNX_SCRIPT_PATH, # 使用动态路径
+        "--model-arch", MODEL_ARCH,
+        "--save-onnx-path", onnx_save_prefix, # 使用包含路径的前缀
+        "--convert-text",
+        "--convert-vision"
+    ]
+    # --- 结束修改 ---
 
     try:
-        # --- 1. 加载并保存处理器 ---
-        logging.info("加载 Processor...")
-        # trust_remote_code=True 是必需的
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        processor.save_pretrained(output_dir)
-        logging.info(f"Processor 文件已保存到 {output_dir}")
+        run_command(cmd_onnx)
+        logging.info("ONNX 模型转换成功。")
+    except Exception as e:
+        logging.error(f"ONNX 转换失败: {e}", exc_info=True)
+        sys.exit(1)
 
-        # --- 2. 加载 PyTorch 模型 ---
-        logging.info("加载 PyTorch 模型 (trust_remote_code=True)...")
-        pt_model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-        pt_model.eval() # 设置为评估模式
+    # --- 步骤 2: 转换 ONNX (FP16) -> OpenVINO IR (FP16) ---
+    logging.info("--- 步骤 2: 转换 ONNX -> OpenVINO IR (FP16) ---")
 
-        # --- 修改：实例化包装模型 (传入编码器和投影层) ---
-        logging.info("创建用于导出的包装模型 (包含投影层)...")
-        vision_model = VisionModelWrapper(
-            pt_model.vision_model,
-            pt_model.visual_projection
-        )
-        text_model = TextModelWrapper(
-            pt_model.text_model,
-            pt_model.text_projection
-        )
-        # --- 结束修改 ---
+    # 官方脚本输出的 FP16 ONNX 文件路径
+    text_onnx_path = onnx_temp_dir / f"vit-l-14.txt.fp16.onnx"
+    vision_onnx_path = onnx_temp_dir / f"vit-l-14.img.fp16.onnx"
 
-        # --- 3. 准备 ONNX 导出的虚拟输入 ---
+    # 最终 OpenVINO IR 的输出路径
+    ov_text_path = ov_save_path / "openvino_text_fp16.xml"
+    ov_vision_path = ov_save_path / "openvino_image_fp16.xml"
 
-        # 视觉模型
-        # (batch_size, num_channels, height, width)
-        dummy_pixel_values = torch.randn(1, 3, 224, 224)
+    if not text_onnx_path.exists() or not vision_onnx_path.exists():
+        logging.error(f"未找到预期的 ONNX 文件: {text_onnx_path} / {vision_onnx_path}")
+        logging.error("请检查步骤1的日志。确保 ONNX 转换成功且路径正确。")
+        sys.exit(1)
 
-        # 文本模型
-        # (batch_size, sequence_length)
-        seq_len = processor.tokenizer.model_max_length
-        vocab_size = processor.tokenizer.vocab_size
-        dummy_input_ids = torch.randint(0, vocab_size, (1, seq_len))
+    core = ov.Core()
 
-        vision_onnx_path = output_dir / "vision_model.onnx"
-        text_onnx_path = output_dir / "text_model.onnx"
-
-        # --- 4. 导出视觉模型到 ONNX ---
-        logging.info("导出视觉模型到 ONNX...")
-        torch.onnx.export(
-            vision_model,            # <--- MODIFIED: 使用新的包装器
-            dummy_pixel_values,
-            vision_onnx_path,
-            input_names=["pixel_values"],
-            output_names=["pooler_output"], # 现在这个名称对应正确的 [?, 1024] 张量
-            dynamic_axes={"pixel_values": {0: "batch_size"}},
-            opset_version=18  # 保持 opset 18
-        )
-
-        # --- 5. 导出文本模型到 ONNX ---
-        logging.info("导出文本模型到 ONNX...")
-        torch.onnx.export(
-            text_model,              # <--- MODIFIED: 使用新的包装器
-            dummy_input_ids,
-            text_onnx_path,
-            input_names=["input_ids"],
-            output_names=["pooler_output"], # 现在这个名称对应正确的 [?, 1024] 张量
-            dynamic_axes={"input_ids": {0: "batch_size"}},
-            opset_version=18  # 保持 opset 18
-        )
-
-        # --- 6. 将 ONNX 转换为 OpenVINO ---
-        logging.info("使用 OpenVINO 转换 ONNX 模型...")
-        core = ov.Core()
-
-        ov_vision_model = ov.convert_model(vision_onnx_path)
+    try:
+        # 转换文本模型
+        logging.info(f"正在转换文本模型: {text_onnx_path} -> {ov_text_path}")
         ov_text_model = ov.convert_model(text_onnx_path)
+        ov.save_model(ov_text_model, ov_text_path, compress_to_fp16=True)
 
-        # --- 7. 保存 OpenVINO 模型 ---
-        # 保存为你的验证脚本期望的 .xml/.bin 文件
-        vision_model_path = output_dir / "openvino_vision_model.xml"
-        text_model_path = output_dir / "openvino_text_model.xml"
+        # 转换图像模型
+        logging.info(f"正在转换图像模型: {vision_onnx_path} -> {ov_vision_path}")
+        ov_vision_model = ov.convert_model(vision_onnx_path)
+        ov.save_model(ov_vision_model, ov_vision_path, compress_to_fp16=True)
 
-        ov.save_model(ov_vision_model, vision_model_path)
-        ov.save_model(ov_text_model, text_model_path)
-
-        logging.info(f"OpenVINO 视觉模型已保存到: {vision_model_path}")
-        logging.info(f"OpenVINO 文本模型已保存到: {text_model_path}")
-
-        # --- 8. 清理临时的 ONNX 文件 ---
-        vision_onnx_path.unlink()
-        text_onnx_path.unlink()
-        logging.info("临时的 ONNX 文件已删除。")
+        logging.info("OpenVINO IR 模型已成功保存。")
 
     except Exception as e:
-        logging.error(f"手动模型转换时发生严重错误: {e}", exc_info=True)
+        logging.error(f"OpenVINO 转换失败: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 你的验证逻辑 (无需更改，现在应该会通过) ---
-    logging.info("--- 开始验证转换后的模型 ---")
+    # --- 步骤 3: 验证转换后的 OpenVINO 模型 ---
+    logging.info("--- 步骤 3: 验证 OpenVINO IR 模型 ---")
     try:
-        core = ov.Core()
-        # 验证处理器是否已正确保存
-        AutoProcessor.from_pretrained(output_dir)
-        logging.info("✅ 验证成功: Processor 加载正常。")
-
-        vision_model_path = output_dir / "openvino_vision_model.xml"
-        text_model_path = output_dir / "openvino_text_model.xml"
-
-        if not vision_model_path.exists() or not text_model_path.exists():
-            raise FileNotFoundError("错误: 手动转换后未找到预期的模型文件。")
-
-        vision_model = core.read_model(vision_model_path)
-        # 重命名验证日志中的 "V视觉模型" 为 "视觉模型"
-        vision_output_shape = vision_model.output("pooler_output").get_partial_shape()
-        logging.info(f"已加载的视觉模型 'pooler_output' 维度: {vision_output_shape}")
-        if vision_output_shape.rank.get_length() != 2 or vision_output_shape[1].get_length() != 1024:
-            logging.error(f"验证失败: 视觉模型维度不是 1024！")
+        vision_model = core.read_model(ov_vision_path)
+        vision_output = vision_model.output(0)
+        vision_dims = vision_output.get_partial_shape()[1].get_length()
+        if vision_dims == NATIVE_DIMS:
+            logging.info(f"✅ 视觉模型维度验证成功: {vision_dims}d")
         else:
-            logging.info("✅ 验证成功: 视觉模型维度正确 (1024)。")
+            raise RuntimeError(f"视觉模型维度错误! 预期: {NATIVE_DIMS}, 得到: {vision_dims}")
 
-        text_model = core.read_model(text_model_path)
-        text_output_shape = text_model.output("pooler_output").get_partial_shape()
-        logging.info(f"已加载的文本模型 'pooler_output' 维度: {text_output_shape}")
-        if text_output_shape.rank.get_length() != 2 or text_output_shape[1].get_length() != 1024:
-            logging.error(f"验证失败: 文本模型维度不是 1024！")
+        text_model = core.read_model(ov_text_path)
+        text_output = text_model.output(0)
+        text_dims = text_output.get_partial_shape()[1].get_length()
+        text_inputs_count = len(text_model.inputs)
+
+        # 官方 Chinese-CLIP ONNX 文本模型只有 1 个输入 (input_ids)
+        if text_inputs_count != 1:
+            raise RuntimeError(f"文本模型输入数量错误! 预期: 1, 得到: {text_inputs_count}")
+        logging.info(f"✅ 文本模型输入数量验证成功: {text_inputs_count}")
+
+        if text_dims == NATIVE_DIMS:
+            logging.info(f"✅ 文本模型维度验证成功: {text_dims}d")
         else:
-            logging.info("✅ 验证成功: 文本模型维度正确 (1024)。")
-
-        logging.info("🎉 全部转换和验证成功完成。")
+            raise RuntimeError(f"文本模型维度错误! 预期: {NATIVE_DIMS}, 得到: {text_dims}")
 
     except Exception as e:
-        logging.error(f"验证转换后的模型时出错: {e}", exc_info=True)
+        logging.error(f"模型验证失败: {e}", exc_info=True)
         sys.exit(1)
+
+    # --- 步骤 4: 清理 ---
+    logging.info("--- 步骤 4: 清理临时 ONNX 文件 ---")
+    try:
+        for f in onnx_temp_dir.glob("vit-l-14*"):
+            f.unlink()
+            logging.info(f"已删除: {f}")
+        onnx_temp_dir.rmdir()
+        logging.info("清理完成。")
+    except Exception as e:
+        logging.warning(f"清理临时文件时出错: {e}", exc_info=True)
+
+    logging.info(f"🎉 全部转换和验证成功完成。模型保存在: {ov_save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="手动将 Alt-CLIP 模型转换为 OpenVINO 格式。")
-    project_root = Path(__file__).resolve().parent.parent
-    default_output = project_root / "models" / "alt-clip" / "openvino"
-    parser.add_argument("--output_dir", type=str, default=str(default_output), help="转换后模型的保存目录。")
-    args = parser.parse_args()
-
-    # 调用新的手动转换函数
-    convert_model_manual(args.output_dir)
+    # --- 修改: 移除了 argparse ---
+    # 脚本现在使用相对于自身的固定路径结构，不再需要外部参数
+    convert_models()
+    # --- 结束修改 ---
