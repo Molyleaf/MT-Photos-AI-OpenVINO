@@ -13,8 +13,10 @@ INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
 MODEL_BASE_PATH = os.environ.get("MODEL_PATH", "/models")
 MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
 
-# 关键常量: 必须与 convert_models_fixed.py 的输出保持一致
-CLIP_EMBEDDING_DIMS = 768
+# --- MODIFIED (Fix 2) ---
+# 关键常量: 必须与 convert_models.py 的输出保持一致
+CLIP_EMBEDDING_DIMS = 1024 # 从 768 修改为 1024
+# --- END MODIFIED ---
 
 # 配置日志记录器
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,8 +66,11 @@ class AIModels:
     def _load_alt_clip(self):
         logging.info(f"正在从以下路径加载 Alt-CLIP 模型: {self.alt_clip_path}")
         try:
-            vision_model_path = os.path.join(self.alt_clip_path, "clip_vision.xml")
-            text_model_path = os.path.join(self.alt_clip_path, "clip_text.xml")
+            # --- MODIFIED (Fix 1) ---
+            # 更改文件名以匹配 convert_models.py 的输出
+            vision_model_path = os.path.join(self.alt_clip_path, "openvino_vision_model.xml")
+            text_model_path = os.path.join(self.alt_clip_path, "openvino_text_model.xml")
+            # --- END MODIFIED ---
 
             if not os.path.exists(vision_model_path) or not os.path.exists(text_model_path):
                 raise FileNotFoundError(f"未在 '{self.alt_clip_path}' 路径下找到 Alt-CLIP 的 OpenVINO 模型文件。请确保已运行正确的模型转换脚本。")
@@ -78,7 +83,7 @@ class AIModels:
             vision_compiled = self.core.compile_model(vision_model_path, INFERENCE_DEVICE, config)
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config)
 
-            # --- 最终验证步骤 (已修复) ---
+            # --- 最终验证步骤 (依赖 Fix 2) ---
             # 使用 get_partial_shape() 来安全地处理动态维度
             vision_output_partial_shape = vision_compiled.outputs[0].get_partial_shape()
             if vision_output_partial_shape.rank.get_length() != 2 or vision_output_partial_shape[1].get_length() != CLIP_EMBEDDING_DIMS:
@@ -164,13 +169,16 @@ class AIModels:
         try:
             inputs = self.clip_processor(text=text, return_tensors="pt", padding=True, truncation=True)
             input_ids = inputs['input_ids'].numpy()
-            attention_mask = inputs['attention_mask'].numpy()
+            # attention_mask = inputs['attention_mask'].numpy() # 已被移除
 
             infer_request = self.clip_text_model.create_infer_request()
+
+            # --- MODIFIED (Fix 3) ---
+            # 移除 attention_mask，因为导出的模型只有一个输入
             results = infer_request.infer({
-                self.clip_text_model.inputs[0].any_name: input_ids,
-                self.clip_text_model.inputs[1].any_name: attention_mask
+                self.clip_text_model.inputs[0].any_name: input_ids
             })
+            # --- END MODIFIED ---
 
             embedding = results[self.clip_text_model.outputs[0]]
 
@@ -186,4 +194,3 @@ class AIModels:
         except Exception as e:
             logging.error(f"在 get_text_embedding 中处理 '{text}' 时发生严重错误: {e}", exc_info=True)
             return [0.0] * CLIP_EMBEDDING_DIMS
-

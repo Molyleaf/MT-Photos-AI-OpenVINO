@@ -8,13 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # 复制运行时环境所需的依赖文件
-COPY requirements.txt .
+COPY requirements-docker.txt .
 
 USER root
 
 COPY models/alt-clip/openvino /models/alt-clip/openvino
 
-COPY models/insightface /models/insightface/models
+COPY models/insightface/models /models/insightface/models
 
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
@@ -35,7 +35,7 @@ RUN apt update && apt install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/ \
-    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -r requirements-docker.txt \
     && apt remove g++ -y \
     && apt autoremove -y \
     && apt autoclean -y
