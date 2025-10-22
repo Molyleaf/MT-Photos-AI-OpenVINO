@@ -7,12 +7,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 复制运行时环境所需的依赖文件
-COPY requirements-docker.txt .
-
 USER root
 
-COPY models/alt-clip/openvino /models/alt-clip/openvino
+COPY requirements-docker.txt .
+
+COPY models/chinese-clip/openvino /models/chinese-clip/openvino
 
 COPY models/insightface/models /models/insightface/models
 

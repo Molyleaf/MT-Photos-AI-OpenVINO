@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from PIL import Image # --- 新增导入 ---
+from PIL import Image
 
 # 导入我们重构后的模型处理模块
 import models as ai_models
@@ -23,7 +23,6 @@ API_KEY_NAME = "api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(api_key_header: str = Depends(api_key_header)):
-    # 如果没有设置 API_AUTH_KEY，则不进行验证
     if not API_AUTH_KEY or API_AUTH_KEY == "no-key":
         return
     if api_key_header != API_AUTH_KEY:
@@ -33,7 +32,6 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 # --- Lifespan 事件管理 ---
-# 创建一个全局变量来持有 AIModels 实例
 models_instance: ai_models.AIModels
 
 @asynccontextmanager
@@ -41,28 +39,25 @@ async def lifespan(app: FastAPI):
     global models_instance
     logging.info("应用启动... 开始加载 AI 模型。")
     try:
-        # 在应用启动时，初始化 AIModels 类
         models_instance = ai_models.AIModels()
         logging.info("AI 模型加载成功。")
     except Exception as e:
-        # 如果模型加载失败，记录严重错误并阻止应用启动
         logging.critical(f"严重错误: AI 模型无法初始化。错误详情: {e}", exc_info=True)
-        # 在实际部署中，这会让 uvicorn 进程失败并退出，容器应该会重启
         raise RuntimeError(f"AI 模型初始化失败: {e}") from e
 
     yield
-
     logging.info("应用关闭。")
 
 app = FastAPI(
     title="MT-Photos AI 统一服务 (OpenVINO 版本)",
     description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。",
-    version="2.0.0", # 版本号提升，代表重大重构
+    version="2.0.0",
     dependencies=[Depends(get_api_key)],
     lifespan=lifespan
 )
 
 # --- Pydantic 模型定义 (请求与响应体) ---
+# (与 models.py 中的定义保持一致)
 
 class TextClipRequest(BaseModel):
     text: str
@@ -82,7 +77,7 @@ class OCRResult(BaseModel):
     boxes: List[OCRBox]
 
 class OCRResponse(BaseModel):
-    result: OCRResult
+    result: OCRResult # 注意这里是 OCRResult 对象，不是列表
 
 class ClipResponse(BaseModel):
     results: List[float]
@@ -101,7 +96,7 @@ class RepresentResult(BaseModel):
 class RepresentResponse(BaseModel):
     detector_backend: str = "insightface"
     recognition_model: str = os.environ.get("MODEL_NAME", "buffalo_l")
-    result: List[RepresentResult]
+    result: List[RepresentResult] # 注意这里是 RepresentResult 对象的列表
 
 # --- 辅助函数 ---
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
@@ -113,10 +108,9 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     if img is None:
         raise HTTPException(status_code=400, detail=f"文件 '{file.filename}' 无法被解码为图像。")
 
-    # 确保图像是 3 通道 BGR 格式
-    if len(img.shape) == 2:  # 灰度图
+    if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif img.shape[2] == 4:  # BGRA (带透明通道)
+    elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     return img
@@ -131,8 +125,10 @@ async def check_service(t: str = ""):
 async def ocr_endpoint(file: UploadFile = File(...)):
     try:
         image = await read_image_from_upload(file)
-        ocr_results = models_instance.get_ocr_results(image)
-        return {"result": ocr_results}
+        # 现在 get_ocr_results 返回的是 OCRResult 对象
+        ocr_results_obj = models_instance.get_ocr_results(image)
+        # 直接将其放入响应的 "result" 字段
+        return {"result": ocr_results_obj}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"处理 OCR 失败: {str(e)}")
@@ -142,17 +138,14 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
     logging.info(f"开始处理 CLIP 图像请求: {file.filename}")
     try:
         image = await read_image_from_upload(file)
-        # 将 BGR 图像转换为 RGB 格式，因为 CLIP 模型是用 RGB 图像训练的
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # --- MODIFIED: 转换为 PIL Image ---
-        # 新的 get_image_embedding 需要 PIL Image 对象
         image_pil = Image.fromarray(image_rgb)
         embedding = models_instance.get_image_embedding(image_pil, file.filename)
-        # --- END MODIFIED ---
 
-        response_data = {"results": embedding}
+        # --- 修正：缩减日志输出 ---
         logging.info(f"成功为 '{file.filename}' 生成 embedding。向量长度: {len(embedding)}")
+        # --- 结束修正 ---
+        response_data = {"results": embedding}
         return response_data
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -162,6 +155,9 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
 async def clip_text_endpoint(request: TextClipRequest):
     try:
         embedding = models_instance.get_text_embedding(request.text)
+        # --- 修正：缩减日志输出 ---
+        logging.info(f"成功为文本 '{request.text[:30]}...' 生成 embedding。向量长度: {len(embedding)}")
+        # --- 结束修正 ---
         return {"results": embedding}
     except Exception as e:
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
@@ -171,16 +167,16 @@ async def clip_text_endpoint(request: TextClipRequest):
 async def represent_endpoint(file: UploadFile = File(...)):
     try:
         image = await read_image_from_upload(file)
-        face_results = models_instance.get_face_representation(image)
-        return {"result": face_results}
+        # 现在 get_face_representation 返回的是 List[RepresentResult]
+        face_results_list = models_instance.get_face_representation(image)
+        # 直接将其放入响应的 "result" 字段
+        return {"result": face_results_list}
     except Exception as e:
         logging.error(f"处理人脸识别请求失败: {file.filename}, 错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"处理人脸识别失败: {str(e)}")
 
-# Uvicorn 服务器入口 (用于直接运行脚本进行测试)
+# Uvicorn 服务器入口
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
-    # 在 __main__ 块中运行 lifespan 管理器需要手动设置
-    # 但在生产环境中，Uvicorn 会自动处理
     uvicorn.run("server_openvino:app", host="0.0.0.0", port=port, reload=True)
