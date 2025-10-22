@@ -57,17 +57,11 @@ RUN groupadd -g 991 render || true
 # 将 root 用户添加到 render 组中。如果你的应用最终以非 root 用户运行，请替换 'root'
 RUN usermod -a -G render root
 
-RUN apt install intel-opencl-icd \
-                libigc-dev \
-                libigdfcl-dev \
-                libva-dev \
-                intel-gpu-tools \
-                clinfo \
-                vainfo
+RUN apt install intel-opencl-icd
 
-RUN apt remove g++ \
-    apt autoremove \
-    apt autoclean \
+RUN apt remove g++ -y
+RUN apt autoremove -y
+RUN apt autoclean -y
 
 # 暴露服务运行的端口
 EXPOSE 8060

@@ -78,7 +78,6 @@ class AIModels:
                 results.append(result)
         return results
 
-    # -------------------- [开始修改] --------------------
     def get_ocr_results(self, image: np.ndarray) -> List[Dict[str, Any]]:
         """
         运行 OCR 并返回一个包含文本、置信度和 x,y,w,h 矩形框的字典列表，以匹配客户端需求。
@@ -109,7 +108,6 @@ class AIModels:
                 }
             })
         return ocr_results
-    # -------------------- [结束修改] --------------------
 
     def get_image_embedding(self, image: np.ndarray) -> List[float]:
         inputs = self.clip_processor(images=image, return_tensors="pt")

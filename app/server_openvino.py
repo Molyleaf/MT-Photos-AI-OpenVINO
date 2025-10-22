@@ -49,8 +49,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# -------------------- [开始修改] --------------------
-
 # --- Pydantic 模型定义 ---
 class TextClipRequest(BaseModel):
     text: str
@@ -91,8 +89,6 @@ class RepresentResponse(BaseModel):
     detector_backend: str = "insightface"
     recognition_model: str = "buffalo_l"
     result: List[RepresentResult]
-
-# -------------------- [结束修改] --------------------
 
 # --- 辅助函数 ---
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
