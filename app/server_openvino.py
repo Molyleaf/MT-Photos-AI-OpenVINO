@@ -80,7 +80,7 @@ class OCRResponse(BaseModel):
     result: OCRResult # 注意这里是 OCRResult 对象，不是列表
 
 class ClipResponse(BaseModel):
-    results: List[float]
+    result: List[float]
 
 class FacialArea(BaseModel):
     x: int
