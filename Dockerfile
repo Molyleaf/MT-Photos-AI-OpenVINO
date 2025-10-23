@@ -11,7 +11,7 @@ USER root
 
 COPY requirements-docker.txt .
 
-COPY models/chinese-clip/openvino /models/chinese-clip/openvino
+COPY models/qa-clip/openvino /models/qa-clip/openvino
 
 COPY models/insightface/models /models/insightface/models
 

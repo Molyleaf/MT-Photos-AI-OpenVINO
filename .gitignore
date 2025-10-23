@@ -23,6 +23,13 @@ models/chinese-clip/openvino/*.bin
 models/chinese-clip/openvino/*.xml
 models/chinese-clip/openvino/*.json
 models/chinese-clip/openvino/*.model
+models/qa-clip/onnx/*.onnx
+models/qa-clip/onnx/*.extra_file
+models/qa-clip/onnx/*.data
+models/qa-clip/openvino/*.bin
+models/qa-clip/openvino/*.xml
+models/qa-clip/openvino/*.json
+models/qa-clip/openvino/*.model
 models/insightface/models/antelopev2/*.onnx
 models/insightface/models/buffalo_l/*.onnx
 cache/*

@@ -1,29 +1,26 @@
+# app/clip/utils.py
 # Code modified from https://github.com/openai/CLIP
 
 import json
 import os
 from pathlib import Path
 from typing import Union, List
+import urllib
 
 import torch
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
+from tqdm import tqdm
 
-from cn_clip.clip import _tokenizer
-from cn_clip.clip.model import convert_weights, CLIP, restore_model
+from clip import _tokenizer
+from clip.model import convert_weights, CLIP, restore_model
 
 __all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name"]
 
-_MODELSCOPE_ORG = "AI-ModelScope"
-_HUGGINGFACE_ORG = "OFA-Sys"
-
 _MODELS = {
-    "ViT-B-16": ("chinese-clip-vit-base-patch16", "clip_cn_vit-b-16.pt"),
-    "ViT-L-14": ("chinese-clip-vit-large-patch14", "clip_cn_vit-l-14.pt"),
-    "ViT-L-14-336": ("chinese-clip-vit-large-patch14-336px", "clip_cn_vit-l-14-336.pt"),
-    "ViT-H-14": ("chinese-clip-vit-huge-patch14", "clip_cn_vit-h-14.pt"),
-    "RN50": ("chinese-clip-rn50", "clip_cn_rn50.pt"),
+    "ViT-B-16": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-base.pt",
+    "ViT-L-14": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-large.pt",
+    "RN50": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-RN50.pt",
 }
-
 _MODEL_INFO = {
     "ViT-B-16": {
         "struct": "ViT-B-16@RoBERTa-wwm-ext-base-chinese",
@@ -33,14 +30,6 @@ _MODEL_INFO = {
         "struct": "ViT-L-14@RoBERTa-wwm-ext-base-chinese",
         "input_resolution": 224
     },
-    "ViT-L-14-336": {
-        "struct": "ViT-L-14-336@RoBERTa-wwm-ext-base-chinese",
-        "input_resolution": 336
-    },
-    "ViT-H-14": {
-        "struct": "ViT-H-14@RoBERTa-wwm-ext-large-chinese",
-        "input_resolution": 224
-    },
     "RN50": {
         "struct": "RN50@RBT3-chinese",
         "input_resolution": 224
@@ -48,11 +37,9 @@ _MODEL_INFO = {
 }
 
 
-def _download(modelname: str, root: str, use_modelscope: bool = False):
+def _download(url: str, root: str):
     os.makedirs(root, exist_ok=True)
-
-    # this a private function and the only caller has checked the model exsits
-    reponame, filename = _MODELS[modelname]
+    filename = os.path.basename(url)
 
     download_target = os.path.join(root, filename)
 
@@ -62,36 +49,18 @@ def _download(modelname: str, root: str, use_modelscope: bool = False):
     if os.path.isfile(download_target):
         return download_target
 
-    if use_modelscope:
-        try:
-            from modelscope.hub.file_download import model_file_download
-        except ImportError as _:
-            raise RuntimeError(
-                "Ckpt download requires `modelscope`. "
-                "Please install `modelscope` or download the ckpt manually and "
-                "provide the local path so that we can continue."
-            )
+    with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
+        with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True,
+                  unit_divisor=1024) as loop:
+            while True:
+                buffer = source.read(8192)
+                if not buffer:
+                    break
 
-        local_path = model_file_download(
-            model_id=_MODELSCOPE_ORG + "/" + reponame,
-            file_path=filename,
-            local_dir=root,
-        )
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-        except ImportError as _:
-            raise RuntimeError(
-                "Ckpt download requires `huggingface_hub`. "
-                "Please install `huggingface_hub` or download the ckpt manually and "
-                "provide the local path so that we can continue."
-            )
+                output.write(buffer)
+                loop.update(len(buffer))
 
-        local_path = hf_hub_download(
-            _HUGGINGFACE_ORG + "/" + reponame, filename=filename, local_dir=root
-        )
-
-    return local_path
+    return download_target
 
 
 def _convert_image_to_rgb(image):
@@ -104,9 +73,9 @@ def available_models() -> List[str]:
 
 
 def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
-                   download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None, use_modelscope: bool = False):
+                   download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
     if name in _MODELS:
-        model_path = _download(name, download_root or os.path.expanduser("~/.cache/clip"), use_modelscope)
+        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
         model_name, model_input_resolution = _MODEL_INFO[name]['struct'], _MODEL_INFO[name]['input_resolution']
     elif os.path.isfile(name):
         assert vision_model_name and text_model_name and input_resolution, "Please specify specific 'vision_model_name', 'text_model_name', and 'input_resolution'"

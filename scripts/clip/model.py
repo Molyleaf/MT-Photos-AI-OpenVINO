@@ -1,24 +1,28 @@
-import collections.abc
-import importlib.util
-import logging
-import math
 from collections import OrderedDict
-from itertools import repeat
 from typing import Tuple, Union
+from itertools import repeat
+import collections.abc
 
+import math
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+import importlib.util
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
-from cn_clip.clip import _tokenizer
-from cn_clip.clip.configuration_bert import BertConfig
-from cn_clip.clip.modeling_bert import BertModel
+from clip import _tokenizer
+from clip.configuration_bert import BertConfig
+from clip.modeling_bert import BertModel
 
+try:
+    from transformers import CLIPTextModelWithProjection
+except:
+    pass
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -405,7 +409,7 @@ class CLIP(nn.Module):
         if image is None:
             return self.encode_text(text)
         elif text is None:
-            return self.encode_image(image)
+            return self.encode_image(image, mask_ratio)
         image_features = self.encode_image(image, mask_ratio)
         text_features = self.encode_text(text)
 
@@ -430,6 +434,315 @@ class CLIP(nn.Module):
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
+class CLIPWithTwoTextEncoder(nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 # vision
+                 image_resolution: int,
+                 vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int,
+                 vision_patch_size: int,
+                 # text
+                 vocab_size: int,
+                 text_attention_probs_dropout_prob: float,
+                 text_hidden_act: str,
+                 text_hidden_dropout_prob: float,
+                 text_hidden_size: int,
+                 text_initializer_range: float,
+                 text_intermediate_size: int,
+                 text_max_position_embeddings: int,
+                 text_num_attention_heads: int,
+                 text_num_hidden_layers: int,
+                 text_type_vocab_size: int,
+                 tokenizer = _tokenizer,
+                 # vision head width, added this param for ViT-H
+                 vision_head_width: int = 64,
+                 use_flash_attention: bool = False,
+                 openai_clip_path: str = "/group/30042/kunyi/CLIP/clip-vit-large-patch14/",
+                 ):
+        super().__init__()
+
+        if isinstance(vision_layers, (tuple, list)):
+            vision_heads = vision_width * 32 // vision_head_width
+            self.visual = ModifiedResNet(
+                layers=vision_layers,
+                output_dim=embed_dim,
+                heads=vision_heads,
+                input_resolution=image_resolution,
+                width=vision_width
+            )
+        else:
+            vision_heads = vision_width // vision_head_width
+            self.visual = VisualTransformer(
+                input_resolution=image_resolution,
+                patch_size=vision_patch_size,
+                width=vision_width,
+                layers=vision_layers,
+                heads=vision_heads,
+                output_dim=embed_dim,
+                use_flash_attention=use_flash_attention
+            )
+
+        self.bert_config = BertConfig(
+            vocab_size_or_config_json_file=vocab_size,
+            hidden_size=text_hidden_size,
+            num_hidden_layers=text_num_hidden_layers,
+            num_attention_heads=text_num_attention_heads,
+            intermediate_size=text_intermediate_size,
+            hidden_act=text_hidden_act,
+            hidden_dropout_prob=text_hidden_dropout_prob,
+            attention_probs_dropout_prob=text_attention_probs_dropout_prob,
+            max_position_embeddings=text_max_position_embeddings,
+            type_vocab_size=text_type_vocab_size,
+            initializer_range=text_initializer_range,
+            layer_norm_eps=1e-12,
+            use_flash_attention=use_flash_attention
+        )
+        self.bert = BertModel(self.bert_config)
+
+        self.text_projection = nn.Parameter(torch.empty(text_hidden_size, embed_dim))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        self.tokenizer = tokenizer
+
+        print('loading openai clip text encoder')
+        self.openai_clip_text_encoder = CLIPTextModelWithProjection.from_pretrained(openai_clip_path)
+
+        self.initialize_parameters()
+
+
+    def initialize_parameters(self):
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        if isinstance(self.visual, ModifiedResNet):
+            if self.visual.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.bert_config.hidden_size ** -0.5)
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.visual.set_grad_checkpointing(enable)
+        self.bert.set_grad_checkpointing(enable)
+
+    @property
+    def dtype(self):
+        return self.visual.conv1.weight.dtype
+
+    def encode_image(self, image, mask_ratio=0):
+        if isinstance(self.visual, ModifiedResNet):
+            # mask_ratio > 0 (FLIP strategy) is currently only implemented for VisualTransformer.
+            return self.visual(image.type(self.dtype))
+        return self.visual(image.type(self.dtype), mask_ratio)
+
+    def encode_text(self, text):
+        pad_index = self.tokenizer.vocab['[PAD]']
+        attn_mask = text.ne(pad_index).type(self.dtype)
+        x = self.bert(text, attention_mask=attn_mask)[0].type(self.dtype) # [batch_size, seq_length, hidden_size]
+        return x[:, 0, :] @ self.text_projection
+
+    def encode_text_ENG(self, text):
+        text_emb = self.openai_clip_text_encoder(text).text_embeds
+        return text_emb
+
+    def forward(self, image, text, is_ENG=False, mask_ratio=0):
+        assert image is not None or text is not None, "text and image cannot both be None!"
+
+        if image is None:
+            if not is_ENG:
+                return self.encode_text(text)
+            else:
+                return self.encode_text_ENG(text)
+        elif text is None:
+            return self.encode_image(image, mask_ratio)
+        image_features = self.encode_image(image, mask_ratio)
+
+        if not is_ENG:
+            text_features = self.encode_text(text)
+        else:
+            text_features = self.encode_text_ENG(text)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        return image_features, text_features, self.logit_scale.exp()
+
+    def get_similarity(self, image, text):
+        image_features = self.encode_image(image)
+        text_features = self.encode_text(text)
+
+        # normalized features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_text = logits_per_image.t()
+
+        # shape = [global_batch_size, global_batch_size]
+        return logits_per_image, logits_per_text
+
+class CLIP4SD(nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 # vision
+                 image_resolution: int,
+                 vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int,
+                 vision_patch_size: int,
+                 # text
+                 vocab_size: int,
+                 text_attention_probs_dropout_prob: float,
+                 text_hidden_act: str,
+                 text_hidden_dropout_prob: float,
+                 text_hidden_size: int,
+                 text_initializer_range: float,
+                 text_intermediate_size: int,
+                 text_max_position_embeddings: int,
+                 text_num_attention_heads: int,
+                 text_num_hidden_layers: int,
+                 text_type_vocab_size: int,
+                 tokenizer = _tokenizer,
+                 # vision head width, added this param for ViT-H
+                 vision_head_width: int = 64,
+                 use_flash_attention: bool = False,
+                 ):
+        super().__init__()
+
+        if isinstance(vision_layers, (tuple, list)):
+            vision_heads = vision_width * 32 // vision_head_width
+            self.visual = ModifiedResNet(
+                layers=vision_layers,
+                output_dim=embed_dim,
+                heads=vision_heads,
+                input_resolution=image_resolution,
+                width=vision_width
+            )
+        else:
+            vision_heads = vision_width // vision_head_width
+            self.visual = VisualTransformer(
+                input_resolution=image_resolution,
+                patch_size=vision_patch_size,
+                width=vision_width,
+                layers=vision_layers,
+                heads=vision_heads,
+                output_dim=embed_dim,
+                use_flash_attention=use_flash_attention
+            )
+
+        self.bert_config = BertConfig(
+            vocab_size_or_config_json_file=vocab_size,
+            hidden_size=text_hidden_size,
+            num_hidden_layers=text_num_hidden_layers,
+            num_attention_heads=text_num_attention_heads,
+            intermediate_size=text_intermediate_size,
+            hidden_act=text_hidden_act,
+            hidden_dropout_prob=text_hidden_dropout_prob,
+            attention_probs_dropout_prob=text_attention_probs_dropout_prob,
+            max_position_embeddings=text_max_position_embeddings,
+            type_vocab_size=text_type_vocab_size,
+            initializer_range=text_initializer_range,
+            layer_norm_eps=1e-12,
+            use_flash_attention=use_flash_attention
+        )
+        self.bert = BertModel(self.bert_config)
+
+        self.text_projection = nn.Parameter(torch.empty(text_hidden_size, embed_dim))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        self.tokenizer = tokenizer
+        self.ln_final = LayerNorm(text_hidden_size)
+
+        self.initialize_parameters()
+
+    def initialize_parameters(self):
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        if isinstance(self.visual, ModifiedResNet):
+            if self.visual.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.bert_config.hidden_size ** -0.5)
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.visual.set_grad_checkpointing(enable)
+        self.bert.set_grad_checkpointing(enable)
+
+    @property
+    def dtype(self):
+        return self.visual.conv1.weight.dtype
+
+    def encode_image(self, image, mask_ratio=0):
+        if isinstance(self.visual, ModifiedResNet):
+            # mask_ratio > 0 (FLIP strategy) is currently only implemented for VisualTransformer.
+            return self.visual(image.type(self.dtype))
+        return self.visual(image.type(self.dtype), mask_ratio)
+
+    # def encode_text(self, text):
+    #     pad_index = self.tokenizer.vocab['[PAD]']
+    #     attn_mask = text.ne(pad_index).type(self.dtype)
+    #     x = self.bert(text, attention_mask=attn_mask)[0].type(self.dtype) # [batch_size, seq_length, hidden_size]
+    #     return x[:, 0, :] @ self.text_projection
+    def encode_text(self, text):
+        pad_index = self.tokenizer.vocab['[PAD]']
+        attn_mask = text.ne(pad_index).type(self.dtype)
+        x = self.bert(text, attention_mask=attn_mask)[0].type(self.dtype) # [batch_size, seq_length, hidden_size]
+        x = self.ln_final(x).type(self.dtype)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
+
+    def forward(self, image, text, mask_ratio=0):
+        assert image is not None or text is not None, "text and image cannot both be None!"
+
+        if image is None:
+            return self.encode_text(text)
+        elif text is None:
+            return self.encode_image(image)
+        image_features = self.encode_image(image, mask_ratio)
+        text_features = self.encode_text(text)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        return image_features, text_features, self.logit_scale.exp()
+
+    def get_similarity(self, image, text):
+        image_features = self.encode_image(image)
+        text_features = self.encode_text(text)
+
+        # normalized features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_text = logits_per_image.t()
+
+        # shape = [global_batch_size, global_batch_size]
+        return logits_per_image, logits_per_text
 
 def convert_models_to_fp32(model):
     for p in model.parameters():
@@ -457,10 +770,13 @@ def convert_weights(model: nn.Module):
             l.to(torch.half)
 
         for name in ["text_projection", "proj"]:
-            if hasattr(l, name):
-                attr = getattr(l, name)
-                if attr is not None:
-                    attr.data = attr.data.half()
+            try:
+                if hasattr(l, name):
+                    attr = getattr(l, name)
+                    if attr is not None:
+                        attr.data = attr.data.half()
+            except:
+                print('name', name)
 
     model.apply(_convert_weights_to_fp16)
 
