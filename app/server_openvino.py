@@ -145,7 +145,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         # --- 修正：缩减日志输出 ---
         logging.info(f"成功为 '{file.filename}' 生成 embedding。向量长度: {len(embedding)}")
         # --- 结束修正 ---
-        response_data = {"results": embedding}
+        response_data = {"result": embedding}
         return response_data
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -158,7 +158,7 @@ async def clip_text_endpoint(request: TextClipRequest):
         # --- 修正：缩减日志输出 ---
         logging.info(f"成功为文本 '{request.text[:30]}...' 生成 embedding。向量长度: {len(embedding)}")
         # --- 结束修正 ---
-        return {"results": embedding}
+        return {"result": embedding}
     except Exception as e:
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"处理 CLIP 文本失败: {str(e)}")
