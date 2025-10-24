@@ -1,4 +1,4 @@
-# app/server_openvino.py
+# app/server.py
 import os
 from contextlib import asynccontextmanager
 from typing import List
@@ -10,23 +10,31 @@ import sys
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
-# --- 修正 2: 导入 HTMLResponse ---
 from fastapi.responses import HTMLResponse
-# --- 结束修正 2 ---
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
 from PIL import Image
 
 # 导入我们重构后的模型处理模块
 import models as ai_models
 
+# --- 修正: 导入共享的 schemas.py 文件 ---
+from schemas import (
+    CheckResponse,
+    OCRResponse,
+    OCRResult,
+    OCRBox,
+    ClipResponse,
+    TextClipRequest,
+    RepresentResponse,
+    RestartResponse
+)
+# --- 结束修正 ---
+
 # --- 日志配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- API 密钥认证 ---
-# --- 修正 1: 更改默认 API Key 以匹配参考脚本 ---
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt_photos_ai_extra")
-# --- 结束修正 1 ---
 API_KEY_NAME = "api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -101,57 +109,13 @@ async def reset_timer_middleware(request: Request, call_next):
     return response
 
 # --- Pydantic 模型定义 (请求与响应体) ---
+# --- 修正: 所有模型定义已移至 schemas.py ---
+# (保留 TextClipRequest 因为它只在 server 端使用)
+# class TextClipRequest(BaseModel):
+#     text: str
+# (已移至 schemas.py)
+# --- 结束修正 ---
 
-class TextClipRequest(BaseModel):
-    text: str
-
-# 匹配参考脚本的 /check 响应
-class CheckResponse(BaseModel):
-    result: str
-    title: str = "MT-Photos AI 统一服务 (OpenVINO 版本)"
-    help: str = "https://mtmt.tech/docs/advanced/ocr_api"
-
-# 匹配参考脚本的 /ocr 响应 (任务 8)
-class OCRBox(BaseModel):
-    x: str
-    y: str
-    width: str
-    height: str
-
-class OCRResult(BaseModel):
-    texts: List[str]
-    scores: List[str]
-    boxes: List[OCRBox]
-
-class OCRResponse(BaseModel):
-    result: OCRResult
-    msg: str = "ok" # 匹配参考脚本
-
-# 匹配参考脚本的 /clip 响应 (任务 8)
-class ClipResponse(BaseModel):
-    result: List[str]
-    msg: str = "ok" # 匹配参考脚本
-
-# /represent 端点模型 (任务 4)
-class FacialArea(BaseModel):
-    x: int
-    y: int
-    w: int
-    h: int
-
-class RepresentResult(BaseModel):
-    embedding: List[float]
-    facial_area: FacialArea
-    face_confidence: float
-
-class RepresentResponse(BaseModel):
-    detector_backend: str = "insightface"
-    recognition_model: str = os.environ.get("MODEL_NAME", "buffalo_l")
-    result: List[RepresentResult]
-
-# /restart 端点模型 (任务 7)
-class RestartResponse(BaseModel):
-    result: str
 
 # --- 辅助函数 ---
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
@@ -178,7 +142,6 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
 
 # --- API 端点定义 ---
 
-# --- 修正 3: 添加根 (/) HTML 端点以匹配参考脚本 ---
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
     html_content = """<!DOCTYPE html>
@@ -195,7 +158,6 @@ async def top_info():
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
-# --- 结束修正 3 ---
 
 @app.post("/check", response_model=CheckResponse)
 async def check_service(t: str = ""):
@@ -218,7 +180,6 @@ async def restart_service():
         models_instance.release_models()
     return {"result": "pass"}
 
-# 匹配参考脚本的 /restart_v2 (任务 8)
 @app.post("/restart_v2", response_model=RestartResponse)
 async def restart_process():
     """
@@ -296,7 +257,12 @@ async def represent_endpoint(file: UploadFile = File(...)):
         image = await read_image_from_upload(file)
         # ensure_models_loaded() 会在 get_face_representation 内部调用
         face_results_list = models_instance.get_face_representation(image)
+
+        # --- 修正: face_results_list 现在是 [schemas.RepresentResult]
+        # Pydantic V2 会自动处理，无需转换
         return RepresentResponse(result=face_results_list)
+        # --- 结束修正 ---
+
     except Exception as e:
         logging.error(f"处理人脸识别请求失败: {file.filename}, 错误: {e}", exc_info=True)
         # InsightFace 端点的错误响应保持不变
@@ -307,4 +273,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
     # 在生产环境中不应使用 reload=True
-    uvicorn.run("server_openvino:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)

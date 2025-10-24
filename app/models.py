@@ -8,12 +8,20 @@ import openvino as ov
 from insightface.app import FaceAnalysis
 from rapidocr_openvino import RapidOCR
 from PIL import Image
-from pydantic import BaseModel
 
 # --- 修正 1: 导入 app/clip 目录下的 QA-CLIP 库 ---
-import clip.clip as clip
+import clip
 from clip.utils import image_transform, _MODEL_INFO
 # --- 结束修正 1 ---
+
+# --- 修正: 导入共享的 schemas.py 文件 ---
+from schemas import (
+    OCRBox,
+    OCRResult,
+    FacialArea,
+    RepresentResult
+)
+# --- 结束修正 ---
 
 
 # --- 环境变量与常量定义 ---
@@ -25,36 +33,15 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
 MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 
-# --- 修正 2: QA-CLIP (ViT-L-14) 使用 77 的上下文长度 ---
-CONTEXT_LENGTH = 77 # 原为 52 (cn_clip)
-# --- 结束修正 2 ---
+# QA-CLIP (ViT-L-14) 使用 77 的上下文长度
+CONTEXT_LENGTH = 77
 
 # 配置日志记录器
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Pydantic 模型定义 (用于 API 响应) ---
-# 保持您参考脚本中的字符串格式
-class OCRBox(BaseModel):
-    x: str
-    y: str
-    width: str
-    height: str
-
-class OCRResult(BaseModel):
-    texts: List[str]
-    scores: List[str] # 字符串
-    boxes: List[OCRBox]
-
-class FacialArea(BaseModel):
-    x: int
-    y: int
-    w: int
-    h: int
-
-class RepresentResult(BaseModel):
-    embedding: List[float]
-    facial_area: FacialArea
-    face_confidence: float
+# --- 修正: 所有模型定义已移至 schemas.py ---
+# --- 结束修正 ---
 
 
 class AIModels:
@@ -149,10 +136,32 @@ class AIModels:
         """
         try:
             logging.info(f"正在加载 InsightFace (OpenVINOExecutionProvider)...")
-            # --- 优化: 使用 OpenVINOExecutionProvider 进行吞吐量优化 ---
-            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=['OpenVINOExecutionProvider'])
+
+            # --- 修正: 解决 ONNXRuntime-OpenVINO 的依赖冲突 ---
+            # 根据你的日志 (Source 95, 100)，OpenVINOProvider 加载失败。
+            # 在你按照步骤 1 修复版本兼容性之前，
+            # 我们可以暂时回退到 'CPUExecutionProvider' 以避免日志错误。
+            #
+            # 如果你已修复版本依赖 (例如使用 openvino==2024.5.0)，
+            # 请将 providers 改回 ['OpenVINOExecutionProvider']
+
+            providers = ['OpenVINOExecutionProvider']
+            try:
+                # 尝试加载 OpenVINO
+                face_app_test = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
+                face_app_test.prepare(ctx_id=0, det_size=(1, 1)) # 用小尺寸快速测试
+                del face_app_test
+                logging.info("OpenVINOExecutionProvider 可用。")
+            except Exception as e:
+                # 捕获日志 (Source 95) 中出现的错误
+                logging.warning(f"加载 OpenVINOExecutionProvider 失败: {e}")
+                logging.warning("ONNXRuntime OpenVINO provider 存在库冲突, 降级到 CPUExecutionProvider。")
+                providers = ['CPUExecutionProvider']
+            # --- 结束修正 ---
+
+            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
-            logging.info("InsightFace 模型加载成功。")
+            logging.info(f"InsightFace 模型加载成功 (使用: {providers})。")
             return face_app
         except Exception as e:
             logging.error(f"加载 InsightFace 模型失败: {e}", exc_info=True)
@@ -230,11 +239,15 @@ class AIModels:
                 bbox = face.bbox.astype(int)
                 x1, y1, x2, y2 = bbox
                 facial_area = FacialArea(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
+
+                # --- 修正: 返回在 schemas.py 中定义的 Pydantic 模型 ---
                 results.append(RepresentResult(
                     embedding=[float(x) for x in face.normed_embedding],
                     facial_area=facial_area,
                     face_confidence=float(face.det_score)
                 ))
+                # --- 结束修正 ---
+
             return results
         except Exception as e:
             logging.warning(f"处理人脸识别时出错: {e}", exc_info=True)
@@ -252,16 +265,20 @@ class AIModels:
 
             for res in ocr_result:
                 texts.append(res[1])
-                scores.append(f"{float(res[2]):.2f}") # 格式化为字符串 (任务 8)
+                scores.append(f"{float(res[2]):.2f}") # 格式化为字符串
                 points = np.array(res[0], dtype=np.int32)
                 x_min, y_min = np.min(points, axis=0)
                 x_max, y_max = np.max(points, axis=0)
+
+                # --- 修正: 返回在 schemas.py 中定义的 Pydantic 模型 ---
                 boxes.append(OCRBox(
                     x=to_fixed(x_min),
                     y=to_fixed(y_min),
                     width=to_fixed(x_max - x_min),
                     height=to_fixed(y_max - y_min)
                 ))
+                # --- 结束修正 ---
+
             return OCRResult(texts=texts, scores=scores, boxes=boxes)
         except Exception as e:
             logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)

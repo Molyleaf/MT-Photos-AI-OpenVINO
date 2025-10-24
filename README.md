@@ -62,7 +62,7 @@ cd mt-photos-ai-openvino
 建议在 Python 虚拟环境中安装。
 
 ```bash
-pip install -r requirements-docker.txt
+pip install -r requirements.txt
 ```
 
 ### 4. 准备模型文件
