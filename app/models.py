@@ -1,17 +1,16 @@
 # app/models.py
-import os
-from typing import List, Any, Dict
 import logging
+import os
+from typing import List
 
 import numpy as np
 import openvino as ov
+from PIL import Image
 from insightface.app import FaceAnalysis
 from rapidocr_openvino import RapidOCR
-from PIL import Image
 
 import clip
 from clip.utils import image_transform, _MODEL_INFO
-
 from schemas import (
     OCRBox,
     OCRResult,
