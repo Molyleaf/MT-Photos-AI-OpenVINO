@@ -1,19 +1,28 @@
 # MT-Photos AI (AltCLIP + OpenVINO 版本)
 
-使用 AltCLIP + Insightface + RapidOCR + Openvino 的一站式 AI 服务。
+使用 Chinese-CLIP / QA-CLIP + Insightface + RapidOCR + OpenVINO 的一站式 AI 服务。
 ONNX 版本稍后做，欢迎 PR。
 
-| 环境变量               | 描述                                                                                       | 默认值                       |
-|--------------------|------------------------------------------------------------------------------------------|---------------------------|
-| `API_AUTH_KEY`     | 用于保护 API 端点的密钥。                                                                          | `"mt-photos-ai-openvino"` |
-| `INFERENCE_DEVICE` | 指定 OpenVINO 的推理设备，可选值如 `"CPU"`, `"GPU"`, `"AUTO"`。`AUTO` 会自动选择最佳设备。                      | `"AUTO"`                  |
-| `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"`             |
+| 环境变量               | 描述                                                                                       | 默认值                   |
+|--------------------|------------------------------------------------------------------------------------------|-----------------------|
+| `API_AUTH_KEY`     | 用于保护 API 端点的密钥。                                                                          | `"mt_photos_ai_extra"` |
+| `INFERENCE_DEVICE` | 指定 OpenVINO 的推理设备，可选值如 `"CPU"`, `"GPU"`, `"AUTO"`。`AUTO` 会自动选择最佳设备。                      | `"AUTO"`              |
+| `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"`         |
+| `WEB_CONCURRENCY`  | 控制 worker 数量。注意：每个 worker 都会加载自己的模型实例，会增加内存使用。 | `"1"`                   |
 
 请使用最新的Docker镜像，旧版可能有bug。
 
-https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
+- Docker Hub: https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 
-``` docker pull molyleaf/mt-photos-ai-openvino:latest ```
+- GitHub: https://github.com/molyleaf/mt-photos-ai-openvino
+
+提供 Chinese-CLIP 和 QA-CLIP 镜像：
+
+``` docker pull molyleaf/mt-photos-ai-openvino:1.0.1.6-QA-CLIP ```
+
+``` docker pull molyleaf/mt-photos-ai-openvino:1.2.2-Chinese-CLIP ```
+
+**向量维度需要改成 768**
 
 ## 以下是AI写的
 
@@ -39,7 +48,7 @@ https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 * **服务框架**: FastAPI
 * **AI 模型**:
     * **人脸识别**: InsightFace (buffalo_l)
-    * **多模态**: BAAI/AltCLIP-m18
+    * **多模态**: Chinese-CLIP / QA-CLIP
     * **OCR**: RapidOCR
 * **容器化**: Docker
 
@@ -47,8 +56,7 @@ https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 
 ### 1. 环境准备
 
-* Python 3.9+
-* Git
+* Python 3.13
 
 ### 2. 克隆项目
 
@@ -62,7 +70,7 @@ cd mt-photos-ai-openvino
 建议在 Python 虚拟环境中安装。
 
 ```bash
-pip install -r requirements-docker.txt
+pip install -r requirements.txt
 ```
 
 ### 4. 准备模型文件
@@ -75,16 +83,12 @@ mkdir models
 
 **a. 转换 Alt-CLIP 模型**
 
-运行模型转换脚本，它会自动从 Hugging Face 下载 `BAAI/AltCLIP-m18` 模型并将其转换为 OpenVINO IR 格式。
+运行模型转换脚本，它会自动从 Hugging Face 下载模型并将其转换为 OpenVINO IR 格式。
 
 ```bash
 python scripts/convert_models.py
 ```
 转换成功后，模型文件将位于 `./models/alt-clip/openvino/` 目录下。
-
-**b. 下载 InsightFace 模型**
-
-`InsightFace` 模型会在服务首次启动时自动下载。当您第一次运行应用时，请确保网络连接正常。模型文件会自动保存到 `./models/insightface/` 目录下。
 
 ### 5. 启动服务
 
@@ -179,32 +183,15 @@ curl -X POST "[http://127.0.0.1:8060/ocr](http://127.0.0.1:8060/ocr)" \
   -F "file=@/path/to/your/image.jpg"
 ```
 
-## 📂 项目结构
-
-```
-.
-├── app
-│   ├── common
-│   │   └── models.py      # 模型加载与管理
-│   └── server_openvino.py # FastAPI 应用与 API 端点
-├── models                 # (需手动创建) 存放所有模型文件
-│   ├── alt-clip/
-│   └── insightface/
-├── scripts
-│   └── convert_models.py  # Alt-CLIP 模型转换脚本
-├── Dockerfile             # Docker 镜像构建文件
-├── requirements.txt       # Python 依赖
-└── README.md              # 项目说明
-```
-
 ## 🙏 致谢
 
 本项目依赖于以下优秀的开源项目和模型：
 
 * [Intel OpenVINO™ Toolkit](https://github.com/openvinotoolkit/openvino)
-* [BAAI/AltCLIP](https://huggingface.co/BAAI/AltCLIP-m18)
 * [InsightFace](https://github.com/deepinsight/insightface)
 * [RapidOCR](https://github.com/RapidAI/RapidOCR)
+* [QA-CLIP](https://github.com/TencentARC-QQ/QA-CLIP)
+* [Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)
 
 ## 📄 许可证
 

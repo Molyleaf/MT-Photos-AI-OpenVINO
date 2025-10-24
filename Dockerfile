@@ -1,4 +1,4 @@
-FROM openvino/ubuntu24_runtime:2025.3.0
+FROM python:3.13-slim-trixie
 
 WORKDIR /app
 
@@ -9,12 +9,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 USER root
 
-COPY requirements-docker.txt .
-
-COPY models/chinese-clip/openvino /models/chinese-clip/openvino
-
-COPY models/insightface/models /models/insightface/models
-
 # 更换 APT 源
 RUN rm -f /etc/apt/sources.list \
     rm -rf /etc/apt/sources.list.d/
@@ -22,7 +16,7 @@ RUN rm -f /etc/apt/sources.list \
 COPY sources.list /etc/apt/sources.list
 
 # 系统依赖
-RUN apt update && apt install -y --no-install-recommends \
+RUN apt update && apt dist-upgrade -y && apt install -y --no-install-recommends \
     python3-dev \
     g++ \
     libgl1 \
@@ -30,14 +24,27 @@ RUN apt update && apt install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    intel-opencl-icd \
+    ocl-icd-libopencl1 \
+    mesa-opencl-icd \
+    libva2  \
+    mesa-va-drivers \
+    clinfo  \
+    vainfo \
+    mesa-vulkan-drivers \
+    libclang-rt-19-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
-    && pip install --no-cache-dir -r requirements-docker.txt \
+COPY requirements.txt .
+
+RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/ \
+    && pip install --no-cache-dir -r requirements.txt \
     && apt remove g++ -y \
     && apt autoremove -y \
     && apt autoclean -y
+
+COPY models/qa-clip/openvino /models/qa-clip/openvino
+
+COPY models/insightface/models /models/insightface/models
 
 COPY app /app
 
@@ -49,5 +56,5 @@ RUN usermod -a -G render root
 EXPOSE 8060
 
 # 设置容器启动时执行的默认命令
-CMD ["uvicorn", "server_openvino:app", "--host", "0.0.0.0", "--port", "8060"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8060"]
 
