@@ -108,15 +108,6 @@ async def reset_timer_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# --- Pydantic 模型定义 (请求与响应体) ---
-# --- 修正: 所有模型定义已移至 schemas.py ---
-# (保留 TextClipRequest 因为它只在 server 端使用)
-# class TextClipRequest(BaseModel):
-#     text: str
-# (已移至 schemas.py)
-# --- 结束修正 ---
-
-
 # --- 辅助函数 ---
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     """从上传的文件中读取并解码图像，处理常见的颜色通道问题。"""
@@ -141,7 +132,6 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     return img
 
 # --- API 端点定义 ---
-
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
     html_content = """<!DOCTYPE html>
