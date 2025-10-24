@@ -22,6 +22,8 @@ ONNX 版本稍后做，欢迎 PR。
 
 ``` docker pull molyleaf/mt-photos-ai-openvino:1.2.2-Chinese-CLIP ```
 
+**向量维度需要改成 768**
+
 ## 以下是AI写的
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
