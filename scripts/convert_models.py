@@ -62,28 +62,39 @@ class VisionModelWrapper(nn.Module):
         image_embeds = self.visual_projection(pooled_output)
         return image_embeds
 
+# ... VisionModelWrapper 保持不变 ...
+
 class TextModelWrapper(nn.Module):
     """
     包装器, 访问基础 BERT (.text_model) 和 *外部* 的投影层 (.text_projection)。
-    适配 transformers 的 QA-CLIP (ChineseCLIPTextModel 和 ChineseCLIPModel) 结构。
+    适配 transformers 的 ChineseCLIPTextModel 和 ChineseCLIPModel 结构。
     """
     def __init__(self, model):
         super().__init__()
-        # 1. 获取基础 BERT 模型 (在 .text_model 内部)
+
+        # --- 修正 ---
+        # ChineseCLIPTextModel 没有 .transformer 属性
+        # 它本身就是我们要调用的基础模型。
         self.text_model_base = model.text_model
+        # --- 结束修正 ---
+
         # 2. 获取位于顶层 ChineseCLIPModel 的 text_projection 层
         self.text_projection = model.text_projection
 
     def forward(self, input_ids, attention_mask):
-        # 运行基础 BERT 模型。
+        # 运行基础 BERT 模型 (现在是 self.text_model_base = model.text_model)
         # 它返回 (last_hidden_state, pooler_output, ...)
         text_outputs = self.text_model_base(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
 
-        # 获取 [CLS] 标记的池化输出 (pooler_output, 索引 1)
-        pooled_output = text_outputs[1]
+        # 我们的上一个修复（手动池化）在这里仍然是正确的。
+        # 1. 从索引 [0] 获取 last_hidden_state
+        last_hidden_state = text_outputs[0]
+
+        # 2. 手动执行池化：提取 [CLS] 标记的输出 (在序列索引 0 处)
+        pooled_output = last_hidden_state[:, 0, :]
 
         # 运行最终的投影层
         text_embeds = self.text_projection(pooled_output)
