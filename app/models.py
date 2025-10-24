@@ -66,163 +66,10 @@ class AIModels:
         self.models_loaded = False
 
     def _normalize(self, vector: np.ndarray) -> np.ndarray:
-        # 规范化 (L2-norm)
+        # 这个函数现在不再被 get_image/text_embedding 调用
         norm = np.linalg.norm(vector, axis=1, keepdims=True)
-        # 防止除以零
         norm[norm < 1e-6] = 1e-6
         return vector / norm
-
-    def load_models(self):
-        """加载所有 AI 模型到内存中。"""
-        if self.models_loaded:
-            logging.info("模型已加载，跳过重复加载。")
-            return
-
-        logging.info("--- 正在加载所有 AI 模型 ---")
-        try:
-            # 任务 4 & 6: 加载 InsightFace 和 RapidOCR
-            self.face_analyzer = self._load_insightface()
-            self.ocr_engine = self._load_rapidocr()
-            # 任务 5: 加载 QA-CLIP
-            self.clip_image_preprocessor, self.clip_vision_model, self.clip_text_model = self._load_qa_clip()
-            self.models_loaded = True
-            logging.info("--- 所有模型已成功加载并编译 ---")
-        except Exception as e:
-            logging.critical(f"模型加载失败: {e}", exc_info=True)
-            # 确保在失败时实例仍处于未加载状态
-            self.release_models()
-            raise
-
-    def release_models(self):
-        """从内存中释放所有已编译的模型。 (任务 7)"""
-        logging.info("--- 正在释放所有 AI 模型 ---")
-        try:
-            if self.face_analyzer:
-                # InsightFace (onnxruntime) 没有显式的 release
-                del self.face_analyzer
-                self.face_analyzer = None
-
-            if self.ocr_engine:
-                # RapidOCR (OpenVINO) 没有显式的 release
-                del self.ocr_engine
-                self.ocr_engine = None
-
-            # OpenVINO 编译的模型可以被 del
-            if self.clip_vision_model:
-                del self.clip_vision_model
-                self.clip_vision_model = None
-
-            if self.clip_text_model:
-                del self.clip_text_model
-                self.clip_text_model = None
-
-            self.clip_image_preprocessor = None
-
-            # 强制垃圾回收
-            import gc
-            gc.collect()
-
-            logging.info("模型已成功从内存中释放。")
-        except Exception as e:
-            logging.warning(f"释放模型时出现错误: {e}", exc_info=True)
-        finally:
-            self.models_loaded = False
-
-
-    def _load_insightface(self) -> FaceAnalysis:
-        """
-        加载 InsightFace (吞吐量优化)。(任务 6)
-        使用 OpenVINOExecutionProvider。
-        """
-        try:
-            logging.info(f"正在加载 InsightFace (OpenVINOExecutionProvider)...")
-
-            # --- 修正: 解决 ONNXRuntime-OpenVINO 的依赖冲突 ---
-            # 根据你的日志 (Source 95, 100)，OpenVINOProvider 加载失败。
-            # 在你按照步骤 1 修复版本兼容性之前，
-            # 我们可以暂时回退到 'CPUExecutionProvider' 以避免日志错误。
-            #
-            # 如果你已修复版本依赖 (例如使用 openvino==2024.5.0)，
-            # 请将 providers 改回 ['OpenVINOExecutionProvider']
-
-            providers = ['OpenVINOExecutionProvider']
-            try:
-                # 尝试加载 OpenVINO
-                face_app_test = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
-                face_app_test.prepare(ctx_id=0, det_size=(1, 1)) # 用小尺寸快速测试
-                del face_app_test
-                logging.info("OpenVINOExecutionProvider 可用。")
-            except Exception as e:
-                # 捕获日志 (Source 95) 中出现的错误
-                logging.warning(f"加载 OpenVINOExecutionProvider 失败: {e}")
-                logging.warning("ONNXRuntime OpenVINO provider 存在库冲突, 降级到 CPUExecutionProvider。")
-                providers = ['CPUExecutionProvider']
-            # --- 结束修正 ---
-
-            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
-            face_app.prepare(ctx_id=0, det_size=(640, 640))
-            logging.info(f"InsightFace 模型加载成功 (使用: {providers})。")
-            return face_app
-        except Exception as e:
-            logging.error(f"加载 InsightFace 模型失败: {e}", exc_info=True)
-            raise
-
-    def _load_rapidocr(self) -> RapidOCR:
-        """加载 RapidOCR (吞吐量优化)。(任务 6)"""
-        try:
-            logging.info("正在加载 RapidOCR (OpenVINO)...")
-            # rapidocr-openvino 默认已为 OpenVINO 吞吐量优化
-            ocr = RapidOCR()
-            logging.info("RapidOCR 模型加载成功。")
-            return ocr
-        except Exception as e:
-            logging.error(f"加载 RapidOCR 模型失败: {e}", exc_info=True)
-            raise
-
-    def _load_qa_clip(self):
-        """
-        加载 QA-CLIP (OpenVINO) 模型。
-        图像：吞吐量优化。(任务 5)
-        文本：延迟优化。(任务 5)
-        """
-        logging.info(f"正在加载 QA-CLIP ({MODEL_ARCH}) 模型: {self.qa_clip_path}")
-        try:
-            vision_model_path = os.path.join(self.qa_clip_path, "openvino_image_fp16.xml")
-            text_model_path = os.path.join(self.qa_clip_path, "openvino_text_fp16.xml")
-
-            if not os.path.exists(vision_model_path) or not os.path.exists(text_model_path):
-                raise FileNotFoundError(f"未在 '{self.qa_clip_path}' 找到 OpenVINO 模型文件。请先运行转换脚本。")
-
-            # --- 优化: 为图像和文本设置不同的性能提示 (任务 5 & 6) ---
-            config_vision = {"PERFORMANCE_HINT": "THROUGHPUT"} # 图像：吞吐量
-            config_text = {"PERFORMANCE_HINT": "LATENCY"}     # 文本：延迟
-
-            logging.info(f"编译 Vision 模型 (提示: {config_vision['PERFORMANCE_HINT']})...")
-            vision_compiled = self.core.compile_model(vision_model_path, INFERENCE_DEVICE, config_vision)
-
-            logging.info(f"编译 Text 模型 (提示: {config_text['PERFORMANCE_HINT']})...")
-            text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config_text)
-            # --- 结束优化 ---
-
-            # 使用 QA-CLIP 库 (app/clip/utils.py) 中的 image_transform
-            image_preprocessor = image_transform(_MODEL_INFO[MODEL_ARCH]['input_resolution'])
-
-            # 验证 (与 convert_models.py 中的验证逻辑一致)
-            if vision_compiled.outputs[0].get_partial_shape()[1].get_length() != CLIP_EMBEDDING_DIMS:
-                raise RuntimeError(f"视觉模型维度不匹配！")
-            if text_compiled.outputs[0].get_partial_shape()[1].get_length() != CLIP_EMBEDDING_DIMS:
-                raise RuntimeError(f"文本模型维度不匹配！")
-
-            # 新的转换脚本 (transformers) 会产生 2 个文本输入 (input_ids, attention_mask)
-            if len(text_compiled.inputs) != 2:
-                logging.warning(f"文本模型输入数量不匹配！预期: 2, 得到: {len(text_compiled.inputs)}")
-                # (如果使用旧的 cn_clip 转换脚本，这里会是 1)
-
-            logging.info(f"QA-CLIP ({MODEL_ARCH}) 模型及 Preprocessor 加载成功。")
-            return image_preprocessor, vision_compiled, text_compiled
-        except Exception as e:
-            logging.error(f"加载 QA-CLIP 模型时发生严重错误: {e}", exc_info=True)
-            raise
 
     def ensure_models_loaded(self):
         """确保模型已加载，如果未加载，则加载它们。"""
@@ -231,6 +78,7 @@ class AIModels:
             self.load_models()
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
+        # ... (此函数不变) ...
         self.ensure_models_loaded()
         try:
             faces = self.face_analyzer.get(image)
@@ -239,45 +87,75 @@ class AIModels:
                 bbox = face.bbox.astype(int)
                 x1, y1, x2, y2 = bbox
                 facial_area = FacialArea(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
-
-                # --- 修正: 返回在 schemas.py 中定义的 Pydantic 模型 ---
                 results.append(RepresentResult(
                     embedding=[float(x) for x in face.normed_embedding],
                     facial_area=facial_area,
                     face_confidence=float(face.det_score)
                 ))
-                # --- 结束修正 ---
-
             return results
         except Exception as e:
             logging.warning(f"处理人脸识别时出错: {e}", exc_info=True)
             return []
 
+
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
         self.ensure_models_loaded()
         try:
-            ocr_result, _ = self.ocr_engine(image)
-            if ocr_result is None:
+            # --- 添加诊断日志 ---
+            logging.debug(f"输入 OCR 引擎的图像 shape: {image.shape}")
+            ocr_raw_output = self.ocr_engine(image)
+            logging.debug(f"RapidOCR 原始输出: {ocr_raw_output}")
+            # --- 结束添加 ---
+
+            # 检查 ocr_raw_output 是否是预期的元组格式
+            if not isinstance(ocr_raw_output, tuple) or len(ocr_raw_output) < 1:
+                logging.error(f"RapidOCR 返回了意外的格式: {type(ocr_raw_output)}")
                 return OCRResult(texts=[], scores=[], boxes=[])
+
+            ocr_result, _ = ocr_raw_output # 假设 ocr_engine 返回元组
+
+            if ocr_result is None:
+                logging.warning("RapidOCR 返回 None 结果。")
+                return OCRResult(texts=[], scores=[], boxes=[])
+
+            if not isinstance(ocr_result, list):
+                logging.error(f"RapidOCR 的结果部分不是列表: {type(ocr_result)}")
+                return OCRResult(texts=[], scores=[], boxes=[])
+
+            if len(ocr_result) == 0:
+                logging.info("RapidOCR 未检测到文本。")
+                # 返回空结果是正常的
+                return OCRResult(texts=[], scores=[], boxes=[])
+
 
             texts, scores, boxes = [], [], []
             def to_fixed(num): return str(round(num, 2))
 
             for res in ocr_result:
-                texts.append(res[1])
-                scores.append(f"{float(res[2]):.2f}") # 格式化为字符串
-                points = np.array(res[0], dtype=np.int32)
-                x_min, y_min = np.min(points, axis=0)
-                x_max, y_max = np.max(points, axis=0)
+                # 添加更健壮的检查
+                if not (isinstance(res, list) or isinstance(res, tuple)) or len(res) < 3:
+                    logging.warning(f"RapidOCR 返回了格式不正确的识别结果项: {res}")
+                    continue
+                if not (isinstance(res[0], list) or isinstance(res[0], np.ndarray)) or len(res[0]) != 4:
+                    logging.warning(f"RapidOCR 返回了格式不正确的坐标点: {res[0]}")
+                    continue
 
-                # --- 修正: 返回在 schemas.py 中定义的 Pydantic 模型 ---
+                texts.append(str(res[1])) # 确保是字符串
+                scores.append(f"{float(res[2]):.2f}") # 格式化为字符串
+                try:
+                    points = np.array(res[0], dtype=np.int32)
+                    x_min, y_min = np.min(points, axis=0)
+                    x_max, y_max = np.max(points, axis=0)
+                except Exception as box_err:
+                    logging.warning(f"处理 OCR 边界框时出错: {box_err} - 原始点: {res[0]}")
+                    continue # 跳过这个结果
+
                 boxes.append(OCRBox(
                     x=to_fixed(x_min),
                     y=to_fixed(y_min),
                     width=to_fixed(x_max - x_min),
                     height=to_fixed(y_max - y_min)
                 ))
-                # --- 结束修正 ---
 
             return OCRResult(texts=texts, scores=scores, boxes=boxes)
         except Exception as e:
@@ -290,13 +168,15 @@ class AIModels:
             inputs = self.clip_image_preprocessor(image).unsqueeze(0)
             pixel_values = inputs.numpy()
 
-            # OpenVINO 推理
             infer_request = self.clip_vision_model.create_infer_request()
             results = infer_request.infer({self.clip_vision_model.inputs[0].any_name: pixel_values})
             embedding = results[self.clip_vision_model.outputs[0]]
 
-            normalized_embedding = self._normalize(embedding)
-            return [float(x) for x in normalized_embedding.flatten()]
+            # --- 修正: 移除 normalize 调用 ---
+            # normalized_embedding = self._normalize(embedding)
+            # return [float(x) for x in normalized_embedding.flatten()]
+            return [float(x) for x in embedding.flatten()] # 直接返回原始 embedding
+            # --- 结束修正 ---
         except Exception as e:
             logging.error(f"在 get_image_embedding 中处理 '{filename}' 时发生严重错误: {e}", exc_info=True)
             return [0.0] * CLIP_EMBEDDING_DIMS
@@ -304,40 +184,26 @@ class AIModels:
     def get_text_embedding(self, text: str) -> List[float]:
         self.ensure_models_loaded()
         try:
-            # --- 修正 3: 使用 QA-CLIP (app/clip) 的 tokenizer 和 CONTEXT_LENGTH ---
-            # clip.tokenize (来自 app/clip/utils.py) 使用的是 BertTokenizer
             inputs_tensor = clip.tokenize([text], context_length=CONTEXT_LENGTH)
             input_ids = inputs_tensor.numpy()
-
-            # 注意：QA-CLIP (transformers) 版本需要 attention_mask
-            # clip.tokenize (来自 app/clip/utils.py) 似乎没有返回 attention_mask
-            # 让我们检查一下 app/clip/utils.py 中的 tokenize...
-            # 它只返回 token IDs，并用 [PAD] (id 0) 填充。
-            # 我们需要手动创建 attention_mask
             pad_index = clip._tokenizer.vocab['[PAD]']
             attention_mask = (input_ids != pad_index).astype(np.int64)
-            # --- 结束修正 3 ---
 
             infer_request = self.clip_text_model.create_infer_request()
-
-            # 准备输入字典 (新转换脚本需要 2 个输入)
-            # { 0: input_ids, 1: attention_mask }
-            # 或者按名称 { 'input_ids': ..., 'attention_mask': ... }
-            # 为了稳健性，我们按索引查找名称
             input_name_0 = self.clip_text_model.inputs[0].any_name
             input_name_1 = self.clip_text_model.inputs[1].any_name
-
-            # 假设顺序是 input_ids, then attention_mask (与 wrapper 一致)
             inputs_dict = {
                 input_name_0: input_ids,
                 input_name_1: attention_mask
             }
-
             results = infer_request.infer(inputs_dict)
             embedding = results[self.clip_text_model.outputs[0]]
 
-            normalized_embedding = self._normalize(embedding)
-            return [float(x) for x in normalized_embedding.flatten()]
+            # --- 修正: 移除 normalize 调用 ---
+            # normalized_embedding = self._normalize(embedding)
+            # return [float(x) for x in normalized_embedding.flatten()]
+            return [float(x) for x in embedding.flatten()] # 直接返回原始 embedding
+            # --- 结束修正 ---
         except Exception as e:
             logging.error(f"在 get_text_embedding 中处理 '{text}' 时发生严重错误: {e}", exc_info=True)
             return [0.0] * CLIP_EMBEDDING_DIMS

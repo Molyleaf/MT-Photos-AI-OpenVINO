@@ -6,6 +6,7 @@ insightface==0.7.3
 transformers==4.53.3
 fastapi==0.119.1
 pydantic==2.12.3
+openvino==2025.1.0
 rapidocr-openvino==1.2.3
 onnxruntime-openvino==1.23.0
 uvicorn==0.38.0
