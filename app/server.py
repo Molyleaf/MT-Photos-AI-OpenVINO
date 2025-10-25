@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -39,8 +40,10 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
-idle_timer: threading.Timer = None
-models_instance: ai_models.AIModels = None
+# 【修复 1】 使用 Optional 修正类型提示
+idle_timer: Optional[threading.Timer] = None
+# 【修复 2】 使用 Optional 修正类型提示
+models_instance: Optional[ai_models.AIModels] = None
 
 def idle_timeout_handler():
     global models_instance
@@ -64,6 +67,11 @@ async def lifespan(app: FastAPI):
     global models_instance
     logging.info("应用启动... 初始化 AIModels 实例。")
     models_instance = ai_models.AIModels()
+    try:
+        models_instance.load_models()
+    except Exception as e:
+        logging.critical(f"应用启动时模型加载失败: {e}", exc_info=True)
+
     reset_idle_timer()
     yield
     global idle_timer
@@ -94,9 +102,7 @@ async def reset_timer_middleware(request: Request, call_next):
 async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
-    # 使用 cv2.imdecode 在后台线程运行以避免阻塞事件循环 (特别是对于大文件)
     img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
-    # img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED) # 旧的阻塞方式
 
     if img is None:
         raise HTTPException(status_code=400, detail=f"文件 '{file.filename}' 无法被解码为图像。")
@@ -106,7 +112,6 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     if width > 10000 or height > 10000:
         raise HTTPException(status_code=400, detail="height or width out of range")
 
-    # 色彩空间转换通常很快，可以在主线程进行，但也可以移到后台线程
     if channels == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif channels == 4:
@@ -144,8 +149,6 @@ async def restart_service():
     logging.info("收到 /restart 请求，正在手动释放模型...")
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
-            # release_models 是 CPU 密集型操作 (del, gc.collect)，也可以考虑放入线程
-            # 但通常很快，且不频繁调用，放在主线程问题不大
             models_instance.release_models()
         else:
             logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
@@ -159,38 +162,35 @@ async def restart_process():
         time.sleep(1)
         python = sys.executable
         os.execl(python, python, *sys.argv)
-    # 启动新线程执行重启操作
     threading.Thread(target=delayed_restart).start()
     return {"result": "pass"}
 
 
 @app.post("/ocr")
 async def ocr_endpoint(file: UploadFile = File(...)):
+    if not models_instance:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     try:
         image = await read_image_from_upload(file)
-        # --- 使用 asyncio.to_thread 运行阻塞的模型推理 ---
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
-        # --- 结束修改 ---
-        return {"result": ocr_results_obj.dict()}
+        # 【修复 3】 使用 .model_dump() 替换 .dict()
+        return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        return {"result": OCRResult(texts=[], scores=[], boxes=[]).dict()}
+        # 【修复 3】 使用 .model_dump() 替换 .dict()
+        return {"result": OCRResult(texts=[], scores=[], boxes=[]).model_dump()}
 
 @app.post("/clip/img")
 async def clip_image_endpoint(file: UploadFile = File(...)):
+    if not models_instance:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     logging.info(f"开始处理 CLIP 图像请求: {file.filename}")
     try:
         image = await read_image_from_upload(file)
-        # image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # 这步很快，可以在主线程
-        # image_pil = Image.fromarray(image_rgb)           # 这步也很快
-        # 可以将这两步也放入 to_thread，但收益可能不大
         image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
 
-        # --- 使用 asyncio.to_thread 运行阻塞的模型推理 ---
         embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
-        # --- 结束修改 ---
         result_strings = [f"{f:.16f}" for f in embedding]
-        # logging.info(f"成功为 '{file.filename}' 生成 embedding。") # 精简日志
         return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -198,12 +198,16 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
 
 @app.post("/clip/txt")
 async def clip_text_endpoint(request: TextClipRequest):
+    if not models_instance:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+
+    if not request.text or request.text.isspace():
+        logging.warning("收到了空的 CLIP 文本请求。")
+        return {"result": []}
+
     try:
-        # --- 使用 asyncio.to_thread 运行阻塞的模型推理 ---
         embedding = await asyncio.to_thread(models_instance.get_text_embedding, request.text)
-        # --- 结束修改 ---
         result_strings = [f"{f:.16f}" for f in embedding]
-        # logging.info(f"成功为文本 '{request.text[:30]}...' 生成 embedding。") # 精简日志
         return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
@@ -211,11 +215,11 @@ async def clip_text_endpoint(request: TextClipRequest):
 
 @app.post("/represent", response_model=RepresentResponse)
 async def represent_endpoint(file: UploadFile = File(...)):
+    if not models_instance:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     try:
         image = await read_image_from_upload(file)
-        # --- 使用 asyncio.to_thread 运行阻塞的模型推理 ---
         face_results_list = await asyncio.to_thread(models_instance.get_face_representation, image)
-        # --- 结束修改 ---
         return RepresentResponse(result=face_results_list)
     except Exception as e:
         logging.error(f"处理人脸识别请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -225,6 +229,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
     log_level = os.environ.get("LOG_LEVEL", "info").lower()
-    # 考虑增加 worker 数量以利用多核 CPU 处理 I/O 和 Python 代码
-    workers = int(os.environ.get("WEB_CONCURRENCY", 1)) # 默认为 1 个 worker
+    workers = int(os.environ.get("WEB_CONCURRENCY", 1))
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False, log_level=log_level, workers=workers)

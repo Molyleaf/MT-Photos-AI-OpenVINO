@@ -1,7 +1,8 @@
 # app/models.py
 import logging
 import os
-import queue  # 导入线程安全的队列
+import queue
+import threading
 from typing import List
 
 import numpy as np
@@ -47,13 +48,14 @@ class AIModels:
         self.clip_text_model = None
         self.clip_image_preprocessor = None
 
-        # 【修改】: 在 __init__ 中直接初始化队列，确保类型始终为 Queue
+        # 在 __init__ 中直接初始化队列，确保类型始终为 Queue
         self.face_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.ocr_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_vision_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_text_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
 
         self.models_loaded = False
+        self._load_lock = threading.Lock() # 【建议 3】 添加一个锁
 
     def load_models(self):
         """加载所有 AI 模型并填充实例池。"""
@@ -63,14 +65,13 @@ class AIModels:
         logging.info("--- 正在加载所有 AI 模型 ---")
         try:
             # 1. 加载可共享的/基础模型 (CLIP)
-            # 确保它们只被编译一次
             if self.clip_vision_model is None:
                 logging.info("编译基础 CLIP 模型...")
                 self.clip_image_preprocessor, self.clip_vision_model, self.clip_text_model = self._load_qa_clip()
             else:
                 logging.info("基础 CLIP 模型已编译，跳过。")
 
-            # 2. 【修改】: 仅当池为空时才填充
+            # 2. 仅当池为空时才填充
             if self.face_pool.empty():
                 logging.info(f"--- 正在填充 {INFERENCE_WORKERS} 个工作实例到池中... ---")
                 for i in range(INFERENCE_WORKERS):
@@ -78,7 +79,6 @@ class AIModels:
                     self.face_pool.put(self._load_insightface())
 
                     logging.info(f"加载 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...")
-                    # 【修正】: 修正上一版的拼写错误
                     self.ocr_pool.put(self._load_rapidocr())
 
                     # 从已编译的模型创建推理请求
@@ -98,32 +98,28 @@ class AIModels:
 
     def release_models(self):
         """从内存中释放所有已编译的模型和池化实例。"""
-        # 检查是否已释放 (例如 face_pool 为空且 models_loaded 为 False)
         if not self.models_loaded and self.face_pool.empty():
             return
 
         logging.info("--- 正在释放所有 AI 模型和实例池 ---")
         try:
-            # 【修改】: 辅助函数，用于安全地清空队列
             def _empty_queue(q: queue.Queue):
                 if q is None: return
                 while not q.empty():
                     try:
                         item = q.get_nowait()
-                        del item # 显式删除，帮助 GC 回收
+                        del item
                     except queue.Empty:
                         break
                     except Exception as e:
                         logging.warning(f"清空队列时出错: {e}")
 
-            # 清空池 (移除所有实例)
             _empty_queue(self.face_pool)
             _empty_queue(self.ocr_pool)
             _empty_queue(self.clip_vision_pool)
             _empty_queue(self.clip_text_pool)
             logging.info("实例池已清空。")
 
-            # 删除编译后的基础模型
             if self.clip_vision_model:
                 del self.clip_vision_model
                 self.clip_vision_model = None
@@ -143,7 +139,6 @@ class AIModels:
             self.models_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # 此函数现在被多次调用以填充池
         try:
             logging.debug("加载 InsightFace (使用 OpenVINOExecutionProvider)...")
             providers = ['OpenVINOExecutionProvider']
@@ -156,7 +151,6 @@ class AIModels:
             raise
 
     def _load_rapidocr(self) -> RapidOCR:
-        # 此函数现在被多次调用以填充池
         try:
             logging.debug("加载 RapidOCR (OpenVINO)...")
             ocr = RapidOCR()
@@ -167,7 +161,6 @@ class AIModels:
             raise
 
     def _load_qa_clip(self):
-        # 此函数只被调用一次，用于编译基础模型
         logging.info(f"正在加载 QA-CLIP ({MODEL_ARCH}) 模型: {self.qa_clip_path}")
         try:
             vision_model_path = os.path.join(self.qa_clip_path, "openvino_image_fp16.xml")
@@ -199,26 +192,19 @@ class AIModels:
             raise
 
     def ensure_models_loaded(self):
-        """确保模型已加载，如果未加载，则加载它们。"""
-        # 注意：这里需要一个锁来防止多个线程同时触发 load_models
-        # 但在 FastAPI 的 lifespan 中加载可以避免这个问题，
-        # 如果依赖按需加载，则需要添加 threading.Lock
-        # 为简单起见，我们假设 lifespan 会处理初始加载。
-        # 如果在 idle 释放后调用，此处的 `if not self.models_loaded` 是线程安全的 (GIL)
+        """确保模型已加载，如果未加载，则加载它们。（线程安全）"""
+        # 【建议 3】: 使用双重检查锁确保线程安全
         if not self.models_loaded:
-            logging.warning("模型未加载。正在触发按需加载...")
-            # TODO: 在高并发下，此处应加锁
-            # with threading.Lock():
-            #    if not self.models_loaded: # Double-check lock
-            #        self.load_models()
-            self.load_models() # 简单实现
+            with self._load_lock:
+                if not self.models_loaded:
+                    logging.warning("模型未加载。正在触发按需加载...")
+                    self.load_models()
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self.ensure_models_loaded()
         face_analyzer = None
         try:
-            # 【修改】: 现在 self.face_pool 始终是 Queue，IDE 不会报错
-            face_analyzer = self.face_pool.get(timeout=10) # 10秒超时
+            face_analyzer = self.face_pool.get(timeout=10)
             faces = face_analyzer.get(image)
             results = []
             for face in faces:
@@ -235,7 +221,6 @@ class AIModels:
             logging.debug(f"处理人脸识别时出错或未找到人脸: {e}", exc_info=False)
             return []
         finally:
-            # 确保实例被放回池中
             if face_analyzer:
                 self.face_pool.put(face_analyzer)
 
@@ -243,7 +228,6 @@ class AIModels:
         self.ensure_models_loaded()
         ocr_engine = None
         try:
-            # 【修改】: 现在 self.ocr_pool 始终是 Queue
             ocr_engine = self.ocr_pool.get(timeout=10)
             ocr_raw_output = ocr_engine(image)
 
@@ -308,7 +292,6 @@ class AIModels:
             inputs = self.clip_image_preprocessor(image).unsqueeze(0)
             pixel_values = inputs.numpy()
 
-            # 【修改】: 现在 self.clip_vision_pool 始终是 Queue
             infer_request = self.clip_vision_pool.get(timeout=10)
 
             results = infer_request.infer({self.clip_vision_model.inputs[0].any_name: pixel_values})
@@ -316,6 +299,8 @@ class AIModels:
             return [float(x) for x in embedding.flatten()]
         except Exception as e:
             logging.error(f"在 get_image_embedding 中处理 '{filename}' 时发生严重错误: {e}", exc_info=True)
+            # 【注意】: 这里的异常处理与 text 不同，因为图像失败返回全零向量是 MT-Photos 的既定行为。
+            # 如果您也想让它返回 []，您需要修改 server.py 中的 clip_image_endpoint
             return [0.0] * CLIP_EMBEDDING_DIMS
         finally:
             if infer_request:
@@ -324,13 +309,13 @@ class AIModels:
     def get_text_embedding(self, text: str) -> List[float]:
         self.ensure_models_loaded()
         infer_request = None
+        # 【建议 1】: 移除了外部的 try...except 块，让异常冒泡到 server.py
         try:
             inputs_tensor = clip.tokenize([text], context_length=CONTEXT_LENGTH)
             input_ids = inputs_tensor.numpy()
             pad_index = clip._tokenizer.vocab['[PAD]']
             attention_mask = (input_ids != pad_index).astype(np.int64)
 
-            # 【修改】: 现在 self.clip_text_pool 始终是 Queue
             infer_request = self.clip_text_pool.get(timeout=10)
 
             input_name_0 = self.clip_text_model.inputs[0].any_name
@@ -342,9 +327,7 @@ class AIModels:
             results = infer_request.infer(inputs_dict)
             embedding = results[self.clip_text_model.outputs[0]]
             return [float(x) for x in embedding.flatten()]
-        except Exception as e:
-            logging.error(f"在 get_text_embedding 中处理 '{text}' 时发生严重错误: {e}", exc_info=True)
-            return [0.0] * CLIP_EMBEDDING_DIMS
         finally:
+            # finally 块确保无论成功还是失败（异常抛出），请求都会被放回池中
             if infer_request:
                 self.clip_text_pool.put(infer_request)
