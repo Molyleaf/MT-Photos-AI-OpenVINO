@@ -4,18 +4,6 @@ import os
 import queue
 import threading
 from typing import List
-import sys
-
-if sys.platform == "win32":
-    try:
-        import onnxruntime.tools.add_openvino_win_libs as utils
-        utils.add_openvino_libs_to_path()
-        logging.warning("已使用 onnxruntime.tools 自动配置 OpenVINO 依赖项路径 (for ONNX EP)。")
-    except ImportError:
-        logging.error("未找到 'onnxruntime.tools.add_openvino_win_libs'。请确保 onnxruntime 已正确安装。")
-    except Exception as e:
-        logging.error(f"使用 onnxruntime.tools 配置 OpenVINO 路径时出错: {e}", exc_info=True)
-# --- 修复结束 ---
 
 import numpy as np
 import openvino as ov
@@ -42,7 +30,7 @@ MODEL_BASE_PATH = os.environ.get("MODEL_PATH", _DEFAULT_MODEL_PATH)
 logging.info(f"模型根目录 (MODEL_BASE_PATH): {MODEL_BASE_PATH}")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
-INFERENCE_WORKERS = int(os.environ.get("INFERENCE_WORKERS", "4"))
+INFERENCE_WORKERS = int(os.environ.get("INFERENCE_WORKERS", "1"))
 MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
@@ -156,66 +144,52 @@ class AIModels:
             self.models_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # --- (保留) 多阶段回退 (AUTO OV -> CPU OV -> Generic CPU) ---
-        # 现在的修复 (v3) 应该能让前两个阶段成功
+        # --- 【修复 v5】: 解决 Error 127 静默失败和日志误导问题 ---
+        #
+        # 分析:
+        # 1. onnxruntime OpenVINO EP (OpenVINOExecutionProvider)
+        #    在 Windows Server 2025 上存在根本兼容性问题 (Error 127)。
+        # 2. 此 Error 127 被 onnxruntime 打印到 stderr，但 *未* 作为 Python 异常
+        #    抛出，导致我们的 try...except 块失效。
+        # 3. 程序继续执行，并错误地打印 "加载成功" 日志，但 onnxruntime
+        #    已在内部(静默)回退到其通用的、无加速的 CPU provider。
+        #
+        # 解决方案:
+        # 停止尝试加载有问题的 OpenVINOExecutionProvider。
+        # 我们直接显式加载 'CPUExecutionProvider'，这是唯一可靠的选项。
+        # 这将消除 Error 127 日志，并正确反映 Insightface 正在 CPU 上运行。
 
-        # 尝试 1: 使用 INFERENCE_DEVICE (例如 "AUTO")
-        primary_device_type = INFERENCE_DEVICE.split('.')[0]
+        logging.warning("OpenVINO EP (for Insightface) 在 Server 2025 上不兼容 (将跳过)。")
+        logging.warning("Insightface 将显式加载通用的 'CPUExecutionProvider' (无 OpenVINO 加速)。")
         try:
-            provider_options = {'device_type': primary_device_type}
-            providers = [('OpenVINOExecutionProvider', provider_options)]
-
-            logging.debug(f"加载 InsightFace (尝试 {providers})...")
-            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
+            providers_generic_cpu = ['CPUExecutionProvider']
+            face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_generic_cpu)
             face_app.prepare(ctx_id=0, det_size=(64, 64))
-            logging.warning(f"InsightFace 实例在 {primary_device_type} (OpenVINO EP) 上加载成功。")
+            logging.warning("InsightFace 实例已在通用 CPU (回退模式) 上成功加载。")
             return face_app
-        except Exception as e:
-            # 记录 Error 127 或其他错误
-            logging.error(f"加载 InsightFace (OpenVINO EP, device={primary_device_type}) 失败。错误: {e}", exc_info=True)
-
-            # 尝试 2: 回退到 OpenVINO CPU
-            logging.warning(f"InsightFace {primary_device_type} (OpenVINO EP) 加载失败，将回退到 OpenVINO CPU Execution Provider...")
-            try:
-                provider_options_cpu = {'device_type': 'CPU'}
-                providers_cpu = [('OpenVINOExecutionProvider', provider_options_cpu)]
-
-                logging.debug(f"加载 InsightFace (尝试 {providers_cpu})...")
-                face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_cpu)
-                face_app.prepare(ctx_id=0, det_size=(64, 64))
-                logging.warning("InsightFace 实例已在 CPU (OpenVINO EP 回退模式) 上成功加载。")
-                return face_app
-            except Exception as fallback_e:
-                logging.error(f"InsightFace 在 CPU (OpenVINO EP 回退) 模式下也加载失败: {fallback_e}", exc_info=True)
-
-                # 尝试 3: 最终回退到通用的 CPUExecutionProvider (无 OpenVINO 加速)
-                logging.warning("OpenVINO EP 彻底失败，将回退到通用的 CPUExecutionProvider (无 OpenVINO 加速)...")
-                try:
-                    providers_generic_cpu = ['CPUExecutionProvider']
-                    face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_generic_cpu)
-                    face_app.prepare(ctx_id=0, det_size=(64, 64))
-                    logging.warning("InsightFace 实例已在通用 CPU (回退模式) 上成功加载。")
-                    return face_app
-                except Exception as final_fallback_e:
-                    logging.critical(f"InsightFace 在所有模式下均加载失败: {final_fallback_e}", exc_info=True)
-                    raise final_fallback_e
-        # --- 回退逻辑结束 ---
+        except Exception as final_fallback_e:
+            # 如果连这个都失败了，那就是个大问题
+            logging.critical(f"InsightFace 在通用 CPU (回退) 模式下也加载失败: {final_fallback_e}", exc_info=True)
+            raise final_fallback_e
+        # --- 修复结束 ---
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
         # (此处的逻辑已正确：AUTO -> CPU (OpenVINO)
+        # 它使用的是纯 OpenVINO API，"AUTO" 会自动回退到 OpenVINO CPU
+        # (如果 GPU 不兼容)，这是有加速的。
         try:
             logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
             # RapidOCR 会自动处理 'AUTO' 设备
             ocr = RapidOCR(device_name=INFERENCE_DEVICE)
-            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} 上加载成功。")
+            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} (OpenVINO) 上加载成功。")
             return ocr
         except Exception as e:
             logging.error(f"加载 RapidOCR 实例失败 (尝试使用 {INFERENCE_DEVICE}): {e}", exc_info=True)
-            logging.warning("RapidOCR (OpenVINO) 加载失败，将回退到 CPU...")
+            logging.warning("RapidOCR (OpenVINO) 加载失败，将回退到 CPU (OpenVINO)...")
             try:
                 ocr = RapidOCR(device_name="CPU")
-                logging.warning("RapidOCR 实例已在 CPU 上成功加载 (回退模式)。")
+                logging.warning("RapidOCR 实例已在 CPU (OpenVINO 回退模式) 上成功加载。")
                 return ocr
             except Exception as fallback_e:
                 logging.critical(f"RapidOCR 在 CPU (回退) 模式下也加载失败: {fallback_e}", exc_info=True)
