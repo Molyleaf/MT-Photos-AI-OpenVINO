@@ -5,29 +5,33 @@ import queue
 import threading
 from typing import List
 
-# --- 【修复 1 & 3】: 解决 OpenVINO DLL (Error 127) ---
+# --- 【修复 1 & 2】: 解决 OpenVINO DLL (Error 127) 和 Linter 警告 ---
 # 必须在导入 insightface 和 rapidocr 之前执行
 import sys
 if sys.platform == "win32":
     try:
         import openvino
-        # 从 openvino 包的安装位置找到 runtime bin 目录
+
+        # 修复：移除 IDE 找不到的 'add_library_directory'
+        # 我们只依赖手动查找 'libs' 目录，这对于新版 OpenVINO (2023+) 是正确的
+
         ov_path = os.path.dirname(openvino.__file__)
-        ov_bin_path = os.path.join(ov_path, "runtime", "bin")
-
-        if os.path.isdir(ov_bin_path):
-            # 使用 os.add_dll_directory (Python 3.8+)
-            os.add_dll_directory(ov_bin_path)
-            logging.info(f"已将 OpenVINO runtime (for ONNX) 添加到 DLL 搜索路径: {ov_bin_path}")
-        else:
-            logging.warning(f"未找到 OpenVINO runtime 目录: {ov_bin_path}")
-
         ov_libs_path = os.path.join(ov_path, "libs")
+
         if os.path.isdir(ov_libs_path):
             os.add_dll_directory(ov_libs_path)
-            logging.info(f"已将 OpenVINO TBB (for ONNX) 添加到 DLL 搜索路径: {ov_libs_path}")
+            logging.debug(f"已将 OpenVINO libs (for ONNX) 添加到 DLL 搜索路径: {ov_libs_path}")
+        else:
+            # 兼容旧版 OpenVINO (2022-)
+            ov_bin_path = os.path.join(ov_path, "runtime", "bin")
+            if os.path.isdir(ov_bin_path):
+                os.add_dll_directory(ov_bin_path)
+                logging.debug(f"已将 OpenVINO runtime (for ONNX) 添加到 DLL 搜索路径: {ov_bin_path}")
+            else:
+                logging.warning(f"未在 {ov_path} 中找到 'libs' 或 'runtime/bin' 目录。")
 
     except ImportError:
+        # 修复：这里不引用 'openvino' 变量，避免 Linter 警告
         logging.warning("未安装 'openvino' 包。onnxruntime-openvino 可能无法工作。")
     except Exception as e:
         logging.error(f"自动设置 OpenVINO DLL 路径时出错: {e}", exc_info=True)
@@ -37,11 +41,11 @@ import numpy as np
 import openvino as ov
 from PIL import Image
 from insightface.app import FaceAnalysis
-# --- 【请求 1】: 回退到 rapidocr_openvino ---
 from rapidocr_openvino import RapidOCR
 
 import clip
-from clip.utils import image_transform, _MODEL_INFO
+# --- 【修复 3】: 导入重命名后的 MODEL_INFO ---
+from clip.utils import image_transform, MODEL_INFO
 from schemas import (
     OCRBox,
     OCRResult,
@@ -52,13 +56,11 @@ from schemas import (
 # --- 环境变量与常量定义 ---
 INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
 
-# --- 【请求 5】: 优化 NSSM 的默认路径 ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 _DEFAULT_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models")
 MODEL_BASE_PATH = os.environ.get("MODEL_PATH", _DEFAULT_MODEL_PATH)
-logging.warning(f"模型根目录 (MODEL_BASE_PATH): {MODEL_BASE_PATH}")
-# --- 路径优化结束 ---
+logging.info(f"模型根目录 (MODEL_BASE_PATH): {MODEL_BASE_PATH}")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
 INFERENCE_WORKERS = int(os.environ.get("INFERENCE_WORKERS", "4"))
@@ -66,20 +68,18 @@ MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 
-# --- 【请求 2】: 默认日志级别设为 WARNING ---
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 class AIModels:
     """封装所有 AI 模型加载和推理逻辑的类（并发安全版）。"""
     def __init__(self):
-        logging.warning(f"正在初始化AI模型实例 (尚未加载)，使用设备: {INFERENCE_DEVICE}") #
+        logging.warning(f"正在初始化AI模型实例 (尚未加载)，使用设备: {INFERENCE_DEVICE}")
         self.core = ov.Core()
 
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
         self.qa_clip_path = os.path.join(MODEL_BASE_PATH, "qa-clip", "openvino")
 
-        # 编译后的基础模型（线程安全，可共享）
         self.clip_vision_model = None
         self.clip_text_model = None
         self.clip_image_preprocessor = None
@@ -101,34 +101,33 @@ class AIModels:
             if self.models_loaded:
                 return
 
-            logging.warning("--- 正在加载所有 AI 模型 ---") #
+            logging.warning("--- 正在加载所有 AI 模型 ---")
             try:
-                # 1. 加载可共享的/基础模型 (CLIP)
                 if self.clip_vision_model is None:
-                    logging.warning("编译基础 CLIP 模型...") #
+                    logging.warning("编译基础 CLIP 模型...")
                     self.clip_image_preprocessor, self.clip_vision_model, self.clip_text_model = self._load_qa_clip()
                 else:
-                    logging.warning("基础 CLIP 模型已编译，跳过。") #
+                    logging.warning("基础 CLIP 模型已编译，跳过。")
 
-                # 2. 仅当池为空时才填充
                 if self.face_pool.empty():
-                    logging.warning(f"--- 正在填充 {INFERENCE_WORKERS} 个工作实例到池中... ---") #
+                    logging.warning(f"--- 正在填充 {INFERENCE_WORKERS} 个工作实例到池中... ---")
                     for i in range(INFERENCE_WORKERS):
-                        logging.warning(f"加载 FaceAnalysis 实例 {i+1}/{INFERENCE_WORKERS}...") #
+                        logging.warning(f"加载 FaceAnalysis 实例 {i+1}/{INFERENCE_WORKERS}...")
                         self.face_pool.put(self._load_insightface())
 
-                        logging.warning(f"加载 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...") #
-                        self.ocr_pool.put(self._load_rapidocr())
+                        logging.warning(f"加载 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...")
+                        # --- 【修复 4】: 调用静态方法 ---
+                        self.ocr_pool.put(AIModels._load_rapidocr())
 
                         self.clip_vision_pool.put(self.clip_vision_model.create_infer_request())
                         self.clip_text_pool.put(self.clip_text_model.create_infer_request())
 
-                    logging.warning(f"--- {INFERENCE_WORKERS} 个工作实例已准备就绪 ---") #
+                    logging.warning(f"--- {INFERENCE_WORKERS} 个工作实例已准备就绪 ---")
                 else:
-                    logging.warning("--- 工作实例池已填充，跳过填充。 ---") #
+                    logging.warning("--- 工作实例池已填充，跳过填充。 ---")
 
                 self.models_loaded = True
-                logging.warning("--- 所有模型已成功加载并编译 ---") #
+                logging.warning("--- 所有模型已成功加载并编译 ---")
             except Exception as e:
                 logging.critical(f"模型加载失败: {e}", exc_info=True)
                 self.release_models()
@@ -139,7 +138,7 @@ class AIModels:
         if not self.models_loaded and self.face_pool.empty():
             return
 
-        logging.warning("--- 正在释放所有 AI 模型和实例池 ---") #
+        logging.warning("--- 正在释放所有 AI 模型和实例池 ---")
         try:
             def _empty_queue(q: queue.Queue):
                 if q is None: return
@@ -156,7 +155,7 @@ class AIModels:
             _empty_queue(self.ocr_pool)
             _empty_queue(self.clip_vision_pool)
             _empty_queue(self.clip_text_pool)
-            logging.warning("实例池已清空。") #
+            logging.warning("实例池已清空。")
 
             if self.clip_vision_model:
                 del self.clip_vision_model
@@ -170,16 +169,14 @@ class AIModels:
             import gc
             gc.collect()
 
-            logging.warning("模型已成功从内存中释放。") #
+            logging.warning("模型已成功从内存中释放。")
         except Exception as e:
             logging.warning(f"释放模型时出现错误: {e}", exc_info=True)
         finally:
             self.models_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # --- 【请求 3】: 修复 Insightface 回退到 CPUExecutionProvider 的问题 ---
         try:
-            # 'GPU.0' -> 'GPU'。ONNXRuntime OpenVINO EP 接受 'AUTO', 'GPU', 'CPU'
             device_type = INFERENCE_DEVICE.split('.')[0]
             provider_options = {'device_type': device_type}
             providers = [('OpenVINOExecutionProvider', provider_options)]
@@ -187,7 +184,7 @@ class AIModels:
             logging.debug(f"加载 InsightFace (使用 {providers})...")
             face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
             face_app.prepare(ctx_id=0, det_size=(64, 64))
-            logging.warning(f"InsightFace 实例在 {device_type} (OpenVINO EP) 上加载成功。") #
+            logging.warning(f"InsightFace 实例在 {device_type} (OpenVINO EP) 上加载成功。")
             return face_app
         except Exception as e:
             logging.error(f"加载 InsightFace 实例失败 (尝试使用 {INFERENCE_DEVICE})。错误: {e}", exc_info=True)
@@ -202,13 +199,14 @@ class AIModels:
                 logging.critical(f"InsightFace 在 CPU (回退) 模式下也加载失败: {fallback_e}", exc_info=True)
                 raise fallback_e
 
-    def _load_rapidocr(self) -> RapidOCR:
-        # --- 【请求 1】: 使用 rapidocr_openvino 并指定 GPU 设备 ---
+    # --- 【修复 4】: 将方法设为 static ---
+    @staticmethod
+    def _load_rapidocr() -> RapidOCR:
+        # 移除 'self' 参数
         try:
             logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
-            # rapidocr_openvino 接受 device_name 参数
             ocr = RapidOCR(device_name=INFERENCE_DEVICE)
-            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} 上加载成功。") #
+            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} 上加载成功。")
             return ocr
         except Exception as e:
             logging.error(f"加载 RapidOCR 实例失败 (尝试使用 {INFERENCE_DEVICE}): {e}", exc_info=True)
@@ -222,7 +220,7 @@ class AIModels:
                 raise fallback_e
 
     def _load_qa_clip(self):
-        logging.warning(f"正在加载 QA-CLIP ({MODEL_ARCH}) 模型: {self.qa_clip_path}") #
+        logging.warning(f"正在加载 QA-CLIP ({MODEL_ARCH}) 模型: {self.qa_clip_path}")
         try:
             vision_model_path = os.path.join(self.qa_clip_path, "openvino_image_fp16.xml")
             text_model_path = os.path.join(self.qa_clip_path, "openvino_text_fp16.xml")
@@ -233,20 +231,21 @@ class AIModels:
             config_vision = {"PERFORMANCE_HINT": "THROUGHPUT"}
             config_text = {"PERFORMANCE_HINT": "LATENCY"}
 
-            logging.warning(f"编译 Vision 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_vision['PERFORMANCE_HINT']})...") #
+            logging.warning(f"编译 Vision 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_vision['PERFORMANCE_HINT']})...")
             vision_compiled = self.core.compile_model(vision_model_path, INFERENCE_DEVICE, config_vision)
 
-            logging.warning(f"编译 Text 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_text['PERFORMANCE_HINT']})...") #
+            logging.warning(f"编译 Text 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_text['PERFORMANCE_HINT']})...")
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config_text)
 
-            image_preprocessor = image_transform(_MODEL_INFO[MODEL_ARCH]['input_resolution'])
+            # --- 【修复 3】: 使用重命名后的 MODEL_INFO ---
+            image_preprocessor = image_transform(MODEL_INFO[MODEL_ARCH]['input_resolution'])
 
             if vision_compiled.outputs[0].get_partial_shape()[1].get_length() != CLIP_EMBEDDING_DIMS:
                 raise RuntimeError(f"视觉模型维度不匹配！")
             if text_compiled.outputs[0].get_partial_shape()[1].get_length() != CLIP_EMBEDDING_DIMS:
                 raise RuntimeError(f"文本模型维度不匹配！")
 
-            logging.warning(f"QA-CLIP ({MODEL_ARCH}) 基础模型编译成功。") #
+            logging.warning(f"QA-CLIP ({MODEL_ARCH}) 基础模型编译成功。")
             return image_preprocessor, vision_compiled, text_compiled
         except Exception as e:
             logging.error(f"加载 QA-CLIP 模型时发生严重错误: {e}", exc_info=True)
@@ -268,7 +267,8 @@ class AIModels:
             faces = face_analyzer.get(image)
             results = []
             for face in faces:
-                bbox = face.bbox.astype(int)
+                # --- 【修复 2】: 显式转换为 np.array 以安抚 Linter ---
+                bbox = np.array(face.bbox).astype(int)
                 x1, y1, x2, y2 = bbox
                 facial_area = FacialArea(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
                 results.append(RepresentResult(
@@ -306,7 +306,6 @@ class AIModels:
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             if len(ocr_result) == 0:
-                # --- 【请求 4】: 移除日志 ---
                 pass
                 return OCRResult(texts=[], scores=[], boxes=[])
 
@@ -372,7 +371,8 @@ class AIModels:
             inputs_tensor = clip.tokenize([text], context_length=CONTEXT_LENGTH)
             input_ids = inputs_tensor.numpy()
             pad_index = clip._tokenizer.vocab['[PAD]']
-            attention_mask = (input_ids != pad_index).astype(np.int64)
+            # --- 【修复 2】: 显式转换为 np.array 以安抚 Linter ---
+            attention_mask = np.array(input_ids != pad_index).astype(np.int64)
 
             infer_request = self.clip_text_pool.get(timeout=10)
 

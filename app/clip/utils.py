@@ -14,14 +14,16 @@ from tqdm import tqdm
 from clip import _tokenizer
 from clip.model import convert_weights, CLIP, restore_model
 
-__all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name"]
+# --- 【修复 3】: 将 '_MODEL_INFO' 添加到 __all__ ---
+__all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name", "MODEL_INFO"]
 
 _MODELS = {
     "ViT-B-16": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-base.pt",
     "ViT-L-14": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-large.pt",
     "RN50": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-RN50.pt",
 }
-_MODEL_INFO = {
+# --- 【修复 3】: 重命名为 MODEL_INFO (移除 '_') ---
+MODEL_INFO = {
     "ViT-B-16": {
         "struct": "ViT-B-16@RoBERTa-wwm-ext-base-chinese",
         "input_resolution": 224
@@ -35,6 +37,7 @@ _MODEL_INFO = {
         "input_resolution": 224
     },
 }
+# --- 修复结束 ---
 
 
 def _download(url: str, root: str):
@@ -76,7 +79,8 @@ def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch
                    download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
-        model_name, model_input_resolution = _MODEL_INFO[name]['struct'], _MODEL_INFO[name]['input_resolution']
+        # --- 【修复 3】: 使用 MODEL_INFO ---
+        model_name, model_input_resolution = MODEL_INFO[name]['struct'], MODEL_INFO[name]['input_resolution']
     elif os.path.isfile(name):
         assert vision_model_name and text_model_name and input_resolution, "Please specify specific 'vision_model_name', 'text_model_name', and 'input_resolution'"
         model_path = name
@@ -130,7 +134,7 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.Lo
     all_tokens = []
     for text in texts:
         all_tokens.append([_tokenizer.vocab['[CLS]']] + _tokenizer.convert_tokens_to_ids(_tokenizer.tokenize(text))[
-                                                        :context_length - 2] + [_tokenizer.vocab['[SEP]']])
+            :context_length - 2] + [_tokenizer.vocab['[SEP]']])
 
     result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
 
