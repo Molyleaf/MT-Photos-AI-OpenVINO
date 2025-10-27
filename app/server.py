@@ -23,7 +23,33 @@ from schemas import (
     RestartResponse
 )
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- 【请求 2 & 5】: NSSM 日志优化和级别设置 ---
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_APP_DIR)
+_LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
+
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper() #
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
+
+log_handlers = [logging.StreamHandler()] # 默认输出到控制台
+if sys.platform == "win32":
+    # 在 Windows (NSSM) 上，额外记录到文件
+    try:
+        log_handlers = [
+            logging.FileHandler(_LOG_FILE, encoding='utf-8', mode='a'),
+            logging.StreamHandler()
+        ]
+        print(f"服务日志将被写入: {_LOG_FILE}")
+    except Exception as e:
+        print(f"无法设置文件日志: {e}")
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=log_handlers
+)
+# --- 日志配置结束 ---
+
 
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt_photos_ai_extra")
 API_KEY_NAME = "api-key"
@@ -40,15 +66,13 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
-# 【修复 1】 使用 Optional 修正类型提示
 idle_timer: Optional[threading.Timer] = None
-# 【修复 2】 使用 Optional 修正类型提示
 models_instance: Optional[ai_models.AIModels] = None
 
 def idle_timeout_handler():
     global models_instance
     if models_instance and models_instance.models_loaded:
-        logging.info(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放模型以节省内存...")
+        logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放模型以节省内存...") #
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
         else:
@@ -65,7 +89,7 @@ def reset_idle_timer():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global models_instance
-    logging.info("应用启动... 初始化 AIModels 实例。")
+    logging.warning("应用启动... 初始化 AIModels 实例。") #
     models_instance = ai_models.AIModels()
     try:
         models_instance.load_models()
@@ -77,7 +101,7 @@ async def lifespan(app: FastAPI):
     global idle_timer
     if idle_timer:
         idle_timer.cancel()
-    logging.info("应用关闭。正在释放所有模型...")
+    logging.warning("应用关闭。正在释放所有模型...") #
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
@@ -146,7 +170,7 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse)
 async def restart_service():
-    logging.info("收到 /restart 请求，正在手动释放模型...")
+    logging.warning("收到 /restart 请求，正在手动释放模型...") #
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
@@ -173,18 +197,19 @@ async def ocr_endpoint(file: UploadFile = File(...)):
     try:
         image = await read_image_from_upload(file)
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
-        # 【修复 3】 使用 .model_dump() 替换 .dict()
+        # --- (保留) Pydantic v2 修复 ---
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        # 【修复 3】 使用 .model_dump() 替换 .dict()
+        # --- (保留) Pydantic v2 修复 ---
         return {"result": OCRResult(texts=[], scores=[], boxes=[]).model_dump()}
 
 @app.post("/clip/img")
 async def clip_image_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
-    logging.info(f"开始处理 CLIP 图像请求: {file.filename}")
+    # --- 【请求 2】: 降级为 DEBUG (在 WARNING 级别下不显示) ---
+    logging.debug(f"开始处理 CLIP 图像请求: {file.filename}")
     try:
         image = await read_image_from_upload(file)
         image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
@@ -228,6 +253,17 @@ async def represent_endpoint(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
-    log_level = os.environ.get("LOG_LEVEL", "info").lower()
+    # --- 【请求 2】: 默认级别改为 "warning" ---
+    log_level = os.environ.get("LOG_LEVEL", "warning").lower() #
     workers = int(os.environ.get("WEB_CONCURRENCY", 1))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False, log_level=log_level, workers=workers)
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level=log_level,
+        workers=workers,
+        # --- (保留) 移除 200 OK 日志 ---
+        access_log=False
+    )
