@@ -253,7 +253,6 @@ async def represent_endpoint(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
-    # --- 【请求 2】: 默认级别改为 "warning" ---
     log_level = os.environ.get("LOG_LEVEL", "warning").lower() #
     workers = int(os.environ.get("WEB_CONCURRENCY", 1))
 
@@ -264,6 +263,5 @@ if __name__ == "__main__":
         reload=False,
         log_level=log_level,
         workers=workers,
-        # --- (保留) 移除 200 OK 日志 ---
         access_log=False
     )

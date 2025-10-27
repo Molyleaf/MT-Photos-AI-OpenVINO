@@ -5,33 +5,42 @@ import queue
 import threading
 from typing import List
 
-# --- 【修复 1 & 2】: 解决 OpenVINO DLL (Error 127) 和 Linter 警告 ---
+# --- 【最终修复 v2】: 解决 OpenVINO DLL (Error 127) ---
 # 必须在导入 insightface 和 rapidocr 之前执行
 import sys
 if sys.platform == "win32":
     try:
         import openvino
 
-        # 修复：移除 IDE 找不到的 'add_library_directory'
-        # 我们只依赖手动查找 'libs' 目录，这对于新版 OpenVINO (2023+) 是正确的
-
         ov_path = os.path.dirname(openvino.__file__)
         ov_libs_path = os.path.join(ov_path, "libs")
+        ov_bin_path_old = os.path.join(ov_path, "runtime", "bin")
 
+        found_path = None
         if os.path.isdir(ov_libs_path):
-            os.add_dll_directory(ov_libs_path)
-            logging.debug(f"已将 OpenVINO libs (for ONNX) 添加到 DLL 搜索路径: {ov_libs_path}")
+            # 新版 OpenVINO (2023+)
+            found_path = ov_libs_path
+        elif os.path.isdir(ov_bin_path_old):
+            # 旧版 OpenVINO (2022-)
+            found_path = ov_bin_path_old
+
+        if found_path:
+            # 1. (新) 使用 os.environ["PATH"]，这是最可靠的方法
+            # 我们将其添加到 PATH 的最前面
+            os.environ["PATH"] = found_path + os.pathsep + os.environ.get("PATH", "")
+
+            # 2. (保留) 使用 add_dll_directory，作为双重保险
+            # os.add_dll_directory 在 Python 3.8+ 上可用
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(found_path)
+
+            # 3. (新) 将日志级别改为 WARNING，确保我们能在日志中看到此条消息
+            logging.warning(f"已将 OpenVINO 运行时 (for ONNX) 添加到 PATH: {found_path}")
         else:
-            # 兼容旧版 OpenVINO (2022-)
-            ov_bin_path = os.path.join(ov_path, "runtime", "bin")
-            if os.path.isdir(ov_bin_path):
-                os.add_dll_directory(ov_bin_path)
-                logging.debug(f"已将 OpenVINO runtime (for ONNX) 添加到 DLL 搜索路径: {ov_bin_path}")
-            else:
-                logging.warning(f"未在 {ov_path} 中找到 'libs' 或 'runtime/bin' 目录。")
+            # 如果两个路径都没找到，这是一个严重错误
+            logging.error(f"严重错误: 未在 {ov_path} 中找到 'libs' 或 'runtime/bin' 目录。")
 
     except ImportError:
-        # 修复：这里不引用 'openvino' 变量，避免 Linter 警告
         logging.warning("未安装 'openvino' 包。onnxruntime-openvino 可能无法工作。")
     except Exception as e:
         logging.error(f"自动设置 OpenVINO DLL 路径时出错: {e}", exc_info=True)
@@ -44,7 +53,6 @@ from insightface.app import FaceAnalysis
 from rapidocr_openvino import RapidOCR
 
 import clip
-# --- 【修复 3】: 导入重命名后的 MODEL_INFO ---
 from clip.utils import image_transform, MODEL_INFO
 from schemas import (
     OCRBox,
@@ -68,6 +76,8 @@ MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 
+# 注意：logging.basicConfig 应该在 server.py 中配置，以避免在库模式下产生副作用
+# 这里保留它是为了确保日志输出，但在一个大型应用中，应由主入口点配置
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -116,8 +126,7 @@ class AIModels:
                         self.face_pool.put(self._load_insightface())
 
                         logging.warning(f"加载 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...")
-                        # --- 【修复 4】: 调用静态方法 ---
-                        self.ocr_pool.put(AIModels._load_rapidocr())
+                        self.ocr_pool.put(self._load_rapidocr())
 
                         self.clip_vision_pool.put(self.clip_vision_model.create_infer_request())
                         self.clip_text_pool.put(self.clip_text_model.create_infer_request())
@@ -176,35 +185,56 @@ class AIModels:
             self.models_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
+        # --- 【修复】: 实现多阶段回退 (AUTO OV -> CPU OV -> Generic CPU) ---
+
+        # 尝试 1: 使用 INFERENCE_DEVICE (例如 "AUTO")
+        primary_device_type = INFERENCE_DEVICE.split('.')[0]
         try:
-            device_type = INFERENCE_DEVICE.split('.')[0]
-            provider_options = {'device_type': device_type}
+            provider_options = {'device_type': primary_device_type}
             providers = [('OpenVINOExecutionProvider', provider_options)]
 
-            logging.debug(f"加载 InsightFace (使用 {providers})...")
+            logging.debug(f"加载 InsightFace (尝试 {providers})...")
             face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
             face_app.prepare(ctx_id=0, det_size=(64, 64))
-            logging.warning(f"InsightFace 实例在 {device_type} (OpenVINO EP) 上加载成功。")
+            logging.warning(f"InsightFace 实例在 {primary_device_type} (OpenVINO EP) 上加载成功。")
             return face_app
         except Exception as e:
-            logging.error(f"加载 InsightFace 实例失败 (尝试使用 {INFERENCE_DEVICE})。错误: {e}", exc_info=True)
-            logging.warning("OpenVINOExecutionProvider 加载失败，将回退到 CPUExecutionProvider...")
+            # 记录 Error 127 或其他错误
+            logging.error(f"加载 InsightFace (OpenVINO EP, device={primary_device_type}) 失败。错误: {e}", exc_info=True)
+
+            # 尝试 2: 回退到 OpenVINO CPU
+            logging.warning(f"InsightFace {primary_device_type} (OpenVINO EP) 加载失败，将回退到 OpenVINO CPU Execution Provider...")
             try:
-                providers = ['CPUExecutionProvider']
-                face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
+                provider_options_cpu = {'device_type': 'CPU'}
+                providers_cpu = [('OpenVINOExecutionProvider', provider_options_cpu)]
+
+                logging.debug(f"加载 InsightFace (尝试 {providers_cpu})...")
+                face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_cpu)
                 face_app.prepare(ctx_id=0, det_size=(64, 64))
-                logging.warning("InsightFace 实例已在 CPU 上成功加载 (回退模式)。")
+                logging.warning("InsightFace 实例已在 CPU (OpenVINO EP 回退模式) 上成功加载。")
                 return face_app
             except Exception as fallback_e:
-                logging.critical(f"InsightFace 在 CPU (回退) 模式下也加载失败: {fallback_e}", exc_info=True)
-                raise fallback_e
+                logging.error(f"InsightFace 在 CPU (OpenVINO EP 回退) 模式下也加载失败: {fallback_e}", exc_info=True)
 
-    # --- 【修复 4】: 将方法设为 static ---
+                # 尝试 3: 最终回退到通用的 CPUExecutionProvider (无 OpenVINO 加速)
+                logging.warning("OpenVINO EP 彻底失败，将回退到通用的 CPUExecutionProvider (无 OpenVINO 加速)...")
+                try:
+                    providers_generic_cpu = ['CPUExecutionProvider']
+                    face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_generic_cpu)
+                    face_app.prepare(ctx_id=0, det_size=(64, 64))
+                    logging.warning("InsightFace 实例已在通用 CPU (回退模式) 上成功加载。")
+                    return face_app
+                except Exception as final_fallback_e:
+                    logging.critical(f"InsightFace 在所有模式下均加载失败: {final_fallback_e}", exc_info=True)
+                    raise final_fallback_e
+        # --- 修复结束 ---
+
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
-        # 移除 'self' 参数
+        # (此处的逻辑已正确：AUTO -> CPU (OpenVINO)
         try:
             logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
+            # RapidOCR 会自动处理 'AUTO' 设备
             ocr = RapidOCR(device_name=INFERENCE_DEVICE)
             logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} 上加载成功。")
             return ocr
@@ -237,7 +267,6 @@ class AIModels:
             logging.warning(f"编译 Text 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_text['PERFORMANCE_HINT']})...")
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config_text)
 
-            # --- 【修复 3】: 使用重命名后的 MODEL_INFO ---
             image_preprocessor = image_transform(MODEL_INFO[MODEL_ARCH]['input_resolution'])
 
             if vision_compiled.outputs[0].get_partial_shape()[1].get_length() != CLIP_EMBEDDING_DIMS:
@@ -267,7 +296,6 @@ class AIModels:
             faces = face_analyzer.get(image)
             results = []
             for face in faces:
-                # --- 【修复 2】: 显式转换为 np.array 以安抚 Linter ---
                 bbox = np.array(face.bbox).astype(int)
                 x1, y1, x2, y2 = bbox
                 facial_area = FacialArea(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
@@ -278,6 +306,7 @@ class AIModels:
                 ))
             return results
         except Exception as e:
+            # 调试级别，因为“未找到人脸”是正常情况
             logging.debug(f"处理人脸识别时出错或未找到人脸: {e}", exc_info=False)
             return []
         finally:
@@ -298,7 +327,8 @@ class AIModels:
             ocr_result, _ = ocr_raw_output
 
             if ocr_result is None:
-                logging.warning("RapidOCR 返回 None 结果。")
+                # 这是正常情况（没有文本）
+                logging.debug("RapidOCR 返回 None 结果 (无文本)。")
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             if not isinstance(ocr_result, list):
@@ -306,7 +336,7 @@ class AIModels:
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             if len(ocr_result) == 0:
-                pass
+                # 正常情况（无文本）
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             texts, scores, boxes = [], [], []
@@ -371,7 +401,6 @@ class AIModels:
             inputs_tensor = clip.tokenize([text], context_length=CONTEXT_LENGTH)
             input_ids = inputs_tensor.numpy()
             pad_index = clip._tokenizer.vocab['[PAD]']
-            # --- 【修复 2】: 显式转换为 np.array 以安抚 Linter ---
             attention_mask = np.array(input_ids != pad_index).astype(np.int64)
 
             infer_request = self.clip_text_pool.get(timeout=10)
@@ -385,6 +414,9 @@ class AIModels:
             results = infer_request.infer(inputs_dict)
             embedding = results[self.clip_text_model.outputs[0]]
             return [float(x) for x in embedding.flatten()]
+        except Exception as e:
+            logging.error(f"在 get_text_embedding 中处理 '{text[:50]}...' 时发生严重错误: {e}", exc_info=True)
+            return [0.0] * CLIP_EMBEDDING_DIMS
         finally:
             if infer_request:
                 self.clip_text_pool.put(infer_request)
