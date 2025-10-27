@@ -4,46 +4,17 @@ import os
 import queue
 import threading
 from typing import List
-
-# --- 【最终修复 v2】: 解决 OpenVINO DLL (Error 127) ---
-# 必须在导入 insightface 和 rapidocr 之前执行
 import sys
+
 if sys.platform == "win32":
     try:
-        import openvino
-
-        ov_path = os.path.dirname(openvino.__file__)
-        ov_libs_path = os.path.join(ov_path, "libs")
-        ov_bin_path_old = os.path.join(ov_path, "runtime", "bin")
-
-        found_path = None
-        if os.path.isdir(ov_libs_path):
-            # 新版 OpenVINO (2023+)
-            found_path = ov_libs_path
-        elif os.path.isdir(ov_bin_path_old):
-            # 旧版 OpenVINO (2022-)
-            found_path = ov_bin_path_old
-
-        if found_path:
-            # 1. (新) 使用 os.environ["PATH"]，这是最可靠的方法
-            # 我们将其添加到 PATH 的最前面
-            os.environ["PATH"] = found_path + os.pathsep + os.environ.get("PATH", "")
-
-            # 2. (保留) 使用 add_dll_directory，作为双重保险
-            # os.add_dll_directory 在 Python 3.8+ 上可用
-            if hasattr(os, 'add_dll_directory'):
-                os.add_dll_directory(found_path)
-
-            # 3. (新) 将日志级别改为 WARNING，确保我们能在日志中看到此条消息
-            logging.warning(f"已将 OpenVINO 运行时 (for ONNX) 添加到 PATH: {found_path}")
-        else:
-            # 如果两个路径都没找到，这是一个严重错误
-            logging.error(f"严重错误: 未在 {ov_path} 中找到 'libs' 或 'runtime/bin' 目录。")
-
+        import onnxruntime.tools.add_openvino_win_libs as utils
+        utils.add_openvino_libs_to_path()
+        logging.warning("已使用 onnxruntime.tools 自动配置 OpenVINO 依赖项路径 (for ONNX EP)。")
     except ImportError:
-        logging.warning("未安装 'openvino' 包。onnxruntime-openvino 可能无法工作。")
+        logging.error("未找到 'onnxruntime.tools.add_openvino_win_libs'。请确保 onnxruntime 已正确安装。")
     except Exception as e:
-        logging.error(f"自动设置 OpenVINO DLL 路径时出错: {e}", exc_info=True)
+        logging.error(f"使用 onnxruntime.tools 配置 OpenVINO 路径时出错: {e}", exc_info=True)
 # --- 修复结束 ---
 
 import numpy as np
@@ -185,7 +156,8 @@ class AIModels:
             self.models_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # --- 【修复】: 实现多阶段回退 (AUTO OV -> CPU OV -> Generic CPU) ---
+        # --- (保留) 多阶段回退 (AUTO OV -> CPU OV -> Generic CPU) ---
+        # 现在的修复 (v3) 应该能让前两个阶段成功
 
         # 尝试 1: 使用 INFERENCE_DEVICE (例如 "AUTO")
         primary_device_type = INFERENCE_DEVICE.split('.')[0]
@@ -227,7 +199,7 @@ class AIModels:
                 except Exception as final_fallback_e:
                     logging.critical(f"InsightFace 在所有模式下均加载失败: {final_fallback_e}", exc_info=True)
                     raise final_fallback_e
-        # --- 修复结束 ---
+        # --- 回退逻辑结束 ---
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
