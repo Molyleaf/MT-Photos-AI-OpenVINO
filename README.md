@@ -47,7 +47,7 @@ ONNX 版本稍后做，欢迎 PR。
 * **推理引擎**: Intel OpenVINO™
 * **服务框架**: FastAPI
 * **AI 模型**:
-    * **人脸识别**: InsightFace (buffalo_l)
+    * **人脸识别**: InsightFace
     * **多模态**: Chinese-CLIP / QA-CLIP
     * **OCR**: RapidOCR
 * **容器化**: Docker
