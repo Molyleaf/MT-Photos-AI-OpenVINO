@@ -9,29 +9,7 @@ venv/
 .env
 .idea/
 
-# Models - 模型文件通常很大，不建议加入Git
-models/alt-clip/onnx/*.onnx
-models/alt-clip/onnx/*.data
-models/alt-clip/openvino/*.bin
-models/alt-clip/openvino/*.xml
-models/alt-clip/openvino/*.json
-models/alt-clip/openvino/*.model
-models/chinese-clip/onnx/*.onnx
-models/chinese-clip/onnx/*.extra_file
-models/chinese-clip/onnx/*.data
-models/chinese-clip/openvino/*.bin
-models/chinese-clip/openvino/*.xml
-models/chinese-clip/openvino/*.json
-models/chinese-clip/openvino/*.model
-models/qa-clip/onnx/*.onnx
-models/qa-clip/onnx/*.extra_file
-models/qa-clip/onnx/*.data
-models/qa-clip/openvino/*.bin
-models/qa-clip/openvino/*.xml
-models/qa-clip/openvino/*.json
-models/qa-clip/openvino/*.model
-models/insightface/models/antelopev2/*.onnx
-models/insightface/models/buffalo_l/*.onnx
+models/*
 cache/*
 
 # Docker

@@ -48,10 +48,6 @@ COPY models/insightface/models /models/insightface/models
 
 COPY app /app
 
-RUN groupadd -g 991 render || true
-
-RUN usermod -a -G render root
-
 # 暴露服务运行的端口
 EXPOSE 8060
 
