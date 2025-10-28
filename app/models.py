@@ -19,9 +19,8 @@ from schemas import (
     FacialArea,
     RepresentResult
 )
-import gc # 垃圾回收
+import gc
 
-# --- 环境变量与常量定义 ---
 INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,28 +48,27 @@ class AIModels:
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
         self.qa_clip_path = os.path.join(MODEL_BASE_PATH, "qa-clip", "openvino")
 
-        # 【修复】基础编译模型
+        # 基础编译模型
         self.clip_vision_model: Optional[ov.CompiledModel] = None
         self.clip_text_model: Optional[ov.CompiledModel] = None
         self.clip_image_preprocessor = None
 
-        # 【修复】实例池
+        # 实例池
         self.face_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.ocr_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_vision_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_text_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
 
-        # 【修复】使用可重入锁(RLock)解决死锁问题
+        # 使用可重入锁(RLock)解决死锁问题
         self._load_lock = threading.RLock()
 
-        # 【修复】使用独立的加载标志
+        # 使用独立的加载标志
         self.clip_text_model_loaded = False
         self.clip_vision_model_loaded = False
         self.ocr_models_loaded = False
         self.face_models_loaded = False
 
     def _empty_queue(self, q: queue.Queue):
-        """辅助函数：安全清空队列"""
         if q is None: return
         while not q.empty():
             try:
@@ -82,11 +80,7 @@ class AIModels:
                 logging.warning(f"清空队列时出错: {e}")
 
     def release_models(self):
-        """
-        (空闲释放)
-        从内存中释放所有“按需”模型 (Face, OCR, Vision CLIP)。
-        【修复】此方法 *不会* 释放 Text CLIP 模型。
-        """
+        # 空闲释放
         if not (self.face_models_loaded or self.ocr_models_loaded or self.clip_vision_model_loaded):
             logging.debug("没有按需模型需要释放。")
             return
@@ -110,17 +104,13 @@ class AIModels:
         except Exception as e:
             logging.warning(f"释放 (按需) 模型时出现错误: {e}", exc_info=True)
         finally:
-            # 【修复】重置“按需”模型的标志
+            # 重置“按需”模型的标志
             self.face_models_loaded = False
             self.ocr_models_loaded = False
             self.clip_vision_model_loaded = False
 
     def release_all_models(self):
-        """
-        (关闭释放)
-        释放 *所有* 模型，包括常驻的 Text CLIP 模型。
-        仅在应用关闭时调用。
-        """
+        # 关闭时释放
         logging.warning("--- 正在释放 *所有* AI 模型 (应用关闭) ---")
         # 1. 释放所有按需模型
         self.release_models()
@@ -141,7 +131,7 @@ class AIModels:
             self.clip_text_model_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # --- 【修复 v5】: 解决 Error 127 静默失败和日志误导问题 ---
+        # 解决 Error 127 静默失败和日志误导问题
         logging.warning("OpenVINO EP (for Insightface) 在 Server 2025 上不兼容 (将跳过)。")
         logging.warning("Insightface 将显式加载通用的 'CPUExecutionProvider' (无 OpenVINO 加速)。")
         try:
@@ -151,10 +141,8 @@ class AIModels:
             logging.warning("InsightFace 实例已在通用 CPU (回退模式) 上成功加载。")
             return face_app
         except Exception as final_fallback_e:
-            # 如果连这个都失败了，那就是个大问题
             logging.critical(f"InsightFace 在通用 CPU (回退) 模式下也加载失败: {final_fallback_e}", exc_info=True)
             raise final_fallback_e
-        # --- 修复结束 ---
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
@@ -176,7 +164,7 @@ class AIModels:
                 logging.critical(f"RapidOCR 在 CPU (回退) 模式下也加载失败: {fallback_e}", exc_info=True)
                 raise fallback_e
 
-    # 【修复】拆分 _load_qa_clip
+    # 拆分 _load_qa_clip
 
     def _compile_clip_vision_model(self) -> Tuple[Callable, ov.CompiledModel]:
         """编译并返回 Vision 模型及预处理器"""
@@ -209,7 +197,7 @@ class AIModels:
             if not os.path.exists(text_model_path):
                 raise FileNotFoundError(f"未在 '{self.qa_clip_path}' 找到 Text 模型文件。")
 
-            # 【修复】为 Text 模型硬编码 LATENCY 模式
+            # 为 Text 模型硬编码 LATENCY 模式
             config_text = {"PERFORMANCE_HINT": "LATENCY"}
             logging.warning(f"编译 Text 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_text['PERFORMANCE_HINT']})...")
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config_text)
@@ -223,7 +211,7 @@ class AIModels:
             logging.error(f"加载 QA-CLIP Text 模型时发生严重错误: {e}", exc_info=True)
             raise
 
-    # 【修复】按需加载 (Ensure) 方法
+    # 按需加载 (Ensure) 方法
 
     def ensure_clip_text_model_loaded(self):
         """(常驻) 确保 Text CLIP 模型已加载。"""
@@ -297,7 +285,7 @@ class AIModels:
                 logging.critical(f"加载 FaceAnalysis 模型失败: {e}", exc_info=True)
                 raise
 
-    # 【修复】修改 get_... 方法以调用其各自的 ensure
+    # 修改 get 方法以调用其各自的 ensure
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self.ensure_face_models_loaded() # 按需加载

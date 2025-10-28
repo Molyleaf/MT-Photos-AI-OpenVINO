@@ -701,11 +701,6 @@ class CLIP4SD(nn.Module):
             return self.visual(image.type(self.dtype))
         return self.visual(image.type(self.dtype), mask_ratio)
 
-    # def encode_text(self, text):
-    #     pad_index = self.tokenizer.vocab['[PAD]']
-    #     attn_mask = text.ne(pad_index).type(self.dtype)
-    #     x = self.bert(text, attention_mask=attn_mask)[0].type(self.dtype) # [batch_size, seq_length, hidden_size]
-    #     return x[:, 0, :] @ self.text_projection
     def encode_text(self, text):
         pad_index = self.tokenizer.vocab['[PAD]']
         attn_mask = text.ne(pad_index).type(self.dtype)
@@ -898,7 +893,6 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
         new_pos_embed = pos_emb_img
     state_dict[prefix + 'visual.positional_embedding'] = new_pos_embed
 
-
 # From PyTorch internals
 def _ntuple(n):
     def parse(x):
@@ -906,7 +900,6 @@ def _ntuple(n):
             return x
         return tuple(repeat(x, n))
     return parse
-
 
 to_1tuple = _ntuple(1)
 to_2tuple = _ntuple(2)
