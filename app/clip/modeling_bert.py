@@ -18,18 +18,15 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import json
+import importlib.util
 import logging
 import math
-import os
 import sys
-from io import open
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-import importlib.util
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 

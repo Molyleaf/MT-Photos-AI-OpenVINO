@@ -16,9 +16,9 @@ import importlib.util
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
-from clip import _tokenizer
-from clip.configuration_bert import BertConfig
-from clip.modeling_bert import BertModel
+from . import _tokenizer
+from .configuration_bert import BertConfig
+from .modeling_bert import BertModel
 
 try:
     from transformers import CLIPTextModelWithProjection

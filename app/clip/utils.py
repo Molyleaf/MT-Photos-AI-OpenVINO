@@ -3,16 +3,17 @@
 
 import json
 import os
+import urllib
+import urllib.request
 from pathlib import Path
 from typing import Union, List
-import urllib
 
 import torch
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
 from tqdm import tqdm
 
-from clip import _tokenizer
-from clip.model import convert_weights, CLIP, restore_model
+from . import _tokenizer
+from .model import convert_weights, CLIP, restore_model
 
 # --- 【修复 3】: 将 '_MODEL_INFO' 添加到 __all__ ---
 __all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name", "MODEL_INFO"]
