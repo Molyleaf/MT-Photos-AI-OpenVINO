@@ -9,8 +9,8 @@ venv/
 .env
 .idea/
 
-models/*
-cache/*
+models/
+cache/
 
 # Docker
 .dockerignore
