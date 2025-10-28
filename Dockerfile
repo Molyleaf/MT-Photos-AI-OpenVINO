@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 USER root
 
-COPY requirements-docker.txt .
+COPY requirements.txt .
 
 COPY models/chinese-clip/openvino /models/chinese-clip/openvino
 
@@ -34,7 +34,7 @@ RUN apt update && apt install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
-    && pip install --no-cache-dir -r requirements-docker.txt \
+    && pip install --no-cache-dir -r requirements.txt \
     && apt remove g++ -y \
     && apt autoremove -y \
     && apt autoclean -y
