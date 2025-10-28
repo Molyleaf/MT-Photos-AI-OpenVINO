@@ -1,7 +1,5 @@
 # scripts/convert_qa_clip_openvino.py
-import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
