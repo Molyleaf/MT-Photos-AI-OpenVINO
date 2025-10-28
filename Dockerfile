@@ -49,5 +49,5 @@ RUN usermod -a -G render root
 EXPOSE 8060
 
 # 设置容器启动时执行的默认命令
-CMD ["uvicorn", "server_openvino:app", "--host", "0.0.0.0", "--port", "8060"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8060"]
 

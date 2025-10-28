@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Union, List
 
 import torch
-from cn_clip.clip import _tokenizer
-from cn_clip.clip.model import convert_weights, CLIP, restore_model
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
+
+from . import _tokenizer
+from .model import convert_weights, CLIP, restore_model
 
 __all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name"]
 

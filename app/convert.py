@@ -1,4 +1,4 @@
-# /app/convert_models.py
+# /app/convert.py
 import argparse
 import logging
 import os

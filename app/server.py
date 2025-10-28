@@ -1,15 +1,15 @@
-# app/server_openvino.py
+# app/server.py
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import List
-import logging
 
 import cv2
 import numpy as np
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from PIL import Image
 
 # 导入我们重构后的模型处理模块
 import models as ai_models

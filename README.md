@@ -78,7 +78,7 @@ mkdir models
 运行模型转换脚本，它会自动从 Hugging Face 下载 `BAAI/AltCLIP-m18` 模型并将其转换为 OpenVINO IR 格式。
 
 ```bash
-python scripts/convert_models.py
+python scripts/convert.py
 ```
 转换成功后，模型文件将位于 `./models/alt-clip/openvino/` 目录下。
 

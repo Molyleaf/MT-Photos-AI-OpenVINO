@@ -1,18 +1,19 @@
 # app/models.py
-import os
-from typing import List, Any, Dict
 import logging
+import os
+from typing import List
 
 import numpy as np
 import openvino as ov
-from insightface.app import FaceAnalysis # 确保导入正确
-from rapidocr_openvino import RapidOCR
 from PIL import Image
+from insightface.app import FaceAnalysis  # 确保导入正确
+from rapidocr_openvino import RapidOCR
 
 # --- 新增: 导入 Chinese-CLIP 相关工具 ---
 import cn_clip.clip as clip
 # --- 修正：修复 ModuleNotFoundError ---
 from cn_clip.clip.utils import image_transform, _MODEL_INFO
+
 # --- 结束修正 ---
 
 
@@ -33,7 +34,7 @@ CONTEXT_LENGTH = 52
 # 配置日志记录器
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 新增：导入 server_openvino.py 中的 Pydantic 模型 ---
+# --- 新增：导入 server.py 中的 Pydantic 模型 ---
 from pydantic import BaseModel
 
 class OCRBox(BaseModel):
