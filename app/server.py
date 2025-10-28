@@ -71,8 +71,9 @@ models_instance: Optional[ai_models.AIModels] = None
 
 def idle_timeout_handler():
     global models_instance
-    if models_instance and models_instance.models_loaded:
-        logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放模型以节省内存...") #
+    if models_instance:
+        # 【修复】更新日志，明确指出只释放“按需”模型
+        logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放 (按需) 模型以节省内存...")
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
         else:
@@ -89,24 +90,27 @@ def reset_idle_timer():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global models_instance
-    logging.warning("应用启动... 初始化 AIModels 实例。") #
+    logging.warning("应用启动... 初始化 AIModels 实例。")
     models_instance = ai_models.AIModels()
     try:
-        models_instance.load_models()
+        # 【修复】启动时只加载常驻的 Text CLIP 模型
+        logging.warning("应用启动... 正在预热加载 Text CLIP 模型。")
+        models_instance.ensure_clip_text_model_loaded()
     except Exception as e:
-        logging.critical(f"应用启动时模型加载失败: {e}", exc_info=True)
+        logging.critical(f"应用启动时基础模型加载失败: {e}", exc_info=True)
 
     reset_idle_timer()
     yield
     global idle_timer
     if idle_timer:
         idle_timer.cancel()
-    logging.warning("应用关闭。正在释放所有模型...") #
+    logging.warning("应用关闭。正在释放所有模型...")
     if models_instance:
-        if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
-            models_instance.release_models()
+        # 【修复】应用关闭时，调用 release_all_models 彻底释放所有模型
+        if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
+            models_instance.release_all_models()
         else:
-            logging.warning("AIModels 实例没有 release_models 方法 (lifespan)。")
+            logging.warning("AIModels 实例没有 release_all_models 方法 (lifespan)。")
 
 app = FastAPI(
     title="MT-Photos AI 统一服务 (OpenVINO 版本)",
@@ -118,7 +122,8 @@ app = FastAPI(
 
 @app.middleware("http")
 async def reset_timer_middleware(request: Request, call_next):
-    if request.url.path not in ["/check", "/"]:
+    # 【修复】/clip/txt 路由不会重置计时器，因为它现在是常驻模型
+    if request.url.path not in ["/check", "/", "/clip/txt"]:
         reset_idle_timer()
     response = await call_next(request)
     return response
@@ -170,7 +175,8 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse)
 async def restart_service():
-    logging.warning("收到 /restart 请求，正在手动释放模型...") #
+    # 【修复】更新日志，明确指出只释放“按需”模型
+    logging.warning("收到 /restart 请求，正在手动释放 (按需) 模型...")
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
@@ -196,6 +202,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     try:
         image = await read_image_from_upload(file)
+        # 【修复】get_ocr_results 内部将处理按需加载
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
         # --- (保留) Pydantic v2 修复 ---
         return {"result": ocr_results_obj.model_dump()}
@@ -214,6 +221,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         image = await read_image_from_upload(file)
         image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
 
+        # 【修复】get_image_embedding 内部将处理按需加载
         embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
@@ -231,6 +239,7 @@ async def clip_text_endpoint(request: TextClipRequest):
         return {"result": []}
 
     try:
+        # 【修复】Text CLIP 模型已在启动时加载，此处直接使用
         embedding = await asyncio.to_thread(models_instance.get_text_embedding, request.text)
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
@@ -244,6 +253,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     try:
         image = await read_image_from_upload(file)
+        # 【修复】get_face_representation 内部将处理按需加载
         face_results_list = await asyncio.to_thread(models_instance.get_face_representation, image)
         return RepresentResponse(result=face_results_list)
     except Exception as e:
