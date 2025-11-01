@@ -42,7 +42,7 @@ logging.getLogger(__name__).setLevel(logging.WARNING)
 class AIModels:
     """封装所有 AI 模型加载和推理逻辑的类（并发安全版）。"""
     def __init__(self):
-        logging.warning(f"正在初始化AI模型实例 (尚未加载)，使用设备: {INFERENCE_DEVICE}")
+        logging.warning(f"正在初始化AI模型实例 (尚未加载)，使用设备: {INFERENCE_DEVICE}, 工作线程数: {INFERENCE_WORKERS}")
         self.core = ov.Core()
 
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
@@ -53,14 +53,17 @@ class AIModels:
         self.clip_text_model: Optional[ov.CompiledModel] = None
         self.clip_image_preprocessor = None
 
-        # --- 【修复性能：使用共享实例替换实例池】 ---
-        self.rapid_ocr_engine: Optional[RapidOCR] = None
-        self.face_analyzer_engine: Optional[FaceAnalysis] = None
+        # --- 【修复并发问题：OCR 和 FaceAnalysis 也需要实例池】 ---
+        # self.rapid_ocr_engine: Optional[RapidOCR] = None # 不再使用共享实例
+        # self.face_analyzer_engine: Optional[FaceAnalysis] = None # 不再使用共享实例
+
+        self.ocr_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
+        self.face_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
+        # --- 修复结束 ---
 
         # 保留 CLIP 的推理请求池 (这是正确模式)
         self.clip_vision_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_text_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
-        # --- 修复结束 ---
 
         # 使用可重入锁(RLock)解决死锁问题
         self._load_lock = threading.RLock()
@@ -99,16 +102,14 @@ class AIModels:
             logging.warning("CLIP Vision (按需) 实例池和模型已释放。")
 
             # 2. 释放 RapidOCR (按需)
-            if self.rapid_ocr_engine:
-                del self.rapid_ocr_engine
-                self.rapid_ocr_engine = None
-                logging.warning("RapidOCR (按需) 共享实例已释放。")
+            # if self.rapid_ocr_engine: (删除)
+            self._empty_queue(self.ocr_pool) # <--- 修改
+            logging.warning("RapidOCR (按需) 实例池已释放。") # <--- 修改
 
             # 3. 释放 FaceAnalysis (按需)
-            if self.face_analyzer_engine:
-                del self.face_analyzer_engine
-                self.face_analyzer_engine = None
-                logging.warning("FaceAnalysis (按需) 共享实例已释放。")
+            # if self.face_analyzer_engine: (删除)
+            self._empty_queue(self.face_pool) # <--- 修改
+            logging.warning("FaceAnalysis (按需) 实例池已释放。") # <--- 修改
 
             gc.collect()
             logging.warning("(按需) 模型已成功从内存中释放。")
@@ -155,21 +156,28 @@ class AIModels:
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
+        # --- 【修复性能：添加 OV Config】 ---
+        # 优化吞吐量，这对于服务端实例池是合理的
+        ov_config = {"PERFORMANCE_HINT": "THROUGHPUT"}
+
         try:
             logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
-            ocr = RapidOCR(device_name=INFERENCE_DEVICE)
-            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} (OpenVINO) 上加载成功。")
+            # 添加 ov_config
+            ocr = RapidOCR(device_name=INFERENCE_DEVICE, ov_config=ov_config)
+            logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} (OpenVINO) 上加载成功 (Config: {ov_config})。")
             return ocr
         except Exception as e:
-            logging.error(f"加载 RapidOCR 实例失败 (尝试使用 {INFERENCE_DEVICE}): {e}", exc_info=True)
+            logging.error(f"加载 RapidOCR 实例失败 (尝试使用 {INFERENCE_DEVICE}, Config: {ov_config}): {e}", exc_info=True)
             logging.warning("RapidOCR (OpenVINO) 加载失败，将回退到 CPU (OpenVINO)...")
             try:
-                ocr = RapidOCR(device_name="CPU")
-                logging.warning("RapidOCR 实例已在 CPU (OpenVINO 回退模式) 上成功加载。")
+                # 回退时也使用 config
+                ocr = RapidOCR(device_name="CPU", ov_config=ov_config)
+                logging.warning(f"RapidOCR 实例已在 CPU (OpenVINO 回退模式) 上成功加载 (Config: {ov_config})。")
                 return ocr
             except Exception as fallback_e:
                 logging.critical(f"RapidOCR 在 CPU (回退) 模式下也加载失败: {fallback_e}", exc_info=True)
                 raise fallback_e
+        # --- 修复结束 ---
 
     # 拆分 _load_qa_clip
 
@@ -256,52 +264,60 @@ class AIModels:
                 raise
 
     def ensure_ocr_models_loaded(self):
-        """(按需) 确保 OCR 模型已加载 (共享实例)。"""
+        """(按需) 确保 OCR 模型已加载 (实例池)。""" # <--- 修改
         if self.ocr_models_loaded:
             return
         with self._load_lock:
             if self.ocr_models_loaded:
                 return
-            logging.warning("--- 正在加载 RapidOCR 模型 (按需, 共享实例) ---")
+            logging.warning(f"--- 正在加载 RapidOCR 模型 (按需, {INFERENCE_WORKERS} 个实例) ---") # <--- 修改
             try:
-                if self.rapid_ocr_engine is None:
-                    logging.warning(f"创建 RapidOCR 共享实例...")
-                    self.rapid_ocr_engine = self._load_rapidocr() # 只加载一次
+                # if self.rapid_ocr_engine is None: (删除)
+                for i in range(INFERENCE_WORKERS): # <--- 添加循环
+                    logging.warning(f"创建 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...")
+                    ocr_instance = self._load_rapidocr() # 加载 INFERENCE_WORKERS 次
+                    self.ocr_pool.put(ocr_instance) # <--- 添加到池
+
                 self.ocr_models_loaded = True
-                logging.warning(f"--- RapidOCR 共享实例已准备就绪 ---")
+                logging.warning(f"--- RapidOCR 实例池已准备就绪 ---") # <--- 修改
             except Exception as e:
-                logging.critical(f"加载 RapidOCR 共享实例失败: {e}", exc_info=True)
+                logging.critical(f"加载 RapidOCR 实例池失败: {e}", exc_info=True) # <--- 修改
                 raise
 
     def ensure_face_models_loaded(self):
-        """(按需) 确保 FaceAnalysis 模型已加载 (共享实例)。"""
+        """(按需) 确保 FaceAnalysis 模型已加载 (实例池)。""" # <--- 修改
         if self.face_models_loaded:
             return
         with self._load_lock:
             if self.face_models_loaded:
                 return
-            logging.warning("--- 正在加载 FaceAnalysis 模型 (按需, 共享实例) ---")
+            logging.warning(f"--- 正在加载 FaceAnalysis 模型 (按需, {INFERENCE_WORKERS} 个实例) ---") # <--- 修改
             try:
-                if self.face_analyzer_engine is None:
-                    logging.warning(f"创建 FaceAnalysis 共享实例...")
-                    self.face_analyzer_engine = self._load_insightface() # 只加载一次
+                # if self.face_analyzer_engine is None: (删除)
+                for i in range(INFERENCE_WORKERS): # <--- 添加循环
+                    logging.warning(f"创建 FaceAnalysis 实例 {i+1}/{INFERENCE_WORKERS}...")
+                    face_instance = self._load_insightface() # 加载 INFERENCE_WORKERS 次
+                    self.face_pool.put(face_instance) # <--- 添加到池
+
                 self.face_models_loaded = True
-                logging.warning(f"--- FaceAnalysis 共享实例已准备就绪 ---")
+                logging.warning(f"--- FaceAnalysis 实例池已准备就绪 ---") # <--- 修改
             except Exception as e:
-                logging.critical(f"加载 FaceAnalysis 共享实例失败: {e}", exc_info=True)
+                logging.critical(f"加载 FaceAnalysis 实例池失败: {e}", exc_info=True) # <--- 修改
                 raise
 
     # 修改 get 方法以调用其各自的 ensure
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self.ensure_face_models_loaded() # 按需加载
-
-        if not self.face_analyzer_engine:
-            logging.error("FaceAnalysis 实例未加载。")
-            raise Exception("FaceAnalysis model not loaded")
+        face_analyzer_engine = None # <--- 修改
 
         try:
-            faces = self.face_analyzer_engine.get(image)
+            face_analyzer_engine = self.face_pool.get(timeout=10) # <--- 从池中获取
+            if not face_analyzer_engine:
+                logging.error("从池中获取 FaceAnalysis 实例失败。")
+                raise Exception("FaceAnalysis model not loaded")
+
+            faces = face_analyzer_engine.get(image)
             results = []
             for face in faces:
                 bbox = np.array(face.bbox).astype(int)
@@ -313,19 +329,28 @@ class AIModels:
                     face_confidence=float(face.det_score)
                 ))
             return results
+        except queue.Empty: # <--- 添加
+            logging.error("获取 FaceAnalysis 实例超时（池已空）")
+            raise Exception("FaceAnalysis model pool timeout")
         except Exception as e:
             logging.debug(f"处理人脸识别时出错或未找到人脸: {e}", exc_info=False)
             return []
+        finally: # <--- 添加
+            if face_analyzer_engine:
+                self.face_pool.put(face_analyzer_engine)
+
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
         self.ensure_ocr_models_loaded() # 按需加载
-
-        if not self.rapid_ocr_engine:
-            logging.error("RapidOCR 实例未加载。")
-            raise Exception("RapidOCR model not loaded")
+        rapid_ocr_engine = None # <--- 修改
 
         try:
-            ocr_raw_output = self.rapid_ocr_engine(image)
+            rapid_ocr_engine = self.ocr_pool.get(timeout=10) # <--- 从池中获取
+            if not rapid_ocr_engine:
+                logging.error("从池中获取 RapidOCR 实例失败。")
+                raise Exception("RapidOCR model not loaded")
+
+            ocr_raw_output = rapid_ocr_engine(image)
 
             if not isinstance(ocr_raw_output, tuple) or len(ocr_raw_output) < 1:
                 logging.warning(f"RapidOCR 返回了意外的格式: {type(ocr_raw_output)}")
@@ -373,9 +398,19 @@ class AIModels:
                 ))
 
             return OCRResult(texts=texts, scores=scores, boxes=boxes)
+        except queue.Empty: # <--- 添加
+            logging.error("获取 RapidOCR 实例超时（池已空）")
+            raise Exception("RapidOCR model pool timeout")
         except Exception as e:
-            logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)
+            # 捕获 RuntimeError
+            if isinstance(e, RuntimeError) and "Infer Request is busy" in str(e):
+                logging.error(f"OCR 出现并发错误 (Infer Request is busy): {e}", exc_info=True)
+            else:
+                logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)
             return OCRResult(texts=[], scores=[], boxes=[])
+        finally: # <--- 添加
+            if rapid_ocr_engine:
+                self.ocr_pool.put(rapid_ocr_engine)
 
     def get_image_embedding(self, image: Image.Image, filename: str = "unknown") -> List[float]:
         self.ensure_clip_vision_model_loaded() # 按需加载

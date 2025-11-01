@@ -49,6 +49,10 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=log_handlers
 )
+
+# --- 【修复日志：强制关闭 Uvicorn 200 访问日志】 ---
+# 必须在 basicConfig 之后调用，以覆盖 uvicorn.access 的默认设置
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # --- 日志配置结束 ---
 
 
