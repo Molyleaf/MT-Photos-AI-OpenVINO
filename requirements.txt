@@ -12,3 +12,5 @@ onnxruntime-openvino==1.23.0
 uvicorn==0.38.0
 python-multipart==0.0.20
 asyncio==4.0.0
+pillow==12.0.0
+opencv-python==4.12.0.88

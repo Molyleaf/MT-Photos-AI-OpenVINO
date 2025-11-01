@@ -5,11 +5,12 @@ import os
 import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
+from io import BytesIO
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
@@ -19,11 +20,11 @@ from schemas import (
     CheckResponse,
     OCRResult,
     TextClipRequest,
-    RepresentResponse,
+    # RepresentResponse, # 不再用于 /represent 的响应模型
     RestartResponse
 )
 
-# --- 【请求 2 & 5】: NSSM 日志优化和级别设置 ---
+# --- NSSM 日志优化和级别设置 ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 _LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
@@ -72,7 +73,6 @@ models_instance: Optional[ai_models.AIModels] = None
 def idle_timeout_handler():
     global models_instance
     if models_instance:
-        # 【修复】更新日志，明确指出只释放“按需”模型
         logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放 (按需) 模型以节省内存...")
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
@@ -93,7 +93,6 @@ async def lifespan(app: FastAPI):
     logging.warning("应用启动... 初始化 AIModels 实例。")
     models_instance = ai_models.AIModels()
     try:
-        # 【修复】启动时只加载常驻的 Text CLIP 模型
         logging.warning("应用启动... 正在预热加载 Text CLIP 模型。")
         models_instance.ensure_clip_text_model_loaded()
     except Exception as e:
@@ -106,61 +105,82 @@ async def lifespan(app: FastAPI):
         idle_timer.cancel()
     logging.warning("应用关闭。正在释放所有模型...")
     if models_instance:
-        # 【修复】应用关闭时，调用 release_all_models 彻底释放所有模型
         if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
             models_instance.release_all_models()
         else:
             logging.warning("AIModels 实例没有 release_all_models 方法 (lifespan)。")
 
 app = FastAPI(
-    title="MT-Photos AI 统一服务 (OpenVINO 版本)",
-    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。",
-    version="2.1.0",
+    title="MT-Photos AI 统一服务",
+    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
+    version="2.2.0",
     dependencies=[Depends(get_api_key)],
     lifespan=lifespan
 )
 
 @app.middleware("http")
 async def reset_timer_middleware(request: Request, call_next):
-    # 【修复】/clip/txt 路由不会重置计时器，因为它现在是常驻模型
     if request.url.path not in ["/check", "/", "/clip/txt"]:
         reset_idle_timer()
     response = await call_next(request)
     return response
 
-async def read_image_from_upload(file: UploadFile) -> np.ndarray:
+# --- 【修复：重写 read_image_from_upload 以匹配示例行为】 ---
+async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    读取上传的图像文件，处理 GIF、16-bit 和其他格式。
+    在失败时返回 (None, "错误消息")，而不是抛出 HTTPException。
+    """
     contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
+    img = None
 
-    if img is None:
-        raise HTTPException(status_code=400, detail=f"文件 '{file.filename}' 无法被解码为图像。")
+    try:
+        # 尝试使用 PIL 打开（主要为了处理 GIF）
+        if file.content_type == 'image/gif':
+            with Image.open(BytesIO(contents)) as pil_img:
+                if pil_img.is_animated:
+                    pil_img.seek(0)  # 移动到第一帧
+                frame = pil_img.convert('RGB')
+                np_arr = np.array(frame)
+                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR) # 转为 CV2 BGR
 
-    # --- 【修复请求3：处理非8-bit图像】 ---
-    # 检查图像数据类型，如果是16-bit (uint16)，则转换为8-bit (uint8)
-    if img.dtype == np.uint16:
-        logging.warning(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
-        # 将 [0, 65535] 缩放到 [0, 255]
-        img = (img / 256).astype(np.uint8)
-    # --- 修复结束 ---
+        # 如果不是 GIF 或 PIL 失败，使用 CV2
+        if img is None:
+            nparr = np.frombuffer(contents, np.uint8)
+            img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
 
-    height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
+        # 检查解码是否成功
+        if img is None:
+            logging.warning(f"文件 '{file.filename}' 无法被解码为图像。")
+            return None, f"文件 '{file.filename}' 无法被解码为图像。"
 
-    if width > 10000 or height > 10000:
-        raise HTTPException(status_code=400, detail="height or width out of range")
+        # 检查 16-bit 图像并转换
+        if img.dtype == np.uint16:
+            logging.warning(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
+            img = (img / 256).astype(np.uint8)
 
-    if channels == 1:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif channels == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        # 检查尺寸
+        height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
+        if width > 10000 or height > 10000:
+            logging.warning(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
+            return None, "height or width out of range"
 
-    # 如果通道数仍然不是3（例如，某些特殊的单通道16-bit图），最后再确认一次
-    if len(img.shape) == 2 or img.shape[2] == 1:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        # 转换通道
+        if channels == 1:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif channels == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-    return img
+        # 最后的健壮性检查
+        if len(img.shape) < 3 or img.shape[2] != 3:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        return img, None
+
+    except Exception as e:
+        logging.error(f"读取图像 '{file.filename}' 时发生意外错误: {e}", exc_info=True)
+        return None, f"处理图像时发生意外错误: {str(e)}"
+# --- 修复结束 ---
 
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
@@ -175,22 +195,28 @@ async def top_info():
 <p style="font-weight: 600;">MT Photos智能识别服务 (OpenVINO)</p>
 <p>服务状态： 运行中</p>
 <p>使用方法： <a href="https://mtmt.tech/docs/advanced/ocr_api">https://mtmt.tech/docs/advanced/ocr_api</a></p>
+<p>作者：https://github.com/Molyleaf/MT-Photos-AI-OpenVINO</p>
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
 
+# --- 【修复：合并 /check 响应】 ---
 @app.post("/check", response_model=CheckResponse)
 async def check_service(t: str = ""):
+    if not models_instance:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     return {
         "result": "pass",
         "title": "MT-Photos AI 统一服务 (OpenVINO 版本)",
-        "help": "https://mtmt.tech/docs/advanced/ocr_api"
+        "help": "https://mtmt.tech/docs/advanced/ocr_api",
+        "detector_backend": "insightface",
+        "recognition_model": models_instance.MODEL_NAME
     }
+# --- 修复结束 ---
 
 @app.post("/restart", response_model=RestartResponse)
 async def restart_service():
-    # 【修复】更新日志，明确指出只释放“按需”模型
-    logging.warning("收到 /restart 请求，正在手动释放 (按需) 模型...")
+    logging.warning("收到 /restart 请求，正在释放模型...")
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
@@ -214,18 +240,18 @@ async def restart_process():
 async def ocr_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+
+    image, error_msg = await read_image_from_upload(file)
+    if image is None:
+        empty_result = OCRResult(texts=[], scores=[], boxes=[]).model_dump()
+        return {"result": empty_result, "msg": error_msg}
+
     try:
-        image = await read_image_from_upload(file)
-        # 【修复】get_ocr_results 内部将处理按需加载
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
-        # --- 【修复请求2：添加 "msg" 字段】 ---
-        return {"result": ocr_results_obj.model_dump(), "msg": "ok"}
+        # --- 【修复检查点1：成功时不返回 msg】 ---
+        return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        # --- 【修复请求2：使用 example 的错误格式】 ---
-        # 注意：example 返回 'result': []，但这与
-        # schemas.py 中定义的 OCRResponse (result: OCRResult) 不完全一致。
-        # 我们返回一个空的 OCRResult 结构体，这更健壮。
         empty_result = OCRResult(texts=[], scores=[], boxes=[]).model_dump()
         return {"result": empty_result, "msg": str(e)}
 
@@ -233,20 +259,21 @@ async def ocr_endpoint(file: UploadFile = File(...)):
 async def clip_image_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
-    # --- 【请求 2】: 降级为 DEBUG (在 WARNING 级别下不显示) ---
-    logging.debug(f"开始处理 CLIP 图像请求: {file.filename}")
-    try:
-        image = await read_image_from_upload(file)
-        image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
 
-        # 【修复】get_image_embedding 内部将处理按需加载
+    logging.debug(f"开始处理 CLIP 图像请求: {file.filename}")
+
+    image, error_msg = await read_image_from_upload(file)
+    if image is None:
+        return {"result": [], "msg": error_msg}
+
+    try:
+        image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
         embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
-        # --- 【修复请求2：添加 "msg" 字段】 ---
-        return {"result": result_strings, "msg": "ok"}
+        # --- 【修复检查点1：成功时不返回 msg】 ---
+        return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        # --- 【修复请求2：使用 example 的错误格式】 ---
         return {"result": [], "msg": str(e)}
 
 @app.post("/clip/txt")
@@ -256,37 +283,44 @@ async def clip_text_endpoint(request: TextClipRequest):
 
     if not request.text or request.text.isspace():
         logging.warning("收到了空的 CLIP 文本请求。")
-        # --- 【修复请求2：使用 example 的错误格式】 ---
         return {"result": [], "msg": "empty text"}
 
     try:
-        # 【修复】Text CLIP 模型已在启动时加载，此处直接使用
         embedding = await asyncio.to_thread(models_instance.get_text_embedding, request.text)
         result_strings = [f"{f:.16f}" for f in embedding]
-        # --- 【修复请求2：添加 "msg" 字段】 ---
-        return {"result": result_strings, "msg": "ok"}
+        return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
-        # --- 【修复请求2：使用 example 的错误格式】 ---
         return {"result": [], "msg": str(e)}
 
-@app.post("/represent", response_model=RepresentResponse)
+@app.post("/represent")
 async def represent_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+
+    image, error_msg = await read_image_from_upload(file)
+    if image is None:
+        return {"result": [], "msg": error_msg}
+
     try:
-        image = await read_image_from_upload(file)
-        # 【修复】get_face_representation 内部将处理按需加载
         face_results_list = await asyncio.to_thread(models_instance.get_face_representation, image)
-        return RepresentResponse(result=face_results_list)
+        results_dict = [r.model_dump() for r in face_results_list]
+        return {
+            "detector_backend": "insightface",
+            "recognition_model": models_instance.MODEL_NAME,
+            "result": results_dict
+        }
     except Exception as e:
         logging.error(f"处理人脸识别请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"处理人脸识别失败: {str(e)}")
+        if 'set enforce_detection' in str(e) or 'Face could not be detected' in str(e):
+            return {"result": []}
+
+        return {"result": [], "msg": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
-    log_level = os.environ.get("LOG_LEVEL", "warning").lower() #
+    log_level = os.environ.get("LOG_LEVEL", "warning").lower()
     workers = int(os.environ.get("WEB_CONCURRENCY", 1))
 
     uvicorn.run(

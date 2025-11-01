@@ -53,16 +53,11 @@ class AIModels:
         self.clip_text_model: Optional[ov.CompiledModel] = None
         self.clip_image_preprocessor = None
 
-        # --- 【修复请求4：使用共享实例替换实例池】 ---
-        # 1. 为 RapidOCR 和 FaceAnalysis 创建单一实例持有者
+        # --- 【修复性能：使用共享实例替换实例池】 ---
         self.rapid_ocr_engine: Optional[RapidOCR] = None
         self.face_analyzer_engine: Optional[FaceAnalysis] = None
 
-        # 2. 移除 ocr_pool 和 face_pool
-        # self.face_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
-        # self.ocr_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
-
-        # 3. 保留 CLIP 的推理请求池 (这是正确模式)
+        # 保留 CLIP 的推理请求池 (这是正确模式)
         self.clip_vision_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         self.clip_text_pool: queue.Queue = queue.Queue(maxsize=INFERENCE_WORKERS)
         # --- 修复结束 ---
@@ -88,43 +83,34 @@ class AIModels:
                 logging.warning(f"清空队列时出错: {e}")
 
     def release_models(self):
-        # 空闲释放
+        """(按需) 释放模型。此函数由空闲计时器或 /restart 调用。"""
         if not (self.face_models_loaded or self.ocr_models_loaded or self.clip_vision_model_loaded):
             logging.debug("没有按需模型需要释放。")
             return
 
         logging.warning("--- 正在释放 (按需) AI 模型 ---")
         try:
-            # --- 【修复请求4：释放共享实例】 ---
-            # 1. 移除池清空
-            # self._empty_queue(self.face_pool)
-            # self._empty_queue(self.ocr_pool)
-
-            # 2. 清空 CLIP Vision 池 (保留)
+            # 1. 释放 CLIP Vision (按需)
             self._empty_queue(self.clip_vision_pool)
-            logging.warning("CLIP Vision 实例池已清空。")
-
-            # 3. 释放 RapidOCR 共享实例
-            if self.rapid_ocr_engine:
-                del self.rapid_ocr_engine
-                self.rapid_ocr_engine = None
-                logging.warning("RapidOCR 共享实例已释放。")
-
-            # 4. 释放 FaceAnalysis 共享实例
-            if self.face_analyzer_engine:
-                del self.face_analyzer_engine
-                self.face_analyzer_engine = None
-                logging.warning("FaceAnalysis 共享实例已释放。")
-            # --- 修复结束 ---
-
             if self.clip_vision_model:
                 del self.clip_vision_model
                 self.clip_vision_model = None
-
             self.clip_image_preprocessor = None
+            logging.warning("CLIP Vision (按需) 实例池和模型已释放。")
+
+            # 2. 释放 RapidOCR (按需)
+            if self.rapid_ocr_engine:
+                del self.rapid_ocr_engine
+                self.rapid_ocr_engine = None
+                logging.warning("RapidOCR (按需) 共享实例已释放。")
+
+            # 3. 释放 FaceAnalysis (按需)
+            if self.face_analyzer_engine:
+                del self.face_analyzer_engine
+                self.face_analyzer_engine = None
+                logging.warning("FaceAnalysis (按需) 共享实例已释放。")
 
             gc.collect()
-
             logging.warning("(按需) 模型已成功从内存中释放。")
         except Exception as e:
             logging.warning(f"释放 (按需) 模型时出现错误: {e}", exc_info=True)
@@ -135,7 +121,7 @@ class AIModels:
             self.clip_vision_model_loaded = False
 
     def release_all_models(self):
-        # 关闭时释放
+        """(关闭时) 释放所有模型，包括常驻模型。"""
         logging.warning("--- 正在释放 *所有* AI 模型 (应用关闭) ---")
         # 1. 释放所有按需模型
         self.release_models()
@@ -143,21 +129,19 @@ class AIModels:
         # 2. 释放常驻的 Text CLIP 模型
         try:
             if self.clip_text_model_loaded:
-                logging.warning("释放 Text CLIP 模型...")
+                logging.warning("释放 Text CLIP (常驻) 模型...")
                 self._empty_queue(self.clip_text_pool)
                 if self.clip_text_model:
                     del self.clip_text_model
                     self.clip_text_model = None
                 gc.collect()
-                logging.warning("Text CLIP 模型已释放。")
+                logging.warning("Text CLIP (常驻) 模型已释放。")
         except Exception as e:
             logging.warning(f"释放 Text CLIP 模型时出现错误: {e}", exc_info=True)
         finally:
             self.clip_text_model_loaded = False
 
     def _load_insightface(self) -> FaceAnalysis:
-        # 解决 Error 127 静默失败和日志误导问题
-        logging.warning("OpenVINO EP (for Insightface) 在 Server 2025 上不兼容 (将跳过)。")
         logging.warning("Insightface 将显式加载通用的 'CPUExecutionProvider' (无 OpenVINO 加速)。")
         try:
             providers_generic_cpu = ['CPUExecutionProvider']
@@ -171,10 +155,8 @@ class AIModels:
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
-        # (此处的逻辑已正确：AUTO -> CPU (OpenVINO)
         try:
             logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
-            # RapidOCR 会自动处理 'AUTO' 设备
             ocr = RapidOCR(device_name=INFERENCE_DEVICE)
             logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} (OpenVINO) 上加载成功。")
             return ocr
@@ -222,7 +204,6 @@ class AIModels:
             if not os.path.exists(text_model_path):
                 raise FileNotFoundError(f"未在 '{self.qa_clip_path}' 找到 Text 模型文件。")
 
-            # 为 Text 模型硬编码 LATENCY 模式
             config_text = {"PERFORMANCE_HINT": "LATENCY"}
             logging.warning(f"编译 Text 模型 (设备: {INFERENCE_DEVICE}, 提示: {config_text['PERFORMANCE_HINT']})...")
             text_compiled = self.core.compile_model(text_model_path, INFERENCE_DEVICE, config_text)
@@ -283,17 +264,11 @@ class AIModels:
                 return
             logging.warning("--- 正在加载 RapidOCR 模型 (按需, 共享实例) ---")
             try:
-                # --- 【修复请求4：仅在需要时加载一次】 ---
                 if self.rapid_ocr_engine is None:
                     logging.warning(f"创建 RapidOCR 共享实例...")
-                    self.rapid_ocr_engine = self._load_rapidocr() # 调用 static method
-                # 移除循环
-                # for i in range(INFERENCE_WORKERS):
-                #    logging.warning(f"加载 RapidOCR 实例 {i+1}/{INFERENCE_WORKERS}...")
-                #    self.ocr_pool.put(self._load_rapidocr())
+                    self.rapid_ocr_engine = self._load_rapidocr() # 只加载一次
                 self.ocr_models_loaded = True
                 logging.warning(f"--- RapidOCR 共享实例已准备就绪 ---")
-                # --- 修复结束 ---
             except Exception as e:
                 logging.critical(f"加载 RapidOCR 共享实例失败: {e}", exc_info=True)
                 raise
@@ -307,17 +282,11 @@ class AIModels:
                 return
             logging.warning("--- 正在加载 FaceAnalysis 模型 (按需, 共享实例) ---")
             try:
-                # --- 【修复请求4：仅在需要时加载一次】 ---
                 if self.face_analyzer_engine is None:
                     logging.warning(f"创建 FaceAnalysis 共享实例...")
-                    self.face_analyzer_engine = self._load_insightface() # 调用 method
-                # 移除循环
-                # for i in range(INFERENCE_WORKERS):
-                #    logging.warning(f"加载 FaceAnalysis 实例 {i+1}/{INFERENCE_WORKERS}...")
-                #    self.face_pool.put(self._load_insightface())
+                    self.face_analyzer_engine = self._load_insightface() # 只加载一次
                 self.face_models_loaded = True
                 logging.warning(f"--- FaceAnalysis 共享实例已准备就绪 ---")
-                # --- 修复结束 ---
             except Exception as e:
                 logging.critical(f"加载 FaceAnalysis 共享实例失败: {e}", exc_info=True)
                 raise
@@ -327,19 +296,11 @@ class AIModels:
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self.ensure_face_models_loaded() # 按需加载
 
-        # --- 【修复请求4：使用共享实例】 ---
-        # 1. 移除 'face_analyzer' 局部变量和 pool.get()
-        # face_analyzer = None
-        # try:
-        #    face_analyzer = self.face_pool.get(timeout=10)
-
-        # 2. 添加检查
         if not self.face_analyzer_engine:
             logging.error("FaceAnalysis 实例未加载。")
             raise Exception("FaceAnalysis model not loaded")
 
         try:
-            # 3. 直接调用共享实例
             faces = self.face_analyzer_engine.get(image)
             results = []
             for face in faces:
@@ -352,36 +313,18 @@ class AIModels:
                     face_confidence=float(face.det_score)
                 ))
             return results
-        # 4. 移除 queue.Empty 异常
-        # except queue.Empty:
-        #    logging.error("获取 FaceAnalysis 实例超时（池已空且无法加载）")
-        #    raise Exception("FaceAnalysis model pool timeout")
         except Exception as e:
-            # 调试级别，因为“未找到人脸”是正常情况
             logging.debug(f"处理人脸识别时出错或未找到人脸: {e}", exc_info=False)
             return []
-        # 5. 移除 finally 和 pool.put()
-        # finally:
-        #    if face_analyzer:
-        #        self.face_pool.put(face_analyzer)
-        # --- 修复结束 ---
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
         self.ensure_ocr_models_loaded() # 按需加载
 
-        # --- 【修复请求4：使用共享实例】 ---
-        # 1. 移除 'ocr_engine' 局部变量和 pool.get()
-        # ocr_engine = None
-        # try:
-        #    ocr_engine = self.ocr_pool.get(timeout=10)
-
-        # 2. 添加检查
         if not self.rapid_ocr_engine:
             logging.error("RapidOCR 实例未加载。")
             raise Exception("RapidOCR model not loaded")
 
         try:
-            # 3. 直接调用共享实例
             ocr_raw_output = self.rapid_ocr_engine(image)
 
             if not isinstance(ocr_raw_output, tuple) or len(ocr_raw_output) < 1:
@@ -391,7 +334,6 @@ class AIModels:
             ocr_result, _ = ocr_raw_output
 
             if ocr_result is None:
-                # 这是正常情况（没有文本）
                 logging.debug("RapidOCR 返回 None 结果 (无文本)。")
                 return OCRResult(texts=[], scores=[], boxes=[])
 
@@ -400,7 +342,6 @@ class AIModels:
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             if len(ocr_result) == 0:
-                # 正常情况（无文本）
                 return OCRResult(texts=[], scores=[], boxes=[])
 
             texts, scores, boxes = [], [], []
@@ -432,18 +373,9 @@ class AIModels:
                 ))
 
             return OCRResult(texts=texts, scores=scores, boxes=boxes)
-        # 4. 移除 queue.Empty 异常
-        # except queue.Empty:
-        #    logging.error("获取 RapidOCR 实例超时（池已空且无法加载）")
-        #    raise Exception("RapidOCR model pool timeout")
         except Exception as e:
             logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)
             return OCRResult(texts=[], scores=[], boxes=[])
-        # 5. 移除 finally 和 pool.put()
-        # finally:
-        #    if ocr_engine:
-        #        self.ocr_pool.put(ocr_engine)
-        # --- 修复结束 ---
 
     def get_image_embedding(self, image: Image.Image, filename: str = "unknown") -> List[float]:
         self.ensure_clip_vision_model_loaded() # 按需加载
@@ -462,7 +394,7 @@ class AIModels:
             embedding = results[self.clip_vision_model.outputs[0]]
             return [float(x) for x in embedding.flatten()]
         except queue.Empty:
-            logging.error("获取 CLIP Vision 实例超时（池已空空且无法加载）")
+            logging.error("获取 CLIP Vision 实例超时（池已空且无法加载）")
             raise Exception("CLIP Vision model pool timeout")
         except Exception as e:
             logging.error(f"在 get_image_embedding 中处理 '{filename}' 时发生严重错误: {e}", exc_info=True)
