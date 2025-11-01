@@ -210,7 +210,7 @@ async def check_service(t: str = ""):
         "title": "MT-Photos AI 统一服务 (OpenVINO 版本)",
         "help": "https://mtmt.tech/docs/advanced/ocr_api",
         "detector_backend": "insightface",
-        "recognition_model": models_instance.MODEL_NAME
+        "recognition_model": ai_models.MODEL_NAME
     }
 # --- 修复结束 ---
 
@@ -307,7 +307,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
         results_dict = [r.model_dump() for r in face_results_list]
         return {
             "detector_backend": "insightface",
-            "recognition_model": models_instance.MODEL_NAME,
+            "recognition_model": ai_models.MODEL_NAME,
             "result": results_dict
         }
     except Exception as e:
