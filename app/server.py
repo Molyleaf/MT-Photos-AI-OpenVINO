@@ -136,6 +136,14 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     if img is None:
         raise HTTPException(status_code=400, detail=f"文件 '{file.filename}' 无法被解码为图像。")
 
+    # --- 【修复请求3：处理非8-bit图像】 ---
+    # 检查图像数据类型，如果是16-bit (uint16)，则转换为8-bit (uint8)
+    if img.dtype == np.uint16:
+        logging.warning(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
+        # 将 [0, 65535] 缩放到 [0, 255]
+        img = (img / 256).astype(np.uint8)
+    # --- 修复结束 ---
+
     height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
 
     if width > 10000 or height > 10000:
@@ -144,6 +152,12 @@ async def read_image_from_upload(file: UploadFile) -> np.ndarray:
     if channels == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif channels == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    # 如果通道数仍然不是3（例如，某些特殊的单通道16-bit图），最后再确认一次
+    if len(img.shape) == 2 or img.shape[2] == 1:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     return img
@@ -204,12 +218,16 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         image = await read_image_from_upload(file)
         # 【修复】get_ocr_results 内部将处理按需加载
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
-        # --- (保留) Pydantic v2 修复 ---
-        return {"result": ocr_results_obj.model_dump()}
+        # --- 【修复请求2：添加 "msg" 字段】 ---
+        return {"result": ocr_results_obj.model_dump(), "msg": "ok"}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        # --- (保留) Pydantic v2 修复 ---
-        return {"result": OCRResult(texts=[], scores=[], boxes=[]).model_dump()}
+        # --- 【修复请求2：使用 example 的错误格式】 ---
+        # 注意：example 返回 'result': []，但这与
+        # schemas.py 中定义的 OCRResponse (result: OCRResult) 不完全一致。
+        # 我们返回一个空的 OCRResult 结构体，这更健壮。
+        empty_result = OCRResult(texts=[], scores=[], boxes=[]).model_dump()
+        return {"result": empty_result, "msg": str(e)}
 
 @app.post("/clip/img")
 async def clip_image_endpoint(file: UploadFile = File(...)):
@@ -224,10 +242,12 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         # 【修复】get_image_embedding 内部将处理按需加载
         embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
-        return {"result": result_strings}
+        # --- 【修复请求2：添加 "msg" 字段】 ---
+        return {"result": result_strings, "msg": "ok"}
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        return {"result": []}
+        # --- 【修复请求2：使用 example 的错误格式】 ---
+        return {"result": [], "msg": str(e)}
 
 @app.post("/clip/txt")
 async def clip_text_endpoint(request: TextClipRequest):
@@ -236,16 +256,19 @@ async def clip_text_endpoint(request: TextClipRequest):
 
     if not request.text or request.text.isspace():
         logging.warning("收到了空的 CLIP 文本请求。")
-        return {"result": []}
+        # --- 【修复请求2：使用 example 的错误格式】 ---
+        return {"result": [], "msg": "empty text"}
 
     try:
         # 【修复】Text CLIP 模型已在启动时加载，此处直接使用
         embedding = await asyncio.to_thread(models_instance.get_text_embedding, request.text)
         result_strings = [f"{f:.16f}" for f in embedding]
-        return {"result": result_strings}
+        # --- 【修复请求2：添加 "msg" 字段】 ---
+        return {"result": result_strings, "msg": "ok"}
     except Exception as e:
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
-        return {"result": []}
+        # --- 【修复请求2：使用 example 的错误格式】 ---
+        return {"result": [], "msg": str(e)}
 
 @app.post("/represent", response_model=RepresentResponse)
 async def represent_endpoint(file: UploadFile = File(...)):
