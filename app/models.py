@@ -30,19 +30,16 @@ MODEL_BASE_PATH = os.environ.get("MODEL_PATH", _DEFAULT_MODEL_PATH)
 logging.info(f"模型根目录 (MODEL_BASE_PATH): {MODEL_BASE_PATH}")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
-# INFERENCE_WORKERS = int(os.environ.get("INFERENCE_WORKERS", "1")) # 不再用于控制池大小
 MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 
-# 注意：logging.basicConfig 应该在 server.py 中配置
 logging.getLogger(__name__).setLevel(logging.WARNING)
 
 
 class AIModels:
     """封装所有 AI 模型加载和推理逻辑的类（并发安全版）。"""
     def __init__(self):
-        # --- 简化为单实例模型】 ---
         logging.warning(f"正在初始化AI模型实例 (尚未加载)，使用设备: {INFERENCE_DEVICE}。所有模型将使用单实例队列。")
         self.core = ov.Core()
 
@@ -54,93 +51,125 @@ class AIModels:
         self.clip_text_model: Optional[ov.CompiledModel] = None
         self.clip_image_preprocessor = None # 仅用于基础引用
 
-        # --- 所有队列大小强制为 1，以序列化请求】 ---
         self.ocr_pool: queue.Queue = queue.Queue(maxsize=1)
         self.face_pool: queue.Queue = queue.Queue(maxsize=1)
         self.clip_vision_pool: queue.Queue = queue.Queue(maxsize=1)
         self.clip_text_pool: queue.Queue = queue.Queue(maxsize=1)
 
-        # 使用可重入锁(RLock)解决死锁问题
         self._load_lock = threading.RLock()
 
-        # 使用独立的加载标志
         self.clip_text_model_loaded = False
         self.clip_vision_model_loaded = False
         self.ocr_models_loaded = False
         self.face_models_loaded = False
 
-    def _empty_queue(self, q: queue.Queue):
-        if q is None: return
-        while not q.empty():
-            try:
-                item = q.get_nowait()
-                del item
-            except queue.Empty:
-                break
-            except Exception as e:
-                logging.warning(f"清空队列时出错: {e}")
+    # --- 【修复：移除 _empty_queue，因为它不安全】 ---
+    # def _empty_queue(self, q: queue.Queue): ... (移除)
 
     def release_models(self):
         """(按需) 释放模型。此函数由空闲计时器或 /restart 调用。"""
 
-        # --- 在释放时获取锁 ---
+        # --- 【修复：使用安全的 'get_nowait' 逻辑】 ---
         with self._load_lock:
             if not (self.face_models_loaded or self.ocr_models_loaded or self.clip_vision_model_loaded):
                 logging.debug("没有按需模型需要释放。")
                 return
 
             logging.warning("--- 正在释放 (按需) AI 模型 ---")
-            try:
-                # 1. 释放 CLIP Vision (按需)
-                self._empty_queue(self.clip_vision_pool)
-                if self.clip_vision_model:
-                    del self.clip_vision_model
-                    self.clip_vision_model = None
-                self.clip_image_preprocessor = None
-                logging.warning("CLIP Vision (按需) 实例池和模型已释放。")
 
-                # 2. 释放 RapidOCR (按需)
-                self._empty_queue(self.ocr_pool)
-                logging.warning("RapidOCR (按需) 实例池已释放。")
+            # 1. 释放 CLIP Vision (按需)
+            if self.clip_vision_model_loaded:
+                try:
+                    # 尝试获取模型，如果队列为空（即模型正在使用），则会引发 Empty
+                    pooled_item = self.clip_vision_pool.get_nowait()
 
-                # 3. 释放 FaceAnalysis (按需)
-                self._empty_queue(self.face_pool)
-                logging.warning("FaceAnalysis (按需) 实例池已释放。")
+                    # 成功获取：表示模型空闲，可以安全释放
+                    logging.warning("释放空闲的 CLIP Vision (按需) 实例...")
+                    del pooled_item
+                    if self.clip_vision_model:
+                        del self.clip_vision_model
+                        self.clip_vision_model = None
+                    self.clip_image_preprocessor = None
+                    self.clip_vision_model_loaded = False
 
-                gc.collect()
-                logging.warning("(按需) 模型已成功从内存中释放。")
-            except Exception as e:
-                logging.warning(f"释放 (按需) 模型时出现错误: {e}", exc_info=True)
-            finally:
-                # 重置“按需”模型的标志
-                self.face_models_loaded = False
-                self.ocr_models_loaded = False
-                self.clip_vision_model_loaded = False
+                except queue.Empty:
+                    # 队列为空：表示模型正在使用中，跳过本次释放
+                    logging.debug("CLIP Vision (按需) 模型正在使用中，跳过释放。")
+                except Exception as e:
+                    logging.error(f"释放 CLIP Vision 时出错: {e}", exc_info=True)
+
+            # 2. 释放 RapidOCR (按需)
+            if self.ocr_models_loaded:
+                try:
+                    ocr_instance = self.ocr_pool.get_nowait()
+                    logging.warning("释放空闲的 RapidOCR (按需) 实例...")
+                    del ocr_instance
+                    self.ocr_models_loaded = False
+                except queue.Empty:
+                    logging.debug("RapidOCR (按需) 模型正在使用中，跳过释放。")
+                except Exception as e:
+                    logging.error(f"释放 RapidOCR 时出错: {e}", exc_info=True)
+
+            # 3. 释放 FaceAnalysis (按需)
+            if self.face_models_loaded:
+                try:
+                    face_instance = self.face_pool.get_nowait()
+                    logging.warning("释放空闲的 FaceAnalysis (按需) 实例...")
+                    del face_instance
+                    self.face_models_loaded = False
+                except queue.Empty:
+                    logging.debug("FaceAnalysis (按需) 模型正在使用中，跳过释放。")
+                except Exception as e:
+                    logging.error(f"释放 FaceAnalysis 时出错: {e}", exc_info=True)
+
+            gc.collect()
+            logging.debug("按需模型释放检查完成。")
+        # --- 修复结束 ---
 
     def release_all_models(self):
         """(关闭时) 释放所有模型，包括常驻模型。"""
 
-        # --- 在释放时获取锁 ---
         with self._load_lock:
             logging.warning("--- 正在释放 *所有* AI 模型 (应用关闭) ---")
+
             # 1. 释放所有按需模型
             # (因为是 RLock，所以 release_models() 在这里再次获取锁是安全的)
+            # 注意：此时我们调用 release_models 只是为了清理池中 *空闲* 的项
             self.release_models()
 
-            # 2. 释放常驻的 Text CLIP 模型
-            try:
-                if self.clip_text_model_loaded:
-                    logging.warning("释放 Text CLIP (常驻) 模型...")
-                    self._empty_queue(self.clip_text_pool)
-                    if self.clip_text_model:
-                        del self.clip_text_model
-                        self.clip_text_model = None
-                    gc.collect()
-                    logging.warning("Text CLIP (常驻) 模型已释放。")
-            except Exception as e:
-                logging.warning(f"释放 Text CLIP 模型时出现错误: {e}", exc_info=True)
-            finally:
+            # 2. 释放常驻的 Text CLIP 模型 (使用 'get_nowait' 逻辑)
+            if self.clip_text_model_loaded:
+                logging.warning("释放 Text CLIP (常驻) 模型...")
+                try:
+                    pooled_item = self.clip_text_pool.get_nowait()
+                    del pooled_item
+                except queue.Empty:
+                    logging.warning("Text CLIP 在关闭时正在使用中。")
+                except Exception as e:
+                    logging.error(f"清空 Text CLIP 池时出错: {e}", exc_info=True)
+
+                # 无论如何都要删除基础模型
+                if self.clip_text_model:
+                    del self.clip_text_model
+                    self.clip_text_model = None
                 self.clip_text_model_loaded = False
+                logging.warning("Text CLIP (常驻) 模型已释放。")
+
+            # 3. (关闭时) 强制清理按需模型的基础引用（即使它们在 release_models 中正在被使用）
+            # 这是为了防止 release_models 跳过它们
+            if self.clip_vision_model:
+                del self.clip_vision_model
+                self.clip_vision_model = None
+            self.clip_image_preprocessor = None
+
+            # 确保池在退出前是空的（即使实例在别处被引用）
+            while not self.clip_vision_pool.empty(): self.clip_vision_pool.get_nowait()
+            while not self.ocr_pool.empty(): self.ocr_pool.get_nowait()
+            while not self.face_pool.empty(): self.face_pool.get_nowait()
+
+            gc.collect()
+            logging.warning("所有模型清理完毕 (应用关闭)。")
+        # --- 修复结束 ---
 
     def _load_insightface(self) -> FaceAnalysis:
         logging.warning("Insightface 将显式加载通用的 'CPUExecutionProvider' (无 OpenVINO 加速)。")
@@ -230,7 +259,6 @@ class AIModels:
             logging.warning("--- 正在加载 CLIP Text 模型 (常驻, 1个实例) ---")
             try:
                 self.clip_text_model = self._compile_clip_text_model()
-                # --- 加载 1 个 (模型, 推理请求) 元组 ---
                 infer_request = self.clip_text_model.create_infer_request()
                 self.clip_text_pool.put((self.clip_text_model, infer_request))
                 self.clip_text_model_loaded = True
@@ -246,14 +274,22 @@ class AIModels:
         with self._load_lock:
             if self.clip_vision_model_loaded:
                 return
+
+            # --- 【修复：增加检查，防止在 release_models 竞争时重复加载】 ---
+            # 这是一个双重保险，防止在 'get_nowait' 逻辑失败时，
+            # 两个线程都尝试加载。
+            if not self.clip_vision_pool.empty():
+                logging.warning("ensure_clip_vision_model_loaded: 发现池非空但标志为False。重置标志并跳过加载。")
+                self.clip_vision_model_loaded = True
+                return
+            # --- 修复结束 ---
+
             logging.warning("--- 正在加载 CLIP Vision 模型 (按需, 1个实例) ---")
             try:
                 preprocessor, model = self._compile_clip_vision_model()
-                # 保留对基础模型的引用，以便在 release 时del
                 self.clip_image_preprocessor = preprocessor
                 self.clip_vision_model = model
 
-                # --- 加载 1 个 (预处理器, 模型, 推理请求) 元组 ---
                 infer_request = model.create_infer_request()
                 self.clip_vision_pool.put((preprocessor, model, infer_request))
 
@@ -270,9 +306,14 @@ class AIModels:
         with self._load_lock:
             if self.ocr_models_loaded:
                 return
+
+            if not self.ocr_pool.empty():
+                logging.warning("ensure_ocr_models_loaded: 发现池非空但标志为False。重置标志并跳过加载。")
+                self.ocr_models_loaded = True
+                return
+
             logging.warning(f"--- 正在加载 RapidOCR 模型 (按需, 1个实例) ---")
             try:
-                # --- 加载 1 个实例 ---
                 logging.warning(f"创建 RapidOCR 实例 1/1...")
                 ocr_instance = self._load_rapidocr()
                 self.ocr_pool.put(ocr_instance)
@@ -290,9 +331,14 @@ class AIModels:
         with self._load_lock:
             if self.face_models_loaded:
                 return
+
+            if not self.face_pool.empty():
+                logging.warning("ensure_face_models_loaded: 发现池非空但标志为False。重置标志并跳过加载。")
+                self.face_models_loaded = True
+                return
+
             logging.warning(f"--- 正在加载 FaceAnalysis 模型 (按需, 1个实例) ---")
             try:
-                # --- 载 1 个实例 ---
                 logging.warning(f"创建 FaceAnalysis 实例 1/1...")
                 face_instance = self._load_insightface()
                 self.face_pool.put(face_instance)
@@ -303,14 +349,13 @@ class AIModels:
                 logging.critical(f"加载 FaceAnalysis 实例池失败: {e}", exc_info=True)
                 raise
 
-    # 修改 get 方法以调用其各自的 ensure
+    # 'get' 方法保持不变 (它们是正确的)
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self.ensure_face_models_loaded() # 按需加载
         face_analyzer_engine = None
 
         try:
-            # 从池中获取实例
             face_analyzer_engine = self.face_pool.get(timeout=10)
             if not face_analyzer_engine:
                 logging.error("从池中获取 FaceAnalysis 实例失败。")
@@ -335,7 +380,6 @@ class AIModels:
             logging.debug(f"处理人脸识别时出错或未找到人脸: {e}", exc_info=False)
             return []
         finally:
-            # 确保实例被放回池中
             if face_analyzer_engine:
                 self.face_pool.put(face_analyzer_engine)
 
@@ -345,7 +389,6 @@ class AIModels:
         rapid_ocr_engine = None
 
         try:
-            # 从池中获取实例
             rapid_ocr_engine = self.ocr_pool.get(timeout=10)
             if not rapid_ocr_engine:
                 logging.error("从池中获取 RapidOCR 实例失败。")
@@ -409,21 +452,18 @@ class AIModels:
                 logging.warning(f"处理 OCR 时出错: {e}", exc_info=True)
             return OCRResult(texts=[], scores=[], boxes=[])
         finally:
-            # 确保实例被放回池中
             if rapid_ocr_engine:
                 self.ocr_pool.put(rapid_ocr_engine)
 
     def get_image_embedding(self, image: Image.Image, filename: str = "unknown") -> List[float]:
         self.ensure_clip_vision_model_loaded() # 按需加载
 
-        # --- 从队列中获取元组 ---
         pooled_item = None
         local_clip_image_preprocessor = None
         local_clip_vision_model = None
         infer_request = None
 
         try:
-            # 原子地获取所有需要的资源
             pooled_item = self.clip_vision_pool.get(timeout=10)
             local_clip_image_preprocessor, local_clip_vision_model, infer_request = pooled_item
 
@@ -445,20 +485,17 @@ class AIModels:
             logging.error(f"在 get_image_embedding 中处理 '{filename}' 时发生严重错误: {e}", exc_info=True)
             return [0.0] * CLIP_EMBEDDING_DIMS
         finally:
-            # --- 将元组放回】 ---
             if pooled_item:
                 self.clip_vision_pool.put(pooled_item)
 
     def get_text_embedding(self, text: str) -> List[float]:
         self.ensure_clip_text_model_loaded() # (常驻) 检查以确保加载
 
-        # --- 从队列中获取元组 ---
         pooled_item = None
         local_clip_text_model = None
         infer_request = None
 
         try:
-            # 原子地获取所有需要的资源
             pooled_item = self.clip_text_pool.get(timeout=10)
             local_clip_text_model, infer_request = pooled_item
 
