@@ -85,58 +85,67 @@ class AIModels:
 
     def release_models(self):
         """(按需) 释放模型。此函数由空闲计时器或 /restart 调用。"""
-        if not (self.face_models_loaded or self.ocr_models_loaded or self.clip_vision_model_loaded):
-            logging.debug("没有按需模型需要释放。")
-            return
 
-        logging.warning("--- 正在释放 (按需) AI 模型 ---")
-        try:
-            # 1. 释放 CLIP Vision (按需)
-            self._empty_queue(self.clip_vision_pool)
-            if self.clip_vision_model:
-                del self.clip_vision_model
-                self.clip_vision_model = None
-            self.clip_image_preprocessor = None
-            logging.warning("CLIP Vision (按需) 实例池和模型已释放。")
+        # --- 【修复死锁/竞态条件】: 在释放时获取锁 ---
+        with self._load_lock:
+            if not (self.face_models_loaded or self.ocr_models_loaded or self.clip_vision_model_loaded):
+                logging.debug("没有按需模型需要释放。")
+                return
 
-            # 2. 释放 RapidOCR (按需)
-            self._empty_queue(self.ocr_pool) # <--- 修改
-            logging.warning("RapidOCR (按需) 实例池已释放。") # <--- 修改
+            logging.warning("--- 正在释放 (按需) AI 模型 ---")
+            try:
+                # 1. 释放 CLIP Vision (按需)
+                self._empty_queue(self.clip_vision_pool)
+                if self.clip_vision_model:
+                    del self.clip_vision_model
+                    self.clip_vision_model = None
+                self.clip_image_preprocessor = None
+                logging.warning("CLIP Vision (按需) 实例池和模型已释放。")
 
-            # 3. 释放 FaceAnalysis (按需)
-            self._empty_queue(self.face_pool) # <--- 修改
-            logging.warning("FaceAnalysis (按需) 实例池已释放。") # <--- 修改
+                # 2. 释放 RapidOCR (按需)
+                self._empty_queue(self.ocr_pool) # <--- 修改
+                logging.warning("RapidOCR (按需) 实例池已释放。") # <--- 修改
 
-            gc.collect()
-            logging.warning("(按需) 模型已成功从内存中释放。")
-        except Exception as e:
-            logging.warning(f"释放 (按需) 模型时出现错误: {e}", exc_info=True)
-        finally:
-            # 重置“按需”模型的标志
-            self.face_models_loaded = False
-            self.ocr_models_loaded = False
-            self.clip_vision_model_loaded = False
+                # 3. 释放 FaceAnalysis (按需)
+                self._empty_queue(self.face_pool) # <--- 修改
+                logging.warning("FaceAnalysis (按需) 实例池已释放。") # <--- 修改
+
+                gc.collect()
+                logging.warning("(按需) 模型已成功从内存中释放。")
+            except Exception as e:
+                logging.warning(f"释放 (按需) 模型时出现错误: {e}", exc_info=True)
+            finally:
+                # 重置“按需”模型的标志
+                self.face_models_loaded = False
+                self.ocr_models_loaded = False
+                self.clip_vision_model_loaded = False
+        # --- 修复结束 ---
 
     def release_all_models(self):
         """(关闭时) 释放所有模型，包括常驻模型。"""
-        logging.warning("--- 正在释放 *所有* AI 模型 (应用关闭) ---")
-        # 1. 释放所有按需模型
-        self.release_models()
 
-        # 2. 释放常驻的 Text CLIP 模型
-        try:
-            if self.clip_text_model_loaded:
-                logging.warning("释放 Text CLIP (常驻) 模型...")
-                self._empty_queue(self.clip_text_pool)
-                if self.clip_text_model:
-                    del self.clip_text_model
-                    self.clip_text_model = None
-                gc.collect()
-                logging.warning("Text CLIP (常驻) 模型已释放。")
-        except Exception as e:
-            logging.warning(f"释放 Text CLIP 模型时出现错误: {e}", exc_info=True)
-        finally:
-            self.clip_text_model_loaded = False
+        # --- 【修复死锁/竞态条件】: 在释放时获取锁 ---
+        with self._load_lock:
+            logging.warning("--- 正在释放 *所有* AI 模型 (应用关闭) ---")
+            # 1. 释放所有按需模型
+            # (因为是 RLock，所以 release_models() 在这里再次获取锁是安全的)
+            self.release_models()
+
+            # 2. 释放常驻的 Text CLIP 模型
+            try:
+                if self.clip_text_model_loaded:
+                    logging.warning("释放 Text CLIP (常驻) 模型...")
+                    self._empty_queue(self.clip_text_pool)
+                    if self.clip_text_model:
+                        del self.clip_text_model
+                        self.clip_text_model = None
+                    gc.collect()
+                    logging.warning("Text CLIP (常驻) 模型已释放。")
+            except Exception as e:
+                logging.warning(f"释放 Text CLIP 模型时出现错误: {e}", exc_info=True)
+            finally:
+                self.clip_text_model_loaded = False
+        # --- 修复结束 ---
 
     def _load_insightface(self) -> FaceAnalysis:
         logging.warning("Insightface 将显式加载通用的 'CPUExecutionProvider' (无 OpenVINO 加速)。")
@@ -477,3 +486,4 @@ class AIModels:
         finally:
             if infer_request:
                 self.clip_text_pool.put(infer_request)
+
