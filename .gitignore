@@ -11,6 +11,7 @@ venv/
 
 models/
 cache/
+example/
 
 # Docker
 .dockerignore

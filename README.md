@@ -1,4 +1,4 @@
-# MT-Photos AI (AltCLIP + OpenVINO 版本)
+# MT-Photos AI
 
 使用 Chinese-CLIP / QA-CLIP + Insightface + RapidOCR + OpenVINO 的一站式 AI 服务。
 ONNX 版本稍后做，欢迎 PR。
