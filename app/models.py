@@ -173,7 +173,7 @@ class AIModels:
         try:
             providers_generic_cpu = ['CPUExecutionProvider']
             face_app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers_generic_cpu)
-            face_app.prepare(ctx_id=0, det_size=(64, 64))
+            face_app.prepare(ctx_id=0, det_size=(640, 640))
             logging.warning("InsightFace 实例已在通用 CPU 上成功加载。")
             return face_app
         except Exception as final_fallback_e:
