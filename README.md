@@ -1,7 +1,7 @@
 # MT-Photos AI
 
-使用 Chinese-CLIP / QA-CLIP + Insightface + RapidOCR + OpenVINO 的一站式 AI 服务。
-ONNX 版本稍后做，欢迎 PR。
+使用 QA-CLIP + Insightface + RapidOCR + OpenVINO 的一站式 AI 服务。
+对非 OpenVINO 设备做了自动 fallback，欢迎 PR。
 
 | 环境变量               | 描述                                                                                       | 默认值                   |
 |--------------------|------------------------------------------------------------------------------------------|-----------------------|
@@ -10,20 +10,14 @@ ONNX 版本稍后做，欢迎 PR。
 | `MODEL_NAME`       | Insightface 使用的模型名称，填"buffalo_l"或"antelopv2"，镜像已经自带这两个模型，无需下载。请注意antelopv2未必比buffalo_l好。 | `"buffalo_l"`         |
 | `WEB_CONCURRENCY`  | 控制 worker 数量。注意：每个 worker 都会加载自己的模型实例，会增加内存使用。 | `"1"`                   |
 
-请使用最新的Docker镜像，旧版可能有bug。
+>**向量维度需要改成 768**
 
-- Docker Hub: https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
+> Docker Hub: https://hub.docker.com/r/molyleaf/mt-photos-ai-openvino
 
-- GitHub: https://github.com/molyleaf/mt-photos-ai-openvino
+> GitHub: https://github.com/molyleaf/mt-photos-ai-openvino
 
-提供 Chinese-CLIP 和 QA-CLIP 镜像：
 
-``` docker pull molyleaf/mt-photos-ai-openvino:1.0.1.6-QA-CLIP ```
-
-``` docker pull molyleaf/mt-photos-ai-openvino:1.2.2-Chinese-CLIP ```
-
-**向量维度需要改成 768**
-
+---
 ## 以下是AI写的
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
