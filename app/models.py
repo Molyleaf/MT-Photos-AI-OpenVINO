@@ -182,16 +182,16 @@ class AIModels:
 
     @staticmethod
     def _load_rapidocr() -> RapidOCR:
-        ov_config = {"PERFORMANCE_HINT": "THROUGHPUT"}
+        ov_config = {"PERFORMANCE_HINT": "LATENCY"}
 
         try:
-            logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})...")
+            logging.debug(f"加载 RapidOCR (OpenVINO) (尝试使用 {INFERENCE_DEVICE})")
             ocr = RapidOCR(device_name=INFERENCE_DEVICE, ov_config=ov_config)
             logging.warning(f"RapidOCR 实例在 {INFERENCE_DEVICE} (OpenVINO) 上加载成功 (Config: {ov_config})。")
             return ocr
         except Exception as e:
             logging.error(f"加载 RapidOCR 实例失败 (尝试使用 {INFERENCE_DEVICE}, Config: {ov_config}): {e}", exc_info=True)
-            logging.warning("RapidOCR (OpenVINO) 加载失败，将回退到 CPU (OpenVINO)...")
+            logging.warning("RapidOCR (OpenVINO) 加载失败，将回退到 CPU (OpenVINO)")
             try:
                 ocr = RapidOCR(device_name="CPU", ov_config=ov_config)
                 logging.warning(f"RapidOCR 实例已在 CPU (OpenVINO 回退模式) 上成功加载 (Config: {ov_config})。")
