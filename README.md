@@ -16,7 +16,6 @@
 
 > GitHub: https://github.com/molyleaf/mt-photos-ai-openvino
 
-
 ---
 ## 以下是AI写的
 
