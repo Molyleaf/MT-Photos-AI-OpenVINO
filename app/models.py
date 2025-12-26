@@ -22,7 +22,7 @@ from schemas import (
 )
 
 # --- 日志净化区域 ---
-# 压制常见的库日志噪音
+# 压制常见的库日志噪音，保持控制台清爽
 logging.getLogger("PIL").setLevel(logging.WARNING)
 logging.getLogger("torch").setLevel(logging.WARNING)
 logging.getLogger("insightface").setLevel(logging.WARNING)
@@ -50,7 +50,10 @@ STANDBY_LOAD_DELAY = 10.0  # 释放完成后多久自动加载 CLIP (热备)
 class AIModels:
     """
     针对 MX150 (2GB) 优化的单例模型管理类。
-    包含 CLIP 热备 (Hot-Standby) 逻辑。
+    策略：
+    1. 平时常驻 CLIP 模型 (热备)，以实现搜图秒回。
+    2. 当 OCR 或 Face 请求到来时，立即卸载 CLIP，腾出显存。
+    3. 任务完成后，延时释放 OCR/Face，随后自动重新加载 CLIP。
     """
     def __init__(self):
         logging.warning(f"初始化 AIModels (Single Slot Mode).")
@@ -71,7 +74,7 @@ class AIModels:
         # 线程锁与定时器
         self._lock = threading.RLock()
         self._release_timer: Optional[threading.Timer] = None
-        self._standby_timer: Optional[threading.Timer] = None # 新增：热备加载定时器
+        self._standby_timer: Optional[threading.Timer] = None # 热备加载定时器
 
     def _clean_gpu_memory(self):
         """强制清理 GPU 显存"""
@@ -92,7 +95,7 @@ class AIModels:
     def release_all_models(self, reason: str = "主动释放", schedule_standby: bool = True):
         """
         释放所有模型。
-        :param schedule_standby: 释放后是否计划自动加载 CLIP 热备
+        :param schedule_standby: 释放后是否计划自动加载 CLIP 热备。关闭服务时应设为 False。
         """
         with self._lock:
             self._cancel_timers() # 停止之前的计时
@@ -108,8 +111,7 @@ class AIModels:
                 self.face_engine = None
                 cleaned = True
 
-            # 注意：如果是 CLIP 且当前策略是热备，这里也会被释放
-            # 只有在 _switch_to 需要腾位置时，或者 lifespan 关闭时才会调用这里
+            # 如果当前有 CLIP，也一并释放（为重型任务腾出空间，或彻底关闭）
             if self.clip_model:
                 del self.clip_model
                 self.clip_model = None
@@ -128,8 +130,7 @@ class AIModels:
                 self._standby_timer.start()
 
     def release_models(self):
-        # 外部调用的释放（如 API /restart），不自动触发热备，或者根据需求触发
-        # 这里设定为触发热备，保持服务活性
+        # 外部调用的释放（如 API /restart），保持服务活性，因此触发热备
         self.release_all_models(reason="外部调用 release", schedule_standby=True)
 
     def _load_clip_standby_worker(self):
@@ -223,8 +224,7 @@ class AIModels:
             # 特殊情况：如果当前是 CLIP (可能是热备的)，而目标是 OCR/Face
             # 需要立即释放 CLIP 给重型任务腾出显存
             if self.current_loaded_type is not None:
-                # 注意：这里调用 release_all_models 时传入 False，防止递归或冲突
-                # 因为我们马上就要加载新模型，不需要调度热备
+                # 立即释放，且不允许在此期间触发热备（因为马上要加载新模型）
                 self.release_all_models(reason=f"切换模型: {self.current_loaded_type}->{target_type}", schedule_standby=False)
 
             # 4. 加载新模型
@@ -299,7 +299,7 @@ class AIModels:
                 image = self._preprocess_image_size(image)
                 faces = self.face_engine.get(image)
 
-                # 【修复】之前遗漏了这里，现在加上自动释放
+                # 任务完成，调度释放
                 self._schedule_auto_release()
 
                 results = []
@@ -329,8 +329,7 @@ class AIModels:
                     features = features / features.norm(dim=-1, keepdim=True)
 
                 # CLIP 请求结束后，不应该调度释放
-                # 因为 CLIP 是我们的热备模型，它应该一直呆在显存里，除非 OCR/Face 来抢
-                # 只有当用户显式调用释放接口时才释放
+                # 因为 CLIP 是我们的热备模型，它应该一直呆在显存里
                 return features.cpu().numpy().flatten().tolist()
             except Exception as e:
                 logging.error(f"CLIP Image Inference Error: {e}")

@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import os
-import sys  # <--- 确保导入 sys
+import sys
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from io import BytesIO
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
@@ -28,7 +28,6 @@ from schemas import (
     CheckResponse,
     OCRResult,
     TextClipRequest,
-    # RepresentResponse, # 不再用于 /represent 的响应模型
     RestartResponse
 )
 
@@ -37,7 +36,7 @@ _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 _LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
 
-LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper() #
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
 
 log_handlers = [logging.StreamHandler()] # 默认输出到控制台
@@ -58,7 +57,6 @@ logging.basicConfig(
     handlers=log_handlers
 )
 
-# --- 【修复日志：强制关闭 Uvicorn 200 访问日志】 ---
 # 必须在 basicConfig 之后调用，以覆盖 uvicorn.access 的默认设置
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # --- 日志配置结束 ---
@@ -78,70 +76,43 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
             detail="无效的 API 密钥",
         )
 
-SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
-idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
-
-def idle_timeout_handler():
-    global models_instance
-    if models_instance:
-        logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放 (按需) 模型以节省内存...")
-        if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
-            models_instance.release_models()
-        else:
-            logging.error("AIModels 实例没有 release_models 方法 (idle_timeout_handler)。")
-
-def reset_idle_timer():
-    global idle_timer
-    if idle_timer:
-        idle_timer.cancel()
-    if SERVER_IDLE_TIMEOUT > 0:
-        idle_timer = threading.Timer(SERVER_IDLE_TIMEOUT, idle_timeout_handler)
-        idle_timer.start()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    应用生命周期管理。
+    注意：这里不再设置 Server 层的 IdleTimer，
+    所有的显存管理逻辑全权移交给 ai_models.AIModels 内部处理。
+    """
     global models_instance
     logging.warning("应用启动... 初始化 AIModels 实例。")
     models_instance = ai_models.AIModels()
     try:
-        logging.warning("应用启动... 正在预热加载 Text CLIP 模型。")
+        logging.warning("应用启动... 正在预热加载 Text CLIP 模型 (热备)。")
         models_instance.ensure_clip_text_model_loaded()
     except Exception as e:
         logging.critical(f"应用启动时基础模型加载失败: {e}", exc_info=True)
 
-    reset_idle_timer()
     yield
-    global idle_timer
-    if idle_timer:
-        idle_timer.cancel()
+
     logging.warning("应用关闭。正在释放所有模型...")
     if models_instance:
-        if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
-            models_instance.release_all_models()
-        else:
-            logging.warning("AIModels 实例没有 release_all_models 方法 (lifespan)。")
+        if hasattr(models_instance, 'release_all_models'):
+            # 关闭时不需要触发热备
+            models_instance.release_all_models(reason="Shutdown", schedule_standby=False)
 
 app = FastAPI(
     title="MT-Photos AI 统一服务",
-    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
-    version="2.2.0",
+    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。",
+    version="2.3.0",
     dependencies=[Depends(get_api_key)],
     lifespan=lifespan
 )
 
-@app.middleware("http")
-async def reset_timer_middleware(request: Request, call_next):
-    if request.url.path not in ["/check", "/", "/clip/txt"]:
-        reset_idle_timer()
-    response = await call_next(request)
-    return response
-
-# --- 【修复：重写 read_image_from_upload 以匹配示例行为】 ---
 async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """
     读取上传的图像文件，处理 GIF、16-bit 和其他格式。
-    在失败时返回 (None, "错误消息")，而不是抛出 HTTPException。
     """
     contents = await file.read()
     img = None
@@ -161,7 +132,6 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
             nparr = np.frombuffer(contents, np.uint8)
             img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
 
-        # 检查解码是否成功
         if img is None:
             logging.warning(f"文件 '{file.filename}' 无法被解码为图像。")
             return None, f"文件 '{file.filename}' 无法被解码为图像。"
@@ -183,7 +153,6 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
         elif channels == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-        # 最后的健壮性检查
         if len(img.shape) < 3 or img.shape[2] != 3:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
@@ -192,7 +161,7 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
     except Exception as e:
         logging.error(f"读取图像 '{file.filename}' 时发生意外错误: {e}", exc_info=True)
         return None, f"处理图像时发生意外错误: {str(e)}"
-# --- 修复结束 ---
+
 
 @app.get("/", response_class=HTMLResponse)
 async def top_info():
@@ -204,15 +173,14 @@ async def top_info():
     <style>p{text-align: center;}</style>
 </head>
 <body>
-<p style="font-weight: 600;">MT Photos智能识别服务 (OpenVINO)</p>
-<p>服务状态： 运行中</p>
+<p style="font-weight: 600;">MT Photos智能识别服务 (OpenVINO Optimized)</p>
+<p>服务状态： 运行中 (CLIP热备模式)</p>
 <p>使用方法： <a href="https://mtmt.tech/docs/advanced/ocr_api">https://mtmt.tech/docs/advanced/ocr_api</a></p>
 <p>作者：https://github.com/Molyleaf/MT-Photos-AI-OpenVINO</p>
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
 
-# --- 【修复：合并 /check 响应】 ---
 @app.post("/check", response_model=CheckResponse)
 async def check_service(t: str = ""):
     if not models_instance:
@@ -224,16 +192,13 @@ async def check_service(t: str = ""):
         "detector_backend": "insightface",
         "recognition_model": ai_models.MODEL_NAME
     }
-# --- 修复结束 ---
 
 @app.post("/restart", response_model=RestartResponse)
 async def restart_service():
-    logging.warning("收到 /restart 请求，正在释放模型...")
+    logging.warning("收到 /restart 请求，正在重置模型状态...")
     if models_instance:
         if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
             models_instance.release_models()
-        else:
-            logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
     return {"result": "pass"}
 
 @app.post("/restart_v2", response_model=RestartResponse)
@@ -260,7 +225,6 @@ async def ocr_endpoint(file: UploadFile = File(...)):
 
     try:
         ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
-        # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -282,7 +246,6 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
         embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
-        # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
