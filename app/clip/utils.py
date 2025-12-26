@@ -1,6 +1,4 @@
 # app/clip/utils.py
-# Code modified from https://github.com/openai/CLIP
-
 import json
 import os
 import urllib
@@ -9,13 +7,13 @@ from pathlib import Path
 from typing import Union, List
 
 import torch
+from safetensors.torch import load_file
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
 from tqdm import tqdm
 
 from . import _tokenizer
 from .model import convert_weights, CLIP, restore_model
 
-# --- 【修复 3】: 将 '_MODEL_INFO' 添加到 __all__ ---
 __all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name", "MODEL_INFO"]
 
 _MODELS = {
@@ -23,7 +21,7 @@ _MODELS = {
     "ViT-L-14": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-large.pt",
     "RN50": "https://huggingface.co/TencentARC/QA-CLIP/resolve/main/QA-CLIP-RN50.pt",
 }
-# --- 【修复 3】: 重命名为 MODEL_INFO (移除 '_') ---
+
 MODEL_INFO = {
     "ViT-B-16": {
         "struct": "ViT-B-16@RoBERTa-wwm-ext-base-chinese",
@@ -38,13 +36,10 @@ MODEL_INFO = {
         "input_resolution": 224
     },
 }
-# --- 修复结束 ---
-
 
 def _download(url: str, root: str):
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
-
     download_target = os.path.join(root, filename)
 
     if os.path.exists(download_target) and not os.path.isfile(download_target):
@@ -60,38 +55,53 @@ def _download(url: str, root: str):
                 buffer = source.read(8192)
                 if not buffer:
                     break
-
                 output.write(buffer)
                 loop.update(len(buffer))
-
     return download_target
-
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
-
 def available_models() -> List[str]:
-    """Returns the names of available CLIP models"""
     return list(_MODELS.keys())
-
 
 def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
                    download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
+
+    model_path = None
+
     if name in _MODELS:
-        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
-        # --- 【修复 3】: 使用 MODEL_INFO ---
+        # 优先查找 safetensors
+        root_dir = download_root or os.path.expanduser("~/.cache/clip")
+        pt_filename = os.path.basename(_MODELS[name])
+        safe_filename = pt_filename.replace(".pt", ".safetensors")
+        safe_path = os.path.join(root_dir, safe_filename)
+
+        if os.path.exists(safe_path):
+            model_path = safe_path
+        else:
+            # 如果没有 safetensors，才下载 .pt (但建议使用 download-models.py 预处理)
+            model_path = _download(_MODELS[name], root_dir)
+
         model_name, model_input_resolution = MODEL_INFO[name]['struct'], MODEL_INFO[name]['input_resolution']
     elif os.path.isfile(name):
-        assert vision_model_name and text_model_name and input_resolution, "Please specify specific 'vision_model_name', 'text_model_name', and 'input_resolution'"
         model_path = name
+        if not (vision_model_name and text_model_name and input_resolution):
+            # 尝试从 name 中推断，或者保持原有的 assert
+            assert vision_model_name and text_model_name and input_resolution, \
+                "Please specify specific 'vision_model_name', 'text_model_name', and 'input_resolution'"
         model_name, model_input_resolution = f'{vision_model_name}@{text_model_name}', input_resolution
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
-    with open(model_path, 'rb') as opened_file:
-        # loading saved checkpoint
-        checkpoint = torch.load(opened_file, map_location="cpu")
+    # Loading Logic: Safetensors vs PyTorch Pickle
+    if model_path.endswith(".safetensors"):
+        print(f"Loading weights from {model_path} (Safetensors)...")
+        checkpoint = load_file(model_path)
+    else:
+        print(f"Loading weights from {model_path} (PyTorch default)...")
+        with open(model_path, 'rb') as opened_file:
+            checkpoint = torch.load(opened_file, map_location="cpu")
 
     model = create_model(model_name, checkpoint)
     if str(device) == "cpu":
@@ -100,35 +110,26 @@ def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch
         model.to(device)
     return model, image_transform(model_input_resolution)
 
-
 def load(model, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", clip_path=None,
-         bert_path=None, use_flash_attention=False):
-    """Load CLIP and BERT model weights
-    """
+         bert_path=None):
+    """Load CLIP and BERT model weights"""
 
     bert_state_dict = torch.load(bert_path, map_location="cpu") if bert_path else None
-    clip_state_dict = torch.load(clip_path, map_location="cpu") if clip_path else None
 
-    restore_model(model, clip_state_dict, bert_state_dict, use_flash_attention).to(device)
+    clip_state_dict = None
+    if clip_path:
+        if clip_path.endswith(".safetensors"):
+            clip_state_dict = load_file(clip_path)
+        else:
+            clip_state_dict = torch.load(clip_path, map_location="cpu")
+
+    restore_model(model, clip_state_dict, bert_state_dict).to(device)
 
     if str(device) == "cpu":
         model.float()
     return model
 
-
 def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.LongTensor:
-    """
-    Returns the tokenized representation of given input string(s)
-    Parameters
-    ----------
-    texts : Union[str, List[str]]
-        An input string or a list of input strings to tokenize
-    context_length : int
-        The context length to use; all baseline models use 52 as the context length
-    Returns
-    -------
-    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
-    """
     if isinstance(texts, str):
         texts = [texts]
 
@@ -145,10 +146,8 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.Lo
 
     return result
 
-
 def _convert_to_rgb(image):
     return image.convert('RGB')
-
 
 def image_transform(image_size=224):
     transform = Compose([
@@ -159,18 +158,13 @@ def image_transform(image_size=224):
     ])
     return transform
 
-
 def create_model(model_name, checkpoint=None):
     vision_model, text_model = model_name.split('@')
-    # Initialize the model.
-    vision_model_config_file = Path(
-        __file__).parent / f"model_configs/{vision_model.replace('/', '-')}.json"
-    print('Loading vision model config from', vision_model_config_file)
+
+    vision_model_config_file = Path(__file__).parent / f"model_configs/{vision_model.replace('/', '-')}.json"
     assert os.path.exists(vision_model_config_file)
 
-    text_model_config_file = Path(
-        __file__).parent / f"model_configs/{text_model.replace('/', '-')}.json"
-    print('Loading text model config from', text_model_config_file)
+    text_model_config_file = Path(__file__).parent / f"model_configs/{text_model.replace('/', '-')}.json"
     assert os.path.exists(text_model_config_file)
 
     with open(vision_model_config_file, 'r') as fv, open(text_model_config_file, 'r') as ft:
@@ -179,12 +173,25 @@ def create_model(model_name, checkpoint=None):
             model_info[k] = v
     if isinstance(model_info['vision_layers'], str):
         model_info['vision_layers'] = eval(model_info['vision_layers'])
+
+    # Remove use_flash_attention if it exists in config json (just in case)
+    if 'use_flash_attention' in model_info:
+        del model_info['use_flash_attention']
+
     print('Model info', model_info)
     model = CLIP(**model_info)
     convert_weights(model)
+
     if checkpoint:
-        sd = checkpoint["state_dict"]
-        if next(iter(sd.items()))[0].startswith('module'):
+        # Handle both nested .pt dicts {"state_dict": ...} and flat .safetensors dicts
+        sd = checkpoint
+        if "state_dict" in sd:
+            sd = sd["state_dict"]
+
+        # Clean up DataParallel prefix if exists
+        if next(iter(sd.items()))[0].startswith('module.'):
             sd = {k[len('module.'):]: v for k, v in sd.items() if "bert.pooler" not in k}
-        model.load_state_dict(sd)
+
+        model.load_state_dict(sd, strict=False)
+
     return model

@@ -218,7 +218,7 @@ async def check_service(t: str = ""):
     }
 # --- 修复结束 ---
 
-@app.post("/restart", response_model=RestartResponse)
+@app.post("/restart", respon1se_model=RestartResponse)
 async def restart_service():
     logging.warning("收到 /restart 请求，正在释放模型...")
     if models_instance:
