@@ -3,8 +3,7 @@ import logging
 import os
 import threading
 import gc
-import time
-from typing import List, Callable, Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -22,9 +21,15 @@ from schemas import (
     RepresentResult
 )
 
+# --- 日志净化区域 ---
+# 压制常见的库日志噪音
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("torch").setLevel(logging.WARNING)
+logging.getLogger("insightface").setLevel(logging.WARNING)
+
 # --- 配置 ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logging.warning(f"当前推理设备: {DEVICE} (2GB 显存极致优化版)")
+logging.warning(f"当前推理设备: {DEVICE} (2GB 显存极致优化版 + CLIP热备)")
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
@@ -38,20 +43,20 @@ CONTEXT_LENGTH = 77
 # 限制图片最大边长，防止预处理 OOM
 MAX_IMAGE_SIDE = 2560
 
-logging.getLogger(__name__).setLevel(logging.WARNING)
+# 自动释放时间配置
+AUTO_RELEASE_DELAY = 5.0   # OCR/Face 完成后多久释放
+STANDBY_LOAD_DELAY = 10.0  # 释放完成后多久自动加载 CLIP (热备)
 
 class AIModels:
     """
     针对 MX150 (2GB) 优化的单例模型管理类。
+    包含 CLIP 热备 (Hot-Standby) 逻辑。
     """
     def __init__(self):
         logging.warning(f"初始化 AIModels (Single Slot Mode).")
 
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
         self.clip_cache_root = os.path.join(MODEL_BASE_PATH, "qa-clip")
-
-        # 移除了 self.ocr_root 的定义，因为使用内置模型不再需要指定外部路径
-
         os.makedirs(self.clip_cache_root, exist_ok=True)
 
         # 模型容器
@@ -66,6 +71,7 @@ class AIModels:
         # 线程锁与定时器
         self._lock = threading.RLock()
         self._release_timer: Optional[threading.Timer] = None
+        self._standby_timer: Optional[threading.Timer] = None # 新增：热备加载定时器
 
     def _clean_gpu_memory(self):
         """强制清理 GPU 显存"""
@@ -73,14 +79,23 @@ class AIModels:
             gc.collect()
             torch.cuda.empty_cache()
 
-    def _cancel_timer(self):
+    def _cancel_timers(self):
+        """取消所有挂起的定时任务（释放或加载）"""
         if self._release_timer:
             self._release_timer.cancel()
             self._release_timer = None
 
-    def release_all_models(self, reason: str = "主动释放"):
+        if self._standby_timer:
+            self._standby_timer.cancel()
+            self._standby_timer = None
+
+    def release_all_models(self, reason: str = "主动释放", schedule_standby: bool = True):
+        """
+        释放所有模型。
+        :param schedule_standby: 释放后是否计划自动加载 CLIP 热备
+        """
         with self._lock:
-            self._cancel_timer()
+            self._cancel_timers() # 停止之前的计时
             cleaned = False
 
             if self.ocr_engine:
@@ -93,6 +108,8 @@ class AIModels:
                 self.face_engine = None
                 cleaned = True
 
+            # 注意：如果是 CLIP 且当前策略是热备，这里也会被释放
+            # 只有在 _switch_to 需要腾位置时，或者 lifespan 关闭时才会调用这里
             if self.clip_model:
                 del self.clip_model
                 self.clip_model = None
@@ -100,64 +117,79 @@ class AIModels:
                 cleaned = True
 
             if cleaned:
-                logging.info(f"[{reason}] 已释放所有模型资源。")
                 self.current_loaded_type = None
                 self._clean_gpu_memory()
+                logging.info(f"[{reason}] 已释放所有模型资源。")
+
+            # 【核心逻辑】释放完成后，计划加载 CLIP 热备
+            if schedule_standby and DEVICE == "cuda":
+                logging.info(f"将在 {STANDBY_LOAD_DELAY}s 后加载 CLIP 进入热备状态...")
+                self._standby_timer = threading.Timer(STANDBY_LOAD_DELAY, self._load_clip_standby_worker)
+                self._standby_timer.start()
 
     def release_models(self):
-        self.release_all_models(reason="外部调用 release")
+        # 外部调用的释放（如 API /restart），不自动触发热备，或者根据需求触发
+        # 这里设定为触发热备，保持服务活性
+        self.release_all_models(reason="外部调用 release", schedule_standby=True)
+
+    def _load_clip_standby_worker(self):
+        """热备加载的工作线程函数"""
+        with self._lock:
+            # 如果当前已经加载了其他东西（可能在等待期间来了新请求），则放弃加载
+            if self.current_loaded_type is not None:
+                return
+
+            logging.info(">>> 触发热备机制：自动加载 CLIP 模型...")
+            try:
+                self._load_clip_safe()
+            except Exception as e:
+                logging.error(f"热备加载 CLIP 失败: {e}")
 
     # --- 内部加载逻辑 ---
 
     def _load_clip_safe(self):
+        if self.clip_model is not None: return
+
         logging.info(f"正在加载 CLIP ({CLIP_MODEL_NAME})...")
         try:
-            # 1. Load CLIP
+            # 捕获可能的标准输出噪音
             model, preprocess = clip.load_from_name(
                 CLIP_MODEL_NAME,
                 device=DEVICE,
                 download_root=self.clip_cache_root
             )
             model.eval()
-
-            # 不再手动调用 .half()，依赖加载时的自动处理
-
             self.clip_model = model
             self.clip_preprocess = preprocess
             self.current_loaded_type = "clip"
+            logging.info("CLIP 模型加载完毕 (Ready).")
         except Exception as e:
             logging.error(f"CLIP 加载失败: {e}")
             raise e
 
     def _load_ocr_safe(self):
-        logging.info("正在加载 RapidOCR (使用内置模型)...")
+        logging.info("正在加载 RapidOCR...")
         use_cuda = (DEVICE == "cuda")
-
         try:
-            # 【核心修改】：不传入 model_path，默认使用 pip 包内自带的模型
+            # 屏蔽 RapidOCR 初始化时的部分日志
+            logging.getLogger().setLevel(logging.ERROR)
             self.ocr_engine = RapidOCR(
                 det_use_cuda=use_cuda,
                 cls_use_cuda=use_cuda,
                 rec_use_cuda=use_cuda
             )
+            logging.getLogger().setLevel(logging.WARNING) # 恢复
+
             self.current_loaded_type = "ocr"
             logging.info(f"RapidOCR 加载成功 (CUDA={use_cuda})")
         except Exception as e:
-            logging.error(f"OCR 加载失败 (详情): {repr(e)}")
-            # 尝试回退到 CPU 模式
+            logging.getLogger().setLevel(logging.WARNING) # 确保恢复
+            logging.error(f"OCR 加载失败: {repr(e)}")
+            # 回退逻辑...
             if use_cuda:
-                logging.warning("尝试回退到 CPU 模式加载 OCR...")
-                try:
-                    self.ocr_engine = RapidOCR(
-                        det_use_cuda=False,
-                        cls_use_cuda=False,
-                        rec_use_cuda=False
-                    )
-                    self.current_loaded_type = "ocr"
-                    logging.info("RapidOCR CPU 回退模式加载成功")
-                    return
-                except Exception as ex_cpu:
-                    logging.error(f"OCR CPU 回退也失败: {ex_cpu}")
+                self.ocr_engine = RapidOCR(det_use_cuda=False, cls_use_cuda=False, rec_use_cuda=False)
+                self.current_loaded_type = "ocr"
+                return
             raise e
 
     def _load_face_safe(self):
@@ -165,25 +197,37 @@ class AIModels:
         try:
             providers = ['CUDAExecutionProvider'] if DEVICE == 'cuda' else ['CPUExecutionProvider']
             app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
-
-            # 2GB 显存核心配置：det_size 320 是 MX150 的极限
             app.prepare(ctx_id=0, det_size=(320, 320))
-
             self.face_engine = app
             self.current_loaded_type = "face"
+            logging.info("InsightFace 加载成功.")
         except Exception as e:
             logging.error(f"InsightFace 加载失败: {e}")
             raise e
 
     def _switch_to(self, target_type: str):
         with self._lock:
-            self._cancel_timer()
+            # 1. 无论如何，只要有请求进来，先取消“热备加载计时器”
+            if self._standby_timer:
+                self._standby_timer.cancel()
+                self._standby_timer = None
+
+            # 2. 如果目标就是当前类型，直接取消“释放计时器”并返回（续命）
             if self.current_loaded_type == target_type:
+                if self._release_timer:
+                    self._release_timer.cancel()
+                    self._release_timer = None
                 return
 
+            # 3. 如果当前有模型且类型不同，必须释放
+            # 特殊情况：如果当前是 CLIP (可能是热备的)，而目标是 OCR/Face
+            # 需要立即释放 CLIP 给重型任务腾出显存
             if self.current_loaded_type is not None:
-                self.release_all_models(reason="模型切换抢占")
+                # 注意：这里调用 release_all_models 时传入 False，防止递归或冲突
+                # 因为我们马上就要加载新模型，不需要调度热备
+                self.release_all_models(reason=f"切换模型: {self.current_loaded_type}->{target_type}", schedule_standby=False)
 
+            # 4. 加载新模型
             self._clean_gpu_memory()
             if target_type == "clip":
                 self._load_clip_safe()
@@ -192,9 +236,14 @@ class AIModels:
             elif target_type == "face":
                 self._load_face_safe()
 
-    def _schedule_auto_release(self, delay: float = 5.0):
-        self._cancel_timer()
-        self._release_timer = threading.Timer(delay, lambda: self.release_all_models(reason="超时自动释放"))
+    def _schedule_auto_release(self):
+        """安排在 5秒后释放模型 (用于 OCR 和 Face)"""
+        if self._release_timer:
+            self._release_timer.cancel()
+
+        # 只有 OCR 和 Face 需要释放后重新进入热备循环
+        # CLIP 自身不需要释放，因为它就是热备目标
+        self._release_timer = threading.Timer(AUTO_RELEASE_DELAY, lambda: self.release_all_models(reason="任务完成自动释放", schedule_standby=True))
         self._release_timer.start()
 
     def _preprocess_image_size(self, image: np.ndarray) -> np.ndarray:
@@ -206,7 +255,9 @@ class AIModels:
         return image
 
     def ensure_clip_text_model_loaded(self):
-        pass
+        # 启动时调用，直接加载 CLIP
+        with self._lock:
+            self._switch_to("clip")
 
     # --- 业务接口 ---
 
@@ -215,14 +266,15 @@ class AIModels:
             try:
                 self._switch_to("ocr")
                 image = self._preprocess_image_size(image)
-                # RapidOCR 返回值结构: result, elapse
                 result, _ = self.ocr_engine(image)
+
+                # 必须调度释放，以便腾出空间给 CLIP 热备
+                self._schedule_auto_release()
 
                 if not result: return OCRResult(texts=[], scores=[], boxes=[])
 
                 texts, scores, boxes = [], [], []
                 for line in result:
-                    # line format: [coordinates, text, score]
                     coords, text, score = line
                     if not text: continue
                     texts.append(str(text))
@@ -246,6 +298,10 @@ class AIModels:
                 self._switch_to("face")
                 image = self._preprocess_image_size(image)
                 faces = self.face_engine.get(image)
+
+                # 【修复】之前遗漏了这里，现在加上自动释放
+                self._schedule_auto_release()
+
                 results = []
                 for face in faces:
                     bbox = np.array(face.bbox).astype(int)
@@ -265,8 +321,6 @@ class AIModels:
             try:
                 self._switch_to("clip")
                 image_input = self.clip_preprocess(image).unsqueeze(0).to(DEVICE)
-
-                # 兼容性处理：如果设备是 CUDA，输入转为 Half
                 if DEVICE == "cuda":
                     image_input = image_input.half()
 
@@ -274,7 +328,9 @@ class AIModels:
                     features = self.clip_model.encode_image(image_input)
                     features = features / features.norm(dim=-1, keepdim=True)
 
-                self._schedule_auto_release(5.0)
+                # CLIP 请求结束后，不应该调度释放
+                # 因为 CLIP 是我们的热备模型，它应该一直呆在显存里，除非 OCR/Face 来抢
+                # 只有当用户显式调用释放接口时才释放
                 return features.cpu().numpy().flatten().tolist()
             except Exception as e:
                 logging.error(f"CLIP Image Inference Error: {e}")
@@ -291,7 +347,7 @@ class AIModels:
                     features = self.clip_model.encode_text(text_input)
                     features = features / features.norm(dim=-1, keepdim=True)
 
-                self._schedule_auto_release(5.0)
+                # CLIP 驻留，不释放
                 return features.cpu().numpy().flatten().tolist()
             except Exception as e:
                 logging.error(f"CLIP Text Inference Error: {e}")
