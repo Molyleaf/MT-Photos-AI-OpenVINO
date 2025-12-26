@@ -7,7 +7,7 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
-# --- 【新增：强制 Windows 控制台使用 UTF-8 编码】 ---
+# --- 强制 Windows 控制台使用 UTF-8 编码 ---
 if sys.platform == "win32":
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
