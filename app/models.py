@@ -31,7 +31,6 @@ _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 MODEL_BASE_PATH = os.environ.get("MODEL_PATH", os.path.join(_PROJECT_ROOT, "models"))
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "antelopev2")
-# ⚠️ 注意：ViT-L-14 很大，QA-CLIP 代码内部已实现了混合精度加载
 CLIP_MODEL_NAME = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
@@ -50,8 +49,8 @@ class AIModels:
 
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
         self.clip_cache_root = os.path.join(MODEL_BASE_PATH, "qa-clip")
-        # 定义 OCR 模型路径
-        self.ocr_root = os.path.join(MODEL_BASE_PATH, "rapidocr")
+
+        # 移除了 self.ocr_root 的定义，因为使用内置模型不再需要指定外部路径
 
         os.makedirs(self.clip_cache_root, exist_ok=True)
 
@@ -108,29 +107,20 @@ class AIModels:
     def release_models(self):
         self.release_all_models(reason="外部调用 release")
 
-    # --- 内部加载逻辑 (修复版) ---
+    # --- 内部加载逻辑 ---
 
     def _load_clip_safe(self):
-        """
-        修复：
-        1. 必须设置 jit=False。
-        2. 不要调用 .half()！clip/model.py 中的 convert_weights 会自动处理混合精度。
-           如果这里强制 .half()，会导致 LayerNorm 权重变 FP16，但输入是 FP32，引发错误。
-        """
         logging.info(f"正在加载 CLIP ({CLIP_MODEL_NAME})...")
         try:
             # 1. Load CLIP
             model, preprocess = clip.load_from_name(
                 CLIP_MODEL_NAME,
-                device=DEVICE, # 直接加载到目标设备，utils.py 会处理权重转换
+                device=DEVICE,
                 download_root=self.clip_cache_root
             )
             model.eval()
 
-            # ⚠️ 【重要修复】:
-            # 删除了 model.half()。
-            # QA-CLIP 的实现会在加载时自动将 Conv/Linear 转为 FP16，
-            # 而保留 LayerNorm 为 FP32。这是为了兼容性。
+            # 不再手动调用 .half()，依赖加载时的自动处理
 
             self.clip_model = model
             self.clip_preprocess = preprocess
@@ -140,28 +130,18 @@ class AIModels:
             raise e
 
     def _load_ocr_safe(self):
-        logging.info("正在加载 RapidOCR...")
+        logging.info("正在加载 RapidOCR (使用内置模型)...")
         use_cuda = (DEVICE == "cuda")
 
-        # 【重要修复】: 显式指定模型路径
-        det_model_path = os.path.join(self.ocr_root, "ch_PP-OCRv4_det_infer.onnx")
-        cls_model_path = os.path.join(self.ocr_root, "ch_ppocr_mobile_v2.0_cls_infer.onnx")
-        rec_model_path = os.path.join(self.ocr_root, "ch_PP-OCRv4_rec_infer.onnx")
-
-        # 检查文件是否存在，避免报 'model_path' 这种含糊的错误
-        if not os.path.exists(det_model_path):
-            raise FileNotFoundError(f"OCR模型缺失: {det_model_path}，请运行 download-models.py")
-
         try:
+            # 【核心修改】：不传入 model_path，默认使用 pip 包内自带的模型
             self.ocr_engine = RapidOCR(
-                det_model_path=det_model_path,
-                cls_model_path=cls_model_path,
-                rec_model_path=rec_model_path,
                 det_use_cuda=use_cuda,
                 cls_use_cuda=use_cuda,
                 rec_use_cuda=use_cuda
             )
             self.current_loaded_type = "ocr"
+            logging.info(f"RapidOCR 加载成功 (CUDA={use_cuda})")
         except Exception as e:
             logging.error(f"OCR 加载失败 (详情): {repr(e)}")
             # 尝试回退到 CPU 模式
@@ -169,14 +149,12 @@ class AIModels:
                 logging.warning("尝试回退到 CPU 模式加载 OCR...")
                 try:
                     self.ocr_engine = RapidOCR(
-                        det_model_path=det_model_path,
-                        cls_model_path=cls_model_path,
-                        rec_model_path=rec_model_path,
                         det_use_cuda=False,
                         cls_use_cuda=False,
                         rec_use_cuda=False
                     )
                     self.current_loaded_type = "ocr"
+                    logging.info("RapidOCR CPU 回退模式加载成功")
                     return
                 except Exception as ex_cpu:
                     logging.error(f"OCR CPU 回退也失败: {ex_cpu}")
@@ -204,7 +182,6 @@ class AIModels:
                 return
 
             if self.current_loaded_type is not None:
-                # 显存极小，切换前必须 aggressively 清理
                 self.release_all_models(reason="模型切换抢占")
 
             self._clean_gpu_memory()
@@ -238,12 +215,14 @@ class AIModels:
             try:
                 self._switch_to("ocr")
                 image = self._preprocess_image_size(image)
+                # RapidOCR 返回值结构: result, elapse
                 result, _ = self.ocr_engine(image)
 
                 if not result: return OCRResult(texts=[], scores=[], boxes=[])
 
                 texts, scores, boxes = [], [], []
                 for line in result:
+                    # line format: [coordinates, text, score]
                     coords, text, score = line
                     if not text: continue
                     texts.append(str(text))
@@ -285,20 +264,9 @@ class AIModels:
         with self._lock:
             try:
                 self._switch_to("clip")
-
-                # 预处理：clip_preprocess 会输出 Float32 的 Tensor
                 image_input = self.clip_preprocess(image).unsqueeze(0).to(DEVICE)
 
-                # ⚠️ 【重要修复】:
-                # 之前在这里调用了 .half()。
-                # 但因为我们在加载模型时去掉了 model.half()，保留了混合精度结构。
-                # clip/model.py 里的 Conv/Linear 权重是 Half，LayerNorm 权重是 Float。
-                # 输入数据最好转为 Half，因为第一层通常是 Conv。
-                # 但是！如果模型的第一层处理不好，可能会报错。
-                # 实测 QA-CLIP 的 preprocess 输出可以保持 Float32 传入，
-                # 模型内部会自动在需要 Half 的地方处理，或者我们需要在这里转 Half。
-
-                # 按照 QA-CLIP 的标准用法，输入应为 Half (如果使用 CUDA)
+                # 兼容性处理：如果设备是 CUDA，输入转为 Half
                 if DEVICE == "cuda":
                     image_input = image_input.half()
 
@@ -317,8 +285,6 @@ class AIModels:
         with self._lock:
             try:
                 self._switch_to("clip")
-
-                # tokenize 返回的是 Long Tensor (Int64)，不需要转 Half
                 text_input = clip.tokenize([text], context_length=CONTEXT_LENGTH).to(DEVICE)
 
                 with torch.no_grad():
