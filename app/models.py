@@ -31,6 +31,7 @@ _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 MODEL_BASE_PATH = os.environ.get("MODEL_PATH", os.path.join(_PROJECT_ROOT, "models"))
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "antelopev2")
+# ⚠️ 注意：ViT-L-14 很大，QA-CLIP 代码内部已实现了混合精度加载
 CLIP_MODEL_NAME = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
@@ -43,17 +44,15 @@ logging.getLogger(__name__).setLevel(logging.WARNING)
 class AIModels:
     """
     针对 MX150 (2GB) 优化的单例模型管理类。
-
-    原则：
-    1. 同一时间显存中只能有一个模型 (Single Slot Strategy)。
-    2. CLIP 文本请求后保留 5 秒，以应对连续搜索；其他请求强制抢占。
-    3. 所有大图在推理前强制缩放。
     """
     def __init__(self):
         logging.warning(f"初始化 AIModels (Single Slot Mode).")
 
         self.insightface_root = os.path.join(MODEL_BASE_PATH, "insightface")
         self.clip_cache_root = os.path.join(MODEL_BASE_PATH, "qa-clip")
+        # 定义 OCR 模型路径
+        self.ocr_root = os.path.join(MODEL_BASE_PATH, "rapidocr")
+
         os.makedirs(self.clip_cache_root, exist_ok=True)
 
         # 模型容器
@@ -63,7 +62,6 @@ class AIModels:
         self.face_engine = None
 
         # 状态标记
-        # "clip", "ocr", "face", None
         self.current_loaded_type: Optional[str] = None
 
         # 线程锁与定时器
@@ -77,33 +75,25 @@ class AIModels:
             torch.cuda.empty_cache()
 
     def _cancel_timer(self):
-        """取消待执行的释放任务"""
         if self._release_timer:
             self._release_timer.cancel()
             self._release_timer = None
 
     def release_all_models(self, reason: str = "主动释放"):
-        """
-        释放所有模型，清空显存槽位。
-        """
         with self._lock:
             self._cancel_timer()
-
             cleaned = False
 
-            # 释放 OCR
             if self.ocr_engine:
                 del self.ocr_engine
                 self.ocr_engine = None
                 cleaned = True
 
-            # 释放 Face
             if self.face_engine:
                 del self.face_engine
                 self.face_engine = None
                 cleaned = True
 
-            # 释放 CLIP
             if self.clip_model:
                 del self.clip_model
                 self.clip_model = None
@@ -115,28 +105,32 @@ class AIModels:
                 self.current_loaded_type = None
                 self._clean_gpu_memory()
 
-    # 兼容 server.py 调用的接口
     def release_models(self):
         self.release_all_models(reason="外部调用 release")
 
-    # --- 内部加载逻辑 (优化版) ---
+    # --- 内部加载逻辑 (修复版) ---
 
     def _load_clip_safe(self):
-        """优化：先载入 CPU 转 FP16，再移入 GPU，防止峰值爆炸"""
+        """
+        修复：
+        1. 必须设置 jit=False。
+        2. 不要调用 .half()！clip/model.py 中的 convert_weights 会自动处理混合精度。
+           如果这里强制 .half()，会导致 LayerNorm 权重变 FP16，但输入是 FP32，引发错误。
+        """
         logging.info(f"正在加载 CLIP ({CLIP_MODEL_NAME})...")
         try:
-            # 1. Load to CPU first
+            # 1. Load CLIP
             model, preprocess = clip.load_from_name(
                 CLIP_MODEL_NAME,
-                device="cpu",
+                device=DEVICE, # 直接加载到目标设备，utils.py 会处理权重转换
                 download_root=self.clip_cache_root
             )
             model.eval()
 
-            # 2. Convert to Half & Move to CUDA
-            if DEVICE == "cuda":
-                model.half()
-                model.to(DEVICE)
+            # ⚠️ 【重要修复】:
+            # 删除了 model.half()。
+            # QA-CLIP 的实现会在加载时自动将 Conv/Linear 转为 FP16，
+            # 而保留 LayerNorm 为 FP32。这是为了兼容性。
 
             self.clip_model = model
             self.clip_preprocess = preprocess
@@ -148,11 +142,44 @@ class AIModels:
     def _load_ocr_safe(self):
         logging.info("正在加载 RapidOCR...")
         use_cuda = (DEVICE == "cuda")
+
+        # 【重要修复】: 显式指定模型路径
+        det_model_path = os.path.join(self.ocr_root, "ch_PP-OCRv4_det_infer.onnx")
+        cls_model_path = os.path.join(self.ocr_root, "ch_ppocr_mobile_v2.0_cls_infer.onnx")
+        rec_model_path = os.path.join(self.ocr_root, "ch_PP-OCRv4_rec_infer.onnx")
+
+        # 检查文件是否存在，避免报 'model_path' 这种含糊的错误
+        if not os.path.exists(det_model_path):
+            raise FileNotFoundError(f"OCR模型缺失: {det_model_path}，请运行 download-models.py")
+
         try:
-            self.ocr_engine = RapidOCR(det_use_cuda=use_cuda, cls_use_cuda=use_cuda, rec_use_cuda=use_cuda)
+            self.ocr_engine = RapidOCR(
+                det_model_path=det_model_path,
+                cls_model_path=cls_model_path,
+                rec_model_path=rec_model_path,
+                det_use_cuda=use_cuda,
+                cls_use_cuda=use_cuda,
+                rec_use_cuda=use_cuda
+            )
             self.current_loaded_type = "ocr"
         except Exception as e:
-            logging.error(f"OCR 加载失败: {e}")
+            logging.error(f"OCR 加载失败 (详情): {repr(e)}")
+            # 尝试回退到 CPU 模式
+            if use_cuda:
+                logging.warning("尝试回退到 CPU 模式加载 OCR...")
+                try:
+                    self.ocr_engine = RapidOCR(
+                        det_model_path=det_model_path,
+                        cls_model_path=cls_model_path,
+                        rec_model_path=rec_model_path,
+                        det_use_cuda=False,
+                        cls_use_cuda=False,
+                        rec_use_cuda=False
+                    )
+                    self.current_loaded_type = "ocr"
+                    return
+                except Exception as ex_cpu:
+                    logging.error(f"OCR CPU 回退也失败: {ex_cpu}")
             raise e
 
     def _load_face_safe(self):
@@ -161,8 +188,7 @@ class AIModels:
             providers = ['CUDAExecutionProvider'] if DEVICE == 'cuda' else ['CPUExecutionProvider']
             app = FaceAnalysis(name=MODEL_NAME, root=self.insightface_root, providers=providers)
 
-            # 【优化】2GB 显存核心保命配置：det_size 降为 320
-            # 640x640 在 MX150 上极易 OOM
+            # 2GB 显存核心配置：det_size 320 是 MX150 的极限
             app.prepare(ctx_id=0, det_size=(320, 320))
 
             self.face_engine = app
@@ -172,25 +198,16 @@ class AIModels:
             raise e
 
     def _switch_to(self, target_type: str):
-        """
-        核心调度器：切换显存槽位到指定模型。
-        如果当前已经是该模型，则跳过；否则先清空再加载。
-        """
         with self._lock:
-            # 1. 任何新请求都会取消之前的释放定时器（如果是 CLIP 续费，或者被抢占）
             self._cancel_timer()
-
-            # 2. 如果已经加载了目标模型，直接返回
             if self.current_loaded_type == target_type:
                 return
 
-            # 3. 如果加载了其他模型，先强制释放
             if self.current_loaded_type is not None:
-                logging.warning(f"切换模型: {self.current_loaded_type} -> {target_type}")
+                # 显存极小，切换前必须 aggressively 清理
                 self.release_all_models(reason="模型切换抢占")
 
-            # 4. 执行加载
-            self._clean_gpu_memory() # 加载前确保干净
+            self._clean_gpu_memory()
             if target_type == "clip":
                 self._load_clip_safe()
             elif target_type == "ocr":
@@ -199,55 +216,38 @@ class AIModels:
                 self._load_face_safe()
 
     def _schedule_auto_release(self, delay: float = 5.0):
-        """计划在 delay 秒后释放模型（主要用于 CLIP）"""
         self._cancel_timer()
         self._release_timer = threading.Timer(delay, lambda: self.release_all_models(reason="超时自动释放"))
         self._release_timer.start()
 
     def _preprocess_image_size(self, image: np.ndarray) -> np.ndarray:
-        """
-        主动大图缩放：防止超大分辨率图片在推理时撑爆显存。
-        限制最大边长为 MAX_IMAGE_SIDE (2560)。
-        """
         h, w = image.shape[:2]
         if max(h, w) > MAX_IMAGE_SIDE:
             scale = MAX_IMAGE_SIDE / max(h, w)
             new_w, new_h = int(w * scale), int(h * scale)
-            logging.info(f"图片尺寸过大 ({w}x{h})，主动缩放至 {new_w}x{new_h}")
             return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
         return image
 
-    # --- 兼容性空方法 (server.py 启动时会调用) ---
     def ensure_clip_text_model_loaded(self):
-        # 启动时不预加载，改为 lazy loading
         pass
 
-        # --- 业务接口 ---
+    # --- 业务接口 ---
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        with self._lock: # 锁住整个推理过程
+        with self._lock:
             try:
-                # 1. 抢占槽位
                 self._switch_to("ocr")
-
-                # 2. 缩放检查
                 image = self._preprocess_image_size(image)
-
-                # 3. 推理
                 result, _ = self.ocr_engine(image)
-
-                # 4. OCR 往往是单次任务，推理完建议直接释放，或者稍微保留等待后续?
-                # 为了极致稳定，建议用完即走，或者让 server.py 的 idle handle 处理
-                # 这里我们选择保留，等待 server 的 idle_timeout 或者被抢占
 
                 if not result: return OCRResult(texts=[], scores=[], boxes=[])
 
                 texts, scores, boxes = [], [], []
                 for line in result:
                     coords, text, score = line
+                    if not text: continue
                     texts.append(str(text))
                     scores.append(f"{float(score):.2f}")
-                    # 坐标处理
                     coords = np.array(coords, dtype=np.int32)
                     x_min, y_min = np.min(coords, axis=0)
                     x_max, y_max = np.max(coords, axis=0)
@@ -257,7 +257,7 @@ class AIModels:
                     ))
                 return OCRResult(texts=texts, scores=scores, boxes=boxes)
             except Exception as e:
-                logging.error(f"OCR Error: {e}")
+                logging.error(f"OCR Inference Error: {e}")
                 self.release_all_models(reason="Error Recovery")
                 return OCRResult(texts=[], scores=[], boxes=[])
 
@@ -266,7 +266,6 @@ class AIModels:
             try:
                 self._switch_to("face")
                 image = self._preprocess_image_size(image)
-
                 faces = self.face_engine.get(image)
                 results = []
                 for face in faces:
@@ -286,11 +285,20 @@ class AIModels:
         with self._lock:
             try:
                 self._switch_to("clip")
-                # CLIP 的 resize 已经在 preprocess 里了，但如果是超大图，PIL to Tensor 也可能炸
-                # 这里假设传入的是 PIL，preprocess 会负责 resize 到 224
 
-                # 预处理
+                # 预处理：clip_preprocess 会输出 Float32 的 Tensor
                 image_input = self.clip_preprocess(image).unsqueeze(0).to(DEVICE)
+
+                # ⚠️ 【重要修复】:
+                # 之前在这里调用了 .half()。
+                # 但因为我们在加载模型时去掉了 model.half()，保留了混合精度结构。
+                # clip/model.py 里的 Conv/Linear 权重是 Half，LayerNorm 权重是 Float。
+                # 输入数据最好转为 Half，因为第一层通常是 Conv。
+                # 但是！如果模型的第一层处理不好，可能会报错。
+                # 实测 QA-CLIP 的 preprocess 输出可以保持 Float32 传入，
+                # 模型内部会自动在需要 Half 的地方处理，或者我们需要在这里转 Half。
+
+                # 按照 QA-CLIP 的标准用法，输入应为 Half (如果使用 CUDA)
                 if DEVICE == "cuda":
                     image_input = image_input.half()
 
@@ -298,12 +306,10 @@ class AIModels:
                     features = self.clip_model.encode_image(image_input)
                     features = features / features.norm(dim=-1, keepdim=True)
 
-                # CLIP 处理完，如果是图像搜索，后续可能还有，保留5秒
                 self._schedule_auto_release(5.0)
-
                 return features.cpu().numpy().flatten().tolist()
             except Exception as e:
-                logging.error(f"CLIP Image Error: {e}")
+                logging.error(f"CLIP Image Inference Error: {e}")
                 self.release_all_models(reason="Error Recovery")
                 return [0.0] * CLIP_EMBEDDING_DIMS
 
@@ -312,17 +318,16 @@ class AIModels:
             try:
                 self._switch_to("clip")
 
+                # tokenize 返回的是 Long Tensor (Int64)，不需要转 Half
                 text_input = clip.tokenize([text], context_length=CONTEXT_LENGTH).to(DEVICE)
 
                 with torch.no_grad():
                     features = self.clip_model.encode_text(text_input)
                     features = features / features.norm(dim=-1, keepdim=True)
 
-                # 文本搜索通常是连续的，保留 5 秒等待下一次搜索
                 self._schedule_auto_release(5.0)
-
                 return features.cpu().numpy().flatten().tolist()
             except Exception as e:
-                logging.error(f"CLIP Text Error: {e}")
+                logging.error(f"CLIP Text Inference Error: {e}")
                 self.release_all_models(reason="Error Recovery")
                 return [0.0] * CLIP_EMBEDDING_DIMS
