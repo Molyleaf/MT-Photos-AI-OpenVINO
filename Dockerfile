@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     INFERENCE_DEVICE=GPU \
     WEB_CONCURRENCY=2 \
     OV_CACHE_DIR=/models/cache/openvino \
-    RAPIDOCR_OPENVINO_CONFIG_PATH=/example/cfg_openvino_cpu.yaml \
+    RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
     RAPIDOCR_MODEL_DIR=/models/rapidocr
 
 USER root
@@ -52,7 +52,6 @@ RUN mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidoc
 
 COPY models/qa-clip/openvino /models/qa-clip/openvino
 COPY models/insightface/models /models/insightface/models
-COPY app/config/cfg_openvino_cpu.yaml /example/cfg_openvino_cpu.yaml
 COPY app /app
 
 EXPOSE 8060

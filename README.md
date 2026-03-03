@@ -14,6 +14,7 @@
 - QA-CLIP 固定为 `TencentARC/QA-CLIP-ViT-L-14`，模型来源为 Hugging Face。
 - QA-CLIP 代码依赖从 `app/QA-CLIP/clip` 引用，不使用历史 `/app/clip` 路径。
 - QA-CLIP 推理默认设备 `GPU`（可通过 `INFERENCE_DEVICE` 覆盖），OpenVINO 优先启用 GPU remote context。
+- 推理运行时不依赖 `torch/torchvision/transformers/nncf`，仅在执行 `app/convert.py` 转换时按需安装。
 - RapidOCR 固定 `rapidocr==3.6.0`，使用 OpenVINO **CPU** 后端。
 - InsightFace 固定 ONNX Runtime，provider 顺序为 `OpenVINOExecutionProvider -> CPUExecutionProvider`。
 
@@ -42,7 +43,7 @@
 | `SERVER_IDLE_TIMEOUT` | 空闲释放触发时间（秒） | `300` |
 | `RESTART_TEXT_RESTORE_DELAY_MS` | `/restart` 后恢复 Text-CLIP 的等待时长（毫秒） | `5000` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录 | `<repo>/cache/openvino` |
-| `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR OpenVINO 配置文件 | `example/cfg_openvino_cpu.yaml` |
+| `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR OpenVINO 配置文件 | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR` | RapidOCR 本地模型目录（建议镜像构建前预下载） | `<repo>/models/rapidocr` |
 | `RAPIDOCR_FONT_PATH` | RapidOCR 字体路径（可选） | 空 |
 | `INSIGHTFACE_OV_DEVICE` | InsightFace OpenVINO EP 设备类型 | `CPU_FP32` |
@@ -51,7 +52,7 @@
 
 ## RapidOCR OpenVINO CPU 配置
 
-示例文件: [example/cfg_openvino_cpu.yaml](app/config/cfg_openvino_cpu.yaml)
+示例文件: [app/config/cfg_openvino_cpu.yaml](app/config/cfg_openvino_cpu.yaml)
 
 关键参数（均已在服务端支持）：
 
@@ -70,9 +71,22 @@
 特性：
 
 - 从 Hugging Face 拉取 QA-CLIP 后转换 OpenVINO IR
+- 不依赖仓库顶层 `scripts/` 目录
 - 视觉/文本分支顺序转换，阶段结束立即 `gc.collect()`
 - 导出使用 `compress_to_fp16=True`
-- 预置 NNCF 关键层忽略策略（LayerNorm/投影等），可通过环境变量选择是否启用 `nncf.compress_weights`
+- 预置 NNCF 关键层忽略策略（LayerNorm/投影等）；仅在显式开启压缩时才需要安装 `nncf`
+
+转换前按需安装依赖（不写入 `requirements.txt`）：
+
+```bash
+pip install openvino torch transformers
+```
+
+如需启用 NNCF 权重压缩，再额外安装：
+
+```bash
+pip install nncf
+```
 
 执行：
 

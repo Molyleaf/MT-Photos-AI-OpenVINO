@@ -1,23 +1,13 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
 numpy==2.3.5
-dill==0.4.0
-multiprocess==0.70.18
-albucore==0.0.24
-opencv-python
 opencv-python-headless
-antlr4-python3-runtime
 insightface
-transformers
 fastapi
 pydantic
 openvino
-nncf
 rapidocr==3.6.0
 onnxruntime-openvino
 uvicorn
 python-multipart
 pyyaml
 pillow
-opencv-python
+six

@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -22,15 +23,12 @@ from rapidocr import RapidOCR
 _APP_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _APP_DIR.parent
 _QA_CLIP_ROOT = _APP_DIR / "QA-CLIP"
+_QA_CLIP_CLIP_ROOT = _QA_CLIP_ROOT / "clip"
 
-if str(_QA_CLIP_ROOT) not in sys.path:
-    sys.path.insert(0, str(_QA_CLIP_ROOT))
+if str(_QA_CLIP_CLIP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_QA_CLIP_CLIP_ROOT))
 
-import clip  # noqa: E402
-try:  # noqa: E402
-    from clip.utils import MODEL_INFO, image_transform  # noqa: E402
-except ImportError:  # noqa: E402
-    from clip.utils import _MODEL_INFO as MODEL_INFO, image_transform  # noqa: E402
+from bert_tokenizer import FullTokenizer  # noqa: E402
 
 from schemas import FacialArea, OCRBox, OCRResult, RepresentResult
 
@@ -38,15 +36,55 @@ INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "GPU")
 CLIP_INFERENCE_DEVICE = os.environ.get("CLIP_INFERENCE_DEVICE", INFERENCE_DEVICE)
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
-MODEL_ARCH = "ViT-L-14"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
+CLIP_IMAGE_RESOLUTION = 224
+
+_CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32).reshape(1, 1, 3)
+_CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32).reshape(1, 1, 3)
+try:
+    _PIL_BICUBIC = Image.Resampling.BICUBIC
+except AttributeError:
+    _PIL_BICUBIC = Image.BICUBIC
+
+_TOKENIZER = FullTokenizer()
+_PAD_TOKEN_ID = int(_TOKENIZER.vocab["[PAD]"])
+_CLS_TOKEN_ID = int(_TOKENIZER.vocab["[CLS]"])
+_SEP_TOKEN_ID = int(_TOKENIZER.vocab["[SEP]"])
 
 QUEUE_MAX_SIZE = int(os.environ.get("INFERENCE_QUEUE_MAX_SIZE", "64"))
 TEXT_BATCH_SIZE = int(os.environ.get("TEXT_CLIP_BATCH_SIZE", "8"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "120"))
 
 LOG = logging.getLogger(__name__)
+
+
+def _patch_rapidocr_openvino_multi_output() -> None:
+    try:
+        from rapidocr.inference_engine.openvino.main import OpenVINOError, OpenVINOInferSession
+    except Exception:
+        return
+
+    if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
+        return
+
+    # RapidOCR 3.6.0 OpenVINO session assumes single output; server det models are multi-output.
+    def _patched_call(self: Any, input_content: np.ndarray) -> Any:
+        try:
+            self.session.infer(inputs=[input_content])
+            outputs = getattr(self.session, "model_outputs", [])
+            if len(outputs) > 1:
+                return self.session.get_output_tensor(0).data
+            return self.session.get_output_tensor().data
+        except Exception as exc:
+            error_info = traceback.format_exc()
+            raise OpenVINOError(error_info) from exc
+
+    OpenVINOInferSession.__call__ = _patched_call  # type: ignore[assignment]
+    OpenVINOInferSession._mt_multi_output_patch = True  # type: ignore[attr-defined]
+
+
+_patch_rapidocr_openvino_multi_output()
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -71,6 +109,34 @@ def _as_int(value: Any, default: int) -> int:
 
 def _format_ov_bool(value: bool) -> str:
     return "YES" if value else "NO"
+
+
+def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -> np.ndarray:
+    if context_length < 2:
+        raise ValueError("context_length must be >= 2")
+
+    token_rows: List[List[int]] = []
+    for text in texts:
+        token_ids = _TOKENIZER.convert_tokens_to_ids(_TOKENIZER.tokenize(text))
+        token_ids = token_ids[: context_length - 2]
+        row = [_CLS_TOKEN_ID, *token_ids, _SEP_TOKEN_ID]
+        token_rows.append(row[:context_length])
+
+    result = np.zeros((len(token_rows), context_length), dtype=np.int64)
+    for index, row in enumerate(token_rows):
+        result[index, : len(row)] = np.asarray(row, dtype=np.int64)
+    return result
+
+
+def _preprocess_clip_image(
+    image: Image.Image,
+    image_resolution: int = CLIP_IMAGE_RESOLUTION,
+) -> np.ndarray:
+    resized = image.convert("RGB").resize((image_resolution, image_resolution), _PIL_BICUBIC)
+    pixel_values = np.asarray(resized, dtype=np.float32) / 255.0
+    pixel_values = (pixel_values - _CLIP_IMAGE_MEAN) / _CLIP_IMAGE_STD
+    chw = np.transpose(pixel_values, (2, 0, 1))
+    return np.expand_dims(chw, axis=0)
 
 
 TaskType = Literal["clip_txt", "clip_img", "ocr", "face", "warmup_text"]
@@ -107,7 +173,7 @@ class AIModels:
         self.rapidocr_config_path = Path(
             os.environ.get(
                 "RAPIDOCR_OPENVINO_CONFIG_PATH",
-                str(_PROJECT_ROOT / "example" / "cfg_openvino_cpu.yaml"),
+                str(_APP_DIR / "config" / "cfg_openvino_cpu.yaml"),
             )
         )
         self.rapidocr_model_dir = os.environ.get(
@@ -127,7 +193,7 @@ class AIModels:
         self._clip_text_request: Optional[ov.InferRequest] = None
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
-        self._clip_image_preprocessor = None
+        self._clip_image_resolution: Optional[int] = None
         self._rapidocr_engine: Optional[RapidOCR] = None
         self._face_engine: Optional[FaceAnalysis] = None
 
@@ -412,7 +478,7 @@ class AIModels:
         elif self._active_family == "vision":
             self._clip_vision_request = None
             self._clip_vision_model = None
-            self._clip_image_preprocessor = None
+            self._clip_image_resolution = None
         elif self._active_family == "ocr":
             self._rapidocr_engine = None
         elif self._active_family == "face":
@@ -426,7 +492,7 @@ class AIModels:
         self._clip_text_model = None
         self._clip_vision_request = None
         self._clip_vision_model = None
-        self._clip_image_preprocessor = None
+        self._clip_image_resolution = None
         self._rapidocr_engine = None
         self._face_engine = None
         self._active_family = None
@@ -486,7 +552,7 @@ class AIModels:
 
         self._clip_vision_model = compiled_model
         self._clip_vision_request = compiled_model.create_infer_request()
-        self._clip_image_preprocessor = image_transform(MODEL_INFO[MODEL_ARCH]["input_resolution"])
+        self._clip_image_resolution = CLIP_IMAGE_RESOLUTION
         LOG.warning("CLIP Vision model loaded on %s.", CLIP_INFERENCE_DEVICE)
 
     def _load_rapidocr_server_config(self) -> Dict[str, Any]:
@@ -665,9 +731,8 @@ class AIModels:
         if not self._clip_text_model or not self._clip_text_request:
             raise RuntimeError("CLIP text model is not loaded.")
 
-        input_ids = clip.tokenize(texts, context_length=CONTEXT_LENGTH).numpy()
-        pad_token_id = clip._tokenizer.vocab["[PAD]"]
-        attention_mask = np.array(input_ids != pad_token_id, dtype=np.int64)
+        input_ids = _tokenize_for_clip(texts, context_length=CONTEXT_LENGTH)
+        attention_mask = np.array(input_ids != _PAD_TOKEN_ID, dtype=np.int64)
 
         input_name_0 = self._clip_text_model.inputs[0].any_name
         input_name_1 = self._clip_text_model.inputs[1].any_name
@@ -688,11 +753,17 @@ class AIModels:
         return [[float(value) for value in row] for row in embeddings]
 
     def _infer_clip_image(self, image: Image.Image, filename: str) -> List[float]:
-        if not self._clip_vision_model or not self._clip_vision_request or not self._clip_image_preprocessor:
+        if (
+            not self._clip_vision_model
+            or not self._clip_vision_request
+            or self._clip_image_resolution is None
+        ):
             raise RuntimeError("CLIP vision model is not loaded.")
 
-        inputs = self._clip_image_preprocessor(image).unsqueeze(0)
-        pixel_values = inputs.numpy()
+        pixel_values = _preprocess_clip_image(
+            image=image,
+            image_resolution=self._clip_image_resolution,
+        )
 
         outputs = self._clip_vision_request.infer(
             {self._clip_vision_model.inputs[0].any_name: pixel_values}
@@ -710,7 +781,19 @@ class AIModels:
             raise RuntimeError("RapidOCR model is not loaded.")
 
         raw_result = self._rapidocr_engine(image)
-        if isinstance(raw_result, tuple):
+        ocr_items: Any
+        if all(hasattr(raw_result, field) for field in ("boxes", "txts", "scores")):
+            boxes_data = getattr(raw_result, "boxes", None)
+            txts_data = getattr(raw_result, "txts", None) or ()
+            scores_data = getattr(raw_result, "scores", None) or ()
+            if boxes_data is None:
+                ocr_items = []
+            else:
+                count = min(len(boxes_data), len(txts_data), len(scores_data))
+                ocr_items = [
+                    (boxes_data[idx], txts_data[idx], scores_data[idx]) for idx in range(count)
+                ]
+        elif isinstance(raw_result, tuple):
             ocr_items = raw_result[0]
         else:
             ocr_items = raw_result
