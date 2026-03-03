@@ -1,4 +1,3 @@
-# app/clip/__init__.py
 from .bert_tokenizer import FullTokenizer
 
 _tokenizer = FullTokenizer()

@@ -1,4 +1,3 @@
-# app/clip/model.py
 from collections import OrderedDict
 from typing import Tuple, Union
 from itertools import repeat
@@ -16,9 +15,9 @@ import importlib.util
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
-from . import _tokenizer
-from .configuration_bert import BertConfig
-from .modeling_bert import BertModel
+from clip import _tokenizer
+from clip.configuration_bert import BertConfig
+from clip.modeling_bert import BertModel
 
 try:
     from transformers import CLIPTextModelWithProjection
@@ -152,7 +151,6 @@ class ModifiedResNet(nn.Module):
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
-        # FIXME support for non-transformer
         pass
 
     def forward(self, x):
@@ -701,6 +699,11 @@ class CLIP4SD(nn.Module):
             return self.visual(image.type(self.dtype))
         return self.visual(image.type(self.dtype), mask_ratio)
 
+    # def encode_text(self, text):
+    #     pad_index = self.tokenizer.vocab['[PAD]']
+    #     attn_mask = text.ne(pad_index).type(self.dtype)
+    #     x = self.bert(text, attention_mask=attn_mask)[0].type(self.dtype) # [batch_size, seq_length, hidden_size]
+    #     return x[:, 0, :] @ self.text_projection
     def encode_text(self, text):
         pad_index = self.tokenizer.vocab['[PAD]']
         attn_mask = text.ne(pad_index).type(self.dtype)
@@ -867,7 +870,7 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
     if old_pos_embed is None or not hasattr(model.visual, 'grid_size'):
         return
     grid_size = to_2tuple(model.visual.grid_size)
-    extra_tokens = 1  # FIXME detect different token configs (ie no class token, or more)
+    extra_tokens = 1
     new_seq_len = grid_size[0] * grid_size[1] + extra_tokens
     if new_seq_len == old_pos_embed.shape[0]:
         return
@@ -893,6 +896,7 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
         new_pos_embed = pos_emb_img
     state_dict[prefix + 'visual.positional_embedding'] = new_pos_embed
 
+
 # From PyTorch internals
 def _ntuple(n):
     def parse(x):
@@ -900,6 +904,7 @@ def _ntuple(n):
             return x
         return tuple(repeat(x, n))
     return parse
+
 
 to_1tuple = _ntuple(1)
 to_2tuple = _ntuple(2)
