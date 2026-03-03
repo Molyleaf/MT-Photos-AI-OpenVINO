@@ -28,14 +28,15 @@ _QA_CLIP_CLIP_ROOT = _QA_CLIP_ROOT / "clip"
 if str(_QA_CLIP_CLIP_ROOT) not in sys.path:
     sys.path.insert(0, str(_QA_CLIP_CLIP_ROOT))
 
+# noinspection PyUnresolvedReferences
 from bert_tokenizer import FullTokenizer  # noqa: E402
 
 from schemas import FacialArea, OCRBox, OCRResult, RepresentResult
 
-INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "GPU")
+INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
 CLIP_INFERENCE_DEVICE = os.environ.get("CLIP_INFERENCE_DEVICE", INFERENCE_DEVICE)
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "buffalo_l")
+MODEL_NAME = os.environ.get("MODEL_NAME", "antelopv2")
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 CLIP_IMAGE_RESOLUTION = 224
