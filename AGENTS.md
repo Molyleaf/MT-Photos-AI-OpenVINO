@@ -155,7 +155,7 @@
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
 1. 待机状态下，Text-CLIP 常驻内存（优化文本请求时延）。
-2. 在收到 `POST /restart` 之后立即释放当前模型， 如果 5000ms 内没收到其它类型请求，才加载 Text-CLIP。防止收到 `POST /restart` 之后立刻加载 Text-CLIP，又收到其它请求导致混乱。
+2. 在收到 `POST /restart` 之后立即释放当前模型；若在统一恢复窗口 `TEXT_MODEL_RESTORE_DELAY_MS`（默认 5000ms）内没收到其它类型请求，才加载 Text-CLIP。防止收到 `POST /restart` 之后立刻加载 Text-CLIP，又收到其它请求导致混乱。
 3. 处理 OCR/图像 CLIP/人脸任务时，卸载 Text-CLIP，加载目标模型。
 4. 同一时刻内存/显存中仅允许一个主模型族常驻（Text-CLIP / Vision-CLIP / OCR / Insightface 互斥）。
 5. 请求并发控制必须采用队列化（或等价可证明正确的串行化调度）。
@@ -163,6 +163,7 @@
   - 若当前正在处理其他任务，不抢断当前正在执行的推理；
   - 当前任务结束后，优先处理排队中的文本 CLIP 请求，再继续后续队列；
   - 必须正确处理模型切换与资源回收。
+7. 非文本任务结束且队列瞬时为空时，不应立即回切 Text-CLIP；必须等待 `TEXT_MODEL_RESTORE_DELAY_MS` 窗口后再恢复，避免连续单次 `/clip/img` 触发模型频繁重载。
 
 ---
 

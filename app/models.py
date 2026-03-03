@@ -11,7 +11,7 @@ from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Literal, Optional
+from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import openvino as ov
@@ -107,6 +107,18 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+TEXT_MODEL_RESTORE_DELAY_MS = max(
+    0,
+    _as_int(
+        os.environ.get(
+            "TEXT_MODEL_RESTORE_DELAY_MS",
+            os.environ.get("RESTART_TEXT_RESTORE_DELAY_MS", "2000"),
+        ),
+        2000,
+    ),
+)
+
+
 def _format_ov_bool(value: bool) -> str:
     return "YES" if value else "NO"
 
@@ -191,8 +203,17 @@ class AIModels:
 
         self._clip_text_model: Optional[ov.CompiledModel] = None
         self._clip_text_request: Optional[ov.InferRequest] = None
+        self._clip_text_input_names: Optional[Tuple[str, str]] = None
+        self._clip_text_host_input_cache: Dict[
+            int, Tuple[ov.Tensor, np.ndarray, ov.Tensor, np.ndarray]
+        ] = {}
+        self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
+        self._clip_vision_input_name: Optional[str] = None
+        self._clip_vision_host_tensor: Optional[ov.Tensor] = None
+        self._clip_vision_host_view: Optional[np.ndarray] = None
+        self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
         self._clip_image_resolution: Optional[int] = None
         self._rapidocr_engine: Optional[RapidOCR] = None
         self._face_engine: Optional[FaceAnalysis] = None
@@ -203,6 +224,7 @@ class AIModels:
         self._queue_capacity = max(1, QUEUE_MAX_SIZE)
         self._text_batch_size = max(1, TEXT_BATCH_SIZE)
         self._task_timeout_seconds = max(1, TASK_TIMEOUT_SECONDS)
+        self._text_restore_delay_seconds = TEXT_MODEL_RESTORE_DELAY_MS / 1000.0
         self._release_requested = False
         self._deferred_text_restore_deadline: Optional[float] = None
         self._stopping = False
@@ -215,10 +237,11 @@ class AIModels:
         self._worker.start()
 
         LOG.warning(
-            "AIModels ready: clip_device=%s queue=%s text_batch=%s",
+            "AIModels ready: clip_device=%s queue=%s text_batch=%s text_restore_delay_ms=%s",
             CLIP_INFERENCE_DEVICE,
             self._queue_capacity,
             self._text_batch_size,
+            TEXT_MODEL_RESTORE_DELAY_MS,
         )
 
     def _configure_openvino_cache(self) -> None:
@@ -257,11 +280,10 @@ class AIModels:
             if (
                 kind in {"clip_img", "ocr", "face"}
                 and self._deferred_text_restore_deadline is not None
-                and self._deferred_text_restore_deadline > time.time()
             ):
-                self._deferred_text_restore_deadline = time.time()
+                self._deferred_text_restore_deadline = None
                 LOG.warning(
-                    "Deferred text restore was accelerated by incoming %s task.", kind
+                    "Deferred text restore was cancelled by incoming %s task.", kind
                 )
             if text_priority:
                 self._text_queue.append(task)
@@ -385,12 +407,26 @@ class AIModels:
                 self._return_to_text_if_idle()
 
     def _return_to_text_if_idle(self) -> None:
+        restore_immediately = False
         with self._condition:
-            has_pending = bool(
-                self._text_queue or self._normal_queue or self._stopping or self._release_requested
-            )
-            has_deferred_restore = self._deferred_text_restore_deadline is not None
-        if not has_pending and not has_deferred_restore:
+            if self._stopping or self._release_requested:
+                return
+            if self._text_queue or self._normal_queue:
+                return
+            if self._active_family == "text":
+                self._deferred_text_restore_deadline = None
+                return
+            if self._deferred_text_restore_deadline is not None:
+                return
+            if self._text_restore_delay_seconds <= 0:
+                restore_immediately = True
+            else:
+                self._deferred_text_restore_deadline = (
+                    time.time() + self._text_restore_delay_seconds
+                )
+                self._condition.notify()
+
+        if restore_immediately:
             try:
                 self._switch_family("text")
             except Exception as exc:
@@ -475,9 +511,14 @@ class AIModels:
         if self._active_family == "text":
             self._clip_text_request = None
             self._clip_text_model = None
+            self._clip_text_input_names = None
+            self._clip_text_host_input_cache.clear()
         elif self._active_family == "vision":
             self._clip_vision_request = None
             self._clip_vision_model = None
+            self._clip_vision_input_name = None
+            self._clip_vision_host_tensor = None
+            self._clip_vision_host_view = None
             self._clip_image_resolution = None
         elif self._active_family == "ocr":
             self._rapidocr_engine = None
@@ -490,8 +531,13 @@ class AIModels:
     def _unload_everything_locked(self) -> None:
         self._clip_text_request = None
         self._clip_text_model = None
+        self._clip_text_input_names = None
+        self._clip_text_host_input_cache.clear()
         self._clip_vision_request = None
         self._clip_vision_model = None
+        self._clip_vision_input_name = None
+        self._clip_vision_host_tensor = None
+        self._clip_vision_host_view = None
         self._clip_image_resolution = None
         self._rapidocr_engine = None
         self._face_engine = None
@@ -510,11 +556,50 @@ class AIModels:
 
         if self._clip_remote_context is not None:
             try:
-                return self.core.compile_model(str(model_path), self._clip_remote_context, config)
+                model = self.core.read_model(str(model_path))
+                return self.core.compile_model(model, self._clip_remote_context, config)
             except Exception as exc:
                 LOG.warning("Remote context compile failed, fallback to device compile: %s", exc)
 
         return self.core.compile_model(str(model_path), CLIP_INFERENCE_DEVICE, config)
+
+    def _get_text_host_tensors(
+        self, batch_size: int
+    ) -> Optional[Tuple[ov.Tensor, np.ndarray, ov.Tensor, np.ndarray]]:
+        if (
+            not self._clip_text_host_tensor_enabled
+            or self._clip_remote_context is None
+            or self._clip_text_model is None
+        ):
+            return None
+
+        cached = self._clip_text_host_input_cache.get(batch_size)
+        if cached is not None:
+            return cached
+
+        try:
+            tensor_shape = ov.Shape([int(batch_size), int(CONTEXT_LENGTH)])
+            input_0 = self._clip_text_model.inputs[0]
+            input_1 = self._clip_text_model.inputs[1]
+            input_tensor_0 = self._clip_remote_context.create_host_tensor(
+                input_0.get_element_type(), tensor_shape
+            )
+            input_tensor_1 = self._clip_remote_context.create_host_tensor(
+                input_1.get_element_type(), tensor_shape
+            )
+            input_view_0 = np.asarray(input_tensor_0.data)
+            input_view_1 = np.asarray(input_tensor_1.data)
+            entry = (input_tensor_0, input_view_0, input_tensor_1, input_view_1)
+            self._clip_text_host_input_cache[batch_size] = entry
+            return entry
+        except Exception as exc:
+            LOG.warning(
+                "CLIP text host tensor allocation failed, fallback to shared numpy inputs: %s",
+                exc,
+            )
+            self._clip_text_host_tensor_enabled = False
+            self._clip_text_host_input_cache.clear()
+            return None
 
     def _load_clip_text_locked(self) -> None:
         text_model_path = self.qa_clip_path / "openvino_text_fp16.xml"
@@ -533,6 +618,12 @@ class AIModels:
 
         self._clip_text_model = compiled_model
         self._clip_text_request = compiled_model.create_infer_request()
+        self._clip_text_input_names = (
+            self._clip_text_model.inputs[0].any_name,
+            self._clip_text_model.inputs[1].any_name,
+        )
+        self._clip_text_host_input_cache.clear()
+        self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
         LOG.warning("CLIP Text model loaded on %s.", CLIP_INFERENCE_DEVICE)
 
     def _load_clip_vision_locked(self) -> None:
@@ -552,6 +643,31 @@ class AIModels:
 
         self._clip_vision_model = compiled_model
         self._clip_vision_request = compiled_model.create_infer_request()
+        self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
+        self._clip_vision_host_tensor = None
+        self._clip_vision_host_view = None
+        self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
+        if self._clip_vision_host_tensor_enabled and self._clip_remote_context is not None:
+            try:
+                input_port = self._clip_vision_model.inputs[0]
+                # Vision input may expose dynamic batch dimension; use fixed single-image shape.
+                input_shape = ov.Shape(
+                    [1, 3, int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION)]
+                )
+                self._clip_vision_host_tensor = self._clip_remote_context.create_host_tensor(
+                    input_port.get_element_type(),
+                    input_shape,
+                )
+                self._clip_vision_host_view = np.asarray(self._clip_vision_host_tensor.data)
+                LOG.warning("CLIP Vision host tensor path enabled for GPU context.")
+            except Exception as exc:
+                LOG.warning(
+                    "CLIP Vision host tensor unavailable, fallback to shared numpy inputs: %s",
+                    exc,
+                )
+                self._clip_vision_host_tensor = None
+                self._clip_vision_host_view = None
+                self._clip_vision_host_tensor_enabled = False
         self._clip_image_resolution = CLIP_IMAGE_RESOLUTION
         LOG.warning("CLIP Vision model loaded on %s.", CLIP_INFERENCE_DEVICE)
 
@@ -730,27 +846,39 @@ class AIModels:
     def _infer_clip_text_batch(self, texts: List[str]) -> List[List[float]]:
         if not self._clip_text_model or not self._clip_text_request:
             raise RuntimeError("CLIP text model is not loaded.")
+        if self._clip_text_input_names is None:
+            raise RuntimeError("CLIP text input metadata is not initialized.")
 
         input_ids = _tokenize_for_clip(texts, context_length=CONTEXT_LENGTH)
         attention_mask = np.array(input_ids != _PAD_TOKEN_ID, dtype=np.int64)
+        input_name_0, input_name_1 = self._clip_text_input_names
 
-        input_name_0 = self._clip_text_model.inputs[0].any_name
-        input_name_1 = self._clip_text_model.inputs[1].any_name
-
-        outputs = self._clip_text_request.infer(
-            {
-                input_name_0: input_ids,
-                input_name_1: attention_mask,
-            }
-        )
-        embeddings = np.asarray(outputs[self._clip_text_model.outputs[0]])
+        host_tensors = self._get_text_host_tensors(batch_size=input_ids.shape[0])
+        if host_tensors is not None:
+            input_tensor_0, input_view_0, input_tensor_1, input_view_1 = host_tensors
+            np.copyto(input_view_0, input_ids, casting="no")
+            np.copyto(input_view_1, attention_mask, casting="no")
+            self._clip_text_request.set_input_tensor(0, input_tensor_0)
+            self._clip_text_request.set_input_tensor(1, input_tensor_1)
+            self._clip_text_request.infer()
+            embeddings = np.asarray(self._clip_text_request.get_output_tensor(0).data)
+        else:
+            outputs = self._clip_text_request.infer(
+                {
+                    input_name_0: input_ids,
+                    input_name_1: attention_mask,
+                },
+                share_inputs=True,
+                share_outputs=True,
+            )
+            embeddings = np.asarray(outputs[self._clip_text_model.outputs[0]])
         if embeddings.ndim == 1:
             embeddings = embeddings.reshape(1, -1)
         if embeddings.shape[-1] != CLIP_EMBEDDING_DIMS:
             raise RuntimeError(
                 f"Invalid text embedding dims: expected={CLIP_EMBEDDING_DIMS}, got={embeddings.shape[-1]}"
             )
-        return [[float(value) for value in row] for row in embeddings]
+        return embeddings.astype(np.float32, copy=False).tolist()
 
     def _infer_clip_image(self, image: Image.Image, filename: str) -> List[float]:
         if (
@@ -765,16 +893,26 @@ class AIModels:
             image_resolution=self._clip_image_resolution,
         )
 
-        outputs = self._clip_vision_request.infer(
-            {self._clip_vision_model.inputs[0].any_name: pixel_values}
-        )
-        embedding = np.asarray(outputs[self._clip_vision_model.outputs[0]]).reshape(-1)
+        if self._clip_vision_host_tensor is not None and self._clip_vision_host_view is not None:
+            np.copyto(self._clip_vision_host_view, pixel_values, casting="no")
+            self._clip_vision_request.set_input_tensor(0, self._clip_vision_host_tensor)
+            self._clip_vision_request.infer()
+            embedding = np.asarray(self._clip_vision_request.get_output_tensor(0).data).reshape(-1)
+        else:
+            if not self._clip_vision_input_name:
+                raise RuntimeError("CLIP vision input metadata is not initialized.")
+            outputs = self._clip_vision_request.infer(
+                {self._clip_vision_input_name: pixel_values},
+                share_inputs=True,
+                share_outputs=True,
+            )
+            embedding = np.asarray(outputs[self._clip_vision_model.outputs[0]]).reshape(-1)
         if embedding.shape[0] != CLIP_EMBEDDING_DIMS:
             raise RuntimeError(
                 f"Invalid image embedding dims for {filename}: "
                 f"expected={CLIP_EMBEDDING_DIMS}, got={embedding.shape[0]}"
             )
-        return [float(value) for value in embedding]
+        return embedding.astype(np.float32, copy=False).tolist()
 
     def _infer_ocr(self, image: np.ndarray) -> OCRResult:
         if self._rapidocr_engine is None:
@@ -863,8 +1001,13 @@ class AIModels:
     def release_models(self) -> None:
         self._schedule_release(text_restore_delay_seconds=0.0)
 
-    def release_models_for_restart(self, text_restore_delay_seconds: float = 5.0) -> None:
-        self._schedule_release(text_restore_delay_seconds=text_restore_delay_seconds)
+    def release_models_for_restart(self, text_restore_delay_seconds: Optional[float] = None) -> None:
+        restore_delay_seconds = (
+            self._text_restore_delay_seconds
+            if text_restore_delay_seconds is None
+            else max(0.0, float(text_restore_delay_seconds))
+        )
+        self._schedule_release(text_restore_delay_seconds=restore_delay_seconds)
 
     def _schedule_release(self, text_restore_delay_seconds: float) -> None:
         delay_seconds = max(0.0, float(text_restore_delay_seconds))

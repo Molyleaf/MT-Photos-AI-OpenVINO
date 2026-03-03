@@ -71,7 +71,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
-RESTART_TEXT_RESTORE_DELAY_MS = int(os.environ.get("RESTART_TEXT_RESTORE_DELAY_MS", "5000"))
+TEXT_MODEL_RESTORE_DELAY_MS = ai_models.TEXT_MODEL_RESTORE_DELAY_MS
 idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
 
@@ -223,16 +223,14 @@ async def check_service(t: str = ""):
 async def restart_service():
     logging.warning(
         "收到 /restart 请求，正在释放模型。Text-CLIP 将在无其它任务 %sms 后恢复。",
-        RESTART_TEXT_RESTORE_DELAY_MS,
+        TEXT_MODEL_RESTORE_DELAY_MS,
     )
     if models_instance:
         if (
             hasattr(models_instance, "release_models_for_restart")
             and callable(models_instance.release_models_for_restart)
         ):
-            models_instance.release_models_for_restart(
-                text_restore_delay_seconds=max(0.0, RESTART_TEXT_RESTORE_DELAY_MS / 1000.0)
-            )
+            models_instance.release_models_for_restart()
         elif hasattr(models_instance, "release_models") and callable(models_instance.release_models):
             models_instance.release_models()
         else:

@@ -24,8 +24,8 @@
 - 每 Worker 内只运行一个模型调度线程，推理请求统一入队串行执行。
 - `/clip/txt` 为非抢断优先调度：不抢断正在执行的任务，但会在当前任务结束后优先处理文本队列。
 - 同一时刻仅一个主模型族常驻（Text-CLIP / Vision-CLIP / OCR / Face 互斥）。
-- 空闲状态自动切回 Text-CLIP 常驻，满足文本检索低延迟需求。
-- `/restart` 会立即释放当前模型；若 5 秒内没有收到 OCR/图像 CLIP/人脸请求，再恢复 Text-CLIP 常驻。
+- 非文本任务结束且队列瞬时为空时，不会立即回切 Text-CLIP；会等待 `TEXT_MODEL_RESTORE_DELAY_MS` 指定窗口，减少连续 `/clip/img` 请求的模型抖动。
+- `/restart` 会立即释放当前模型；若 `TEXT_MODEL_RESTORE_DELAY_MS` 窗口内没有收到 OCR/图像 CLIP/人脸请求，再恢复 Text-CLIP 常驻。
 
 ## 环境变量
 
@@ -41,13 +41,14 @@
 | `TEXT_CLIP_BATCH_SIZE` | 每 Worker 文本批处理上限 | `8` |
 | `INFERENCE_TASK_TIMEOUT` | 队列任务超时（秒） | `120` |
 | `SERVER_IDLE_TIMEOUT` | 空闲释放触发时间（秒） | `300` |
-| `RESTART_TEXT_RESTORE_DELAY_MS` | `/restart` 后恢复 Text-CLIP 的等待时长（毫秒） | `5000` |
+| `TEXT_MODEL_RESTORE_DELAY_MS` | Text-CLIP 延迟恢复窗口（毫秒），用于 `/restart` 与“队列瞬时空闲后回切 Text” | `5000` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录 | `<repo>/cache/openvino` |
 | `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR OpenVINO 配置文件 | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR` | RapidOCR 本地模型目录（建议镜像构建前预下载） | `<repo>/models/rapidocr` |
 | `RAPIDOCR_FONT_PATH` | RapidOCR 字体路径（可选） | 空 |
 | `INSIGHTFACE_OV_DEVICE` | InsightFace OpenVINO EP 设备类型 | `CPU_FP32` |
 
+> 兼容性：若未设置 `TEXT_MODEL_RESTORE_DELAY_MS`，服务会回退读取旧变量 `RESTART_TEXT_RESTORE_DELAY_MS`。
 > 总并行度建议按 `WEB_CONCURRENCY × inference_num_threads` 评估，避免线程过订阅。
 
 ## RapidOCR OpenVINO CPU 配置
