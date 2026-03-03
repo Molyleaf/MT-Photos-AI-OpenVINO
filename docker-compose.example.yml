@@ -7,11 +7,9 @@ services:
     ports:
       - "8060:8060"
     volumes:
-      # Mount the models directory to persist downloaded models
-      # and allow easy updates without rebuilding the image.
-      # Note: The Dockerfile already copies the models in,
-      # this is useful if you manage models outside the build process.
+      # Persist local models and mount RapidOCR OpenVINO config.
       - ./models:/models
+      - ./example/cfg_openvino_cpu.yaml:/example/cfg_openvino_cpu.yaml:ro
     environment:
       # --- IMPORTANT ---
       # SET YOUR SECRET API KEY HERE
@@ -20,7 +18,13 @@ services:
       # --- INFERENCE DEVICE ---
       # Options: "CPU", "GPU", "AUTO", "AUTO:GPU,CPU"
       # "AUTO:GPU,CPU" will prioritize GPU and fallback to CPU.
-      - INFERENCE_DEVICE=AUTO:GPU,CPU
+      - INFERENCE_DEVICE=GPU
+      - WEB_CONCURRENCY=2
+      - INFERENCE_QUEUE_MAX_SIZE=64
+      - TEXT_CLIP_BATCH_SIZE=8
+      - OV_CACHE_DIR=/models/cache/openvino
+      - RAPIDOCR_OPENVINO_CONFIG_PATH=/example/cfg_openvino_cpu.yaml
+      - RAPIDOCR_MODEL_DIR=/models/rapidocr
     devices:
       # This is required to give the container access to the host's GPU (iGPU).
       # On Linux, this is typically /dev/dri.

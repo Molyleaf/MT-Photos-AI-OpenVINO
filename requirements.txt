@@ -8,7 +8,7 @@ fastapi
 pydantic
 openvino
 nncf
-rapidocr>=3.6.0
+rapidocr==3.6.0
 onnxruntime-openvino
 uvicorn
 python-multipart

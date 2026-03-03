@@ -5,6 +5,8 @@
 > 严禁做这些事：**改接口语义、不按要求替换推理后端、非兼容性需求改 QA-CLIP 子库、线程/进程过度并发导致抖动、模型重复驻留导致内存暴涨、文档与依赖不一致**。
 >
 > 目标：产出 **行为稳定、响应兼容、资源可控、可回归验证** 的改动，而不是“看起来很优化”的改动。
+> 
+> 不要进行 `pip install -r requirements.txt` 验证
 
 ---
 
@@ -53,7 +55,7 @@
   - 禁止继续使用旧参数 `--data_type FP16`。
 - NNCF 约束：
   - 使用 NNCF 流程做转换/压缩集成。
-  - **关键层不压缩**（输入投影、输出投影、LayerNorm/归一化等敏感层保持原精度策略）。
+  - **关键层不压缩**（输入投影、输出投影、LayerNorm/归一化等敏感层保持 FP32）。
 
 ### 3.3 RapidOCR
 
@@ -61,14 +63,6 @@
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
 - 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO CPU** 后端（不使用 GPU）。
-- OpenVINO 参数至少支持以下项：
-  - `inference_num_threads`
-  - `performance_hint`
-  - `performance_num_requests`
-  - `enable_cpu_pinning`
-  - `num_streams`
-  - `enable_hyper_threading`
-  - `scheduling_core_type`
 - 使用 server 模型配置。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
@@ -159,10 +153,11 @@
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
 1. 待机状态下，Text-CLIP 常驻内存（优化文本请求时延）。
-2. 处理 OCR/图像 CLIP/人脸任务时，允许卸载 Text-CLIP，加载目标模型。
-3. 同一时刻内存中仅允许一个主模型族常驻（Text-CLIP / Vision-CLIP / OCR / Face 互斥）。
-4. 请求并发控制必须采用队列化（或等价可证明正确的串行化调度）。
-5. `/clip/txt` 具备优先级：
+2. 在收到 `POST /restart` 之后立即释放当前模型， 如果 5000ms 内没收到其它类型请求，才加载 Text-CLIP。防止收到 `POST /restart` 之后立刻加载 Text-CLIP，又收到其它请求导致混乱。
+3. 处理 OCR/图像 CLIP/人脸任务时，卸载 Text-CLIP，加载目标模型。
+4. 同一时刻内存/显存中仅允许一个主模型族常驻（Text-CLIP / Vision-CLIP / OCR / Insightface 互斥）。
+5. 请求并发控制必须采用队列化（或等价可证明正确的串行化调度）。
+6. `/clip/txt` 具备低优先级：
   - 若当前正在处理其他任务，不抢断当前正在执行的推理；
   - 当前任务结束后，优先处理排队中的文本 CLIP 请求，再继续后续队列；
   - 必须正确处理模型切换与资源回收。

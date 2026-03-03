@@ -71,6 +71,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
+RESTART_TEXT_RESTORE_DELAY_MS = int(os.environ.get("RESTART_TEXT_RESTORE_DELAY_MS", "5000"))
 idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
 
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
     models_instance = ai_models.AIModels()
     try:
         logging.warning("应用启动... 正在预热加载 Text CLIP 模型。")
-        models_instance.ensure_clip_text_model_loaded()
+        await models_instance.ensure_clip_text_model_loaded_async()
     except Exception as e:
         logging.critical(f"应用启动时基础模型加载失败: {e}", exc_info=True)
 
@@ -220,9 +221,19 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse)
 async def restart_service():
-    logging.warning("收到 /restart 请求，正在释放模型...")
+    logging.warning(
+        "收到 /restart 请求，正在释放模型。Text-CLIP 将在无其它任务 %sms 后恢复。",
+        RESTART_TEXT_RESTORE_DELAY_MS,
+    )
     if models_instance:
-        if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
+        if (
+            hasattr(models_instance, "release_models_for_restart")
+            and callable(models_instance.release_models_for_restart)
+        ):
+            models_instance.release_models_for_restart(
+                text_restore_delay_seconds=max(0.0, RESTART_TEXT_RESTORE_DELAY_MS / 1000.0)
+            )
+        elif hasattr(models_instance, "release_models") and callable(models_instance.release_models):
             models_instance.release_models()
         else:
             logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
@@ -251,7 +262,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         return {"result": empty_result, "msg": error_msg}
 
     try:
-        ocr_results_obj = await asyncio.to_thread(models_instance.get_ocr_results, image)
+        ocr_results_obj = await models_instance.get_ocr_results_async(image)
         # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
@@ -272,7 +283,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
 
     try:
         image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
-        embedding = await asyncio.to_thread(models_instance.get_image_embedding, image_pil, file.filename)
+        embedding = await models_instance.get_image_embedding_async(image_pil, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
         # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": result_strings}
@@ -290,7 +301,7 @@ async def clip_text_endpoint(request: TextClipRequest):
         return {"result": [], "msg": "empty text"}
 
     try:
-        embedding = await asyncio.to_thread(models_instance.get_text_embedding, request.text)
+        embedding = await models_instance.get_text_embedding_async(request.text)
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
     except Exception as e:
@@ -307,7 +318,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
         return {"result": [], "msg": error_msg}
 
     try:
-        face_results_list = await asyncio.to_thread(models_instance.get_face_representation, image)
+        face_results_list = await models_instance.get_face_representation_async(image)
         results_dict = [r.model_dump() for r in face_results_list]
         return {
             "detector_backend": "insightface",
@@ -325,7 +336,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
     log_level = os.environ.get("LOG_LEVEL", "warning").lower()
-    workers = int(os.environ.get("WEB_CONCURRENCY", 1))
+    workers = int(os.environ.get("WEB_CONCURRENCY", 2))
 
     uvicorn.run(
         "server:app",
