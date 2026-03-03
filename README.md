@@ -51,7 +51,7 @@
 
 ## RapidOCR OpenVINO CPU 配置
 
-示例文件: [example/cfg_openvino_cpu.yaml](example/cfg_openvino_cpu.yaml)
+示例文件: [example/cfg_openvino_cpu.yaml](app/config/cfg_openvino_cpu.yaml)
 
 关键参数（均已在服务端支持）：
 

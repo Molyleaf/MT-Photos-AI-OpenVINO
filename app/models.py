@@ -27,7 +27,10 @@ if str(_QA_CLIP_ROOT) not in sys.path:
     sys.path.insert(0, str(_QA_CLIP_ROOT))
 
 import clip  # noqa: E402
-from clip.utils import MODEL_INFO, image_transform  # noqa: E402
+try:  # noqa: E402
+    from clip.utils import MODEL_INFO, image_transform  # noqa: E402
+except ImportError:  # noqa: E402
+    from clip.utils import _MODEL_INFO as MODEL_INFO, image_transform  # noqa: E402
 
 from schemas import FacialArea, OCRBox, OCRResult, RepresentResult
 

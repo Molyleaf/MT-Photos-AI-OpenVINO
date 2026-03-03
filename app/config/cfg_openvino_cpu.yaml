@@ -1,0 +1,67 @@
+Global:
+  text_score: 0.5
+  use_det: true
+  use_cls: true
+  use_rec: true
+  min_height: 30
+  width_height_ratio: 8
+  max_side_len: 2000
+  min_side_len: 30
+  return_word_box: false
+  return_single_char_box: false
+  font_path: null
+  log_level: "info"
+
+EngineConfig:
+  openvino:
+    inference_num_threads: 8
+    performance_hint: "THROUGHPUT"
+    performance_num_requests: -1
+    enable_cpu_pinning: true
+    num_streams: -1
+    enable_hyper_threading: true
+    scheduling_core_type: "ANY_CORE"
+
+Det:
+  engine_type: "openvino"
+  lang_type: "ch"
+  model_type: "mobile"
+  ocr_version: "PP-OCRv4"
+  task_type: "det"
+  model_path: null
+  model_dir: null
+  limit_side_len: 736
+  limit_type: "min"
+  std: [0.5, 0.5, 0.5]
+  mean: [0.5, 0.5, 0.5]
+  thresh: 0.3
+  box_thresh: 0.5
+  max_candidates: 1000
+  unclip_ratio: 1.6
+  use_dilation: true
+  score_mode: "fast"
+
+Cls:
+  engine_type: "openvino"
+  lang_type: "ch"
+  model_type: "mobile"
+  ocr_version: "PP-OCRv4"
+  task_type: "cls"
+  model_path: null
+  model_dir: null
+  cls_image_shape: [3, 48, 192]
+  cls_batch_num: 6
+  cls_thresh: 0.9
+  label_list: ["0", "180"]
+
+Rec:
+  engine_type: "openvino"
+  lang_type: "ch"
+  model_type: "mobile"
+  ocr_version: "PP-OCRv4"
+  task_type: "rec"
+  model_path: null
+  model_dir: null
+  rec_keys_path: null
+  rec_img_shape: [3, 48, 320]
+  rec_batch_num: 6

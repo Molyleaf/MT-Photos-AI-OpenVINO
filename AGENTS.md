@@ -19,6 +19,8 @@
 - 模型转换：`app/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
 - QA-CLIP 子库：`app/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
+- 配置存储：`app/config`。
+- 参考文件（对齐端点用）：`example/`。
 
 ---
 

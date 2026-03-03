@@ -52,7 +52,7 @@ RUN mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidoc
 
 COPY models/qa-clip/openvino /models/qa-clip/openvino
 COPY models/insightface/models /models/insightface/models
-COPY example/cfg_openvino_cpu.yaml /example/cfg_openvino_cpu.yaml
+COPY app/config/cfg_openvino_cpu.yaml /example/cfg_openvino_cpu.yaml
 COPY app /app
 
 EXPOSE 8060
