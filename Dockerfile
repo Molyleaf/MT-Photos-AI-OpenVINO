@@ -43,6 +43,10 @@ RUN set -eux; \
         libmfx-gen1.2 \
         libze1 \
         ocl-icd-libopencl1 \
+        build-essential \
+        gcc \
+        libpq-dev \
+        curl \
         mesa-opencl-icd; \
     rm -rf /var/lib/apt/lists/*
 
@@ -57,6 +61,10 @@ RUN set -eux; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
     mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidocr /models/cache/openvino; \
     chown -R appuser:appgroup /app /models
+
+RUN apt remove -y build-essential gcc libpq-dev curl; \
+    apt autoremove; \
+    apt autoclean
 
 COPY --chown=appuser:appgroup app /app
 COPY --chown=appuser:appgroup models/qa-clip/openvino /models/qa-clip/openvino
