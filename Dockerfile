@@ -67,8 +67,7 @@ RUN apt remove -y build-essential gcc libpq-dev; \
     apt autoclean
 
 COPY --chown=appuser:appgroup app /app
-COPY --chown=appuser:appgroup models/qa-clip/openvino /models/qa-clip/openvino
-COPY --chown=appuser:appgroup models/insightface/models /models/insightface/models
+COPY --chown=appuser:appgroup models/ /models/
 
 USER appuser
 
