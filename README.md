@@ -8,7 +8,7 @@
 - 已准备模型目录（至少包含）：
   - `models/qa-clip/openvino`
   - `models/insightface/models`
-  - `models/rapidocr`（建议提前下载，避免首次请求在线拉取）
+  - `models/rapidocr`（必须预置 `PP-OCRv5 mobile det/rec/dict + cls` 本地文件）
 - 服务入口：`app/server.py`
 
 ## Debian 容器目标与当前实践
@@ -64,7 +64,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 |---|---|---|
 | `API_AUTH_KEY` | 任意字符串；`no-key` 或空字符串表示关闭鉴权 | `mt_photos_ai_extra` |
 | `INFERENCE_DEVICE` | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO` / `AUTO:GPU,CPU` | `AUTO` |
-| `CLIP_INFERENCE_DEVICE` | 同 `INFERENCE_DEVICE`；仅覆盖 QA-CLIP 设备 | 跟随 `INFERENCE_DEVICE` |
+| `CLIP_INFERENCE_DEVICE` | 同 `INFERENCE_DEVICE`；仅覆盖 QA-CLIP 设备。`AUTO` 时强制初始化 GPU Remote Context，失败直接报错（无 silent fallback） | 跟随 `INFERENCE_DEVICE` |
 | `MODEL_PATH` | 模型根目录路径 | `<repo>/models` |
 | `MODEL_NAME` | InsightFace 模型目录名，如 `antelopv2` / `buffalo_l` | `antelopv2` |
 | `WEB_CONCURRENCY` | 整数，建议 `>=1` | `2` |
@@ -76,7 +76,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 | `RESTART_TEXT_RESTORE_DELAY_MS` | 旧变量，仅在未设置 `TEXT_MODEL_RESTORE_DELAY_MS` 时生效 | `2000` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径 | `<repo>/cache/openvino` |
 | `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR 配置文件路径（YAML） | `app/config/cfg_openvino_cpu.yaml` |
-| `RAPIDOCR_MODEL_DIR` | RapidOCR 模型目录（服务会优先从该目录加载 `PP-OCRv5 mobile det/rec/dict`） | `<repo>/models/rapidocr` |
+| `RAPIDOCR_MODEL_DIR` | RapidOCR 模型目录（必须包含 `PP-OCRv5 mobile det/rec/dict` 与 `ch_ppocr_mobile_v2.0_cls_infer.onnx`，缺失即失败） | `<repo>/models/rapidocr` |
 | `RAPIDOCR_FONT_PATH` | 字体文件路径；空表示不指定 | 空 |
 | `RAPIDOCR_INFERENCE_NUM_THREADS` | 整数，建议 `1~CPU核心数` | `-1`（跟随 `cfg_openvino_cpu.yaml`） |
 | `RAPIDOCR_PERFORMANCE_HINT` | OpenVINO 性能提示，常用：`LATENCY` / `THROUGHPUT` | `LATENCY` |
@@ -88,6 +88,8 @@ apt-get update && apt-get install -y --no-install-recommends \
 | `INSIGHTFACE_OV_DEVICE` | 透传给 ORT OpenVINO EP 的 `device_type`；常见：`CPU_FP32` / `CPU_FP16` / `GPU_FP32` / `GPU_FP16` | `CPU_FP32` |
 | `PORT` | 端口号（整数） | `8060` |
 | `LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` | `WARNING` |
+| `FFMPEG_BIN` | 图片解码 ffmpeg 可执行文件名/路径（服务内非 GIF 上传默认优先走 QSV+ffmpeg） | `ffmpeg` |
+| `FFPROBE_BIN` | 图片解码尺寸探测 ffprobe 可执行文件名/路径 | `ffprobe` |
 
 ## 环境变量（`app/convert.py`）
 
@@ -226,22 +228,17 @@ docker exec -it mt-photos-ai-openvino vainfo
 docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 ```
 
-如需在容器内进行图片转码（例如 `png/jpg/webp` 与帧图像处理链）并强制走 Intel 核显，可优先使用 `ffmpeg` 的 VAAPI/QSV 路径。
+服务内 `read_image_from_upload` 对非 GIF 上传默认采用“`ffmpeg(QSV)` -> `ffmpeg(CPU)` -> `cv2.imdecode`”顺序解码，优先使用 Intel 核显链路并显式记录每一级失败原因；检测到高位深图像时会直接使用 `cv2.imdecode` 以保持 16-bit 转 8-bit 语义。
+`/clip/img` 端点已去除 `BGR -> RGB -> PIL` 额外拷贝链，模型层直接消费 `numpy BGR` 并优先走 OpenVINO host tensor。
 
-## RapidOCR 模型下载
+## RapidOCR 模型预置（强制）
 
-### 方式一：自动下载（最省事）
-
-保持 `app/config/cfg_openvino_cpu.yaml` 里的 `Det/Rec.model_path` 为 `null`，首次调用 `/ocr` 时会自动下载模型到 RapidOCR 默认目录（通常是 Python 站点包目录下的 `rapidocr/models`）。
-
-### 方式二：离线预下载（推荐用于生产/镜像）
-
-本仓库当前默认配置使用 `PP-OCRv5 + mobile`（核心为 `Det/Rec`），建议预置以下 4 个文件：
+服务已禁用线上下载回退，必须在镜像/部署目录预置以下 4 个本地文件（缺失即失败）：
 
 - `ch_PP-OCRv5_mobile_det.onnx`
 - `ch_PP-OCRv5_rec_mobile_infer.onnx`
 - `ppocrv5_dict.txt`
-- `ch_ppocr_mobile_v2.0_cls_infer.onnx`（RapidOCR 初始化兼容）
+- `ch_ppocr_mobile_v2.0_cls_infer.onnx`（即使 `Global.use_cls=false` 仍需预置，避免初始化触发下载路径）
 
 Linux/macOS 下载示例：
 
@@ -279,7 +276,7 @@ Cls:
 
 说明：
 - 当前默认配置 `Global.use_cls=false`，即不启用方向分类器（仅使用 `PP-OCRv5 mobile det+rec`）。
-- 如需启用分类器，可将 `Global.use_cls=true`，并额外下载 `ch_ppocr_mobile_v2.0_cls_infer.onnx`。
+- 即使 `Global.use_cls=false`，服务仍会强校验 `ch_ppocr_mobile_v2.0_cls_infer.onnx` 是否存在。
 
 ## RapidOCR OpenVINO CPU 配置
 

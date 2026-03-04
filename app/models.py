@@ -13,10 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
 
+import cv2
 import numpy as np
 import openvino as ov
 import yaml
-from PIL import Image
 from insightface.app import FaceAnalysis
 from rapidocr import RapidOCR
 
@@ -41,12 +41,9 @@ CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 CLIP_IMAGE_RESOLUTION = 224
 
-_CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32).reshape(1, 1, 3)
-_CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32).reshape(1, 1, 3)
-try:
-    _PIL_BICUBIC = Image.Resampling.BICUBIC
-except AttributeError:
-    _PIL_BICUBIC = Image.BICUBIC
+_CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
+_CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
+_CLIP_INV_255 = np.float32(1.0 / 255.0)
 
 _TOKENIZER = FullTokenizer()
 _PAD_TOKEN_ID = int(_TOKENIZER.vocab["[PAD]"])
@@ -145,15 +142,50 @@ def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -
     return result
 
 
-def _preprocess_clip_image(
-    image: Image.Image,
+def _preprocess_clip_image_bgr(
+    image: np.ndarray,
     image_resolution: int = CLIP_IMAGE_RESOLUTION,
+    out: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    resized = image.convert("RGB").resize((image_resolution, image_resolution), _PIL_BICUBIC)
-    pixel_values = np.asarray(resized, dtype=np.float32) / 255.0
-    pixel_values = (pixel_values - _CLIP_IMAGE_MEAN) / _CLIP_IMAGE_STD
-    chw = np.transpose(pixel_values, (2, 0, 1))
-    return np.expand_dims(chw, axis=0)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Invalid image shape for CLIP preprocess: {image.shape}")
+
+    src_h, src_w = image.shape[:2]
+    interpolation = (
+        cv2.INTER_AREA
+        if src_h > image_resolution or src_w > image_resolution
+        else cv2.INTER_LINEAR
+    )
+    resized = cv2.resize(image, (image_resolution, image_resolution), interpolation=interpolation)
+
+    if out is None:
+        pixel_values = np.empty((1, 3, image_resolution, image_resolution), dtype=np.float32)
+    else:
+        expected_shape = (1, 3, image_resolution, image_resolution)
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Invalid CLIP host tensor view shape: expected={expected_shape}, got={out.shape}"
+            )
+        if out.dtype != np.float32:
+            raise ValueError(f"Invalid CLIP host tensor dtype: expected=float32, got={out.dtype}")
+        pixel_values = out
+
+    # CLIP expects RGB order, while API input is BGR.
+    chw = pixel_values[0]
+
+    np.multiply(resized[:, :, 2], _CLIP_INV_255, out=chw[0], casting="unsafe")
+    np.subtract(chw[0], _CLIP_IMAGE_MEAN[0], out=chw[0])
+    np.divide(chw[0], _CLIP_IMAGE_STD[0], out=chw[0])
+
+    np.multiply(resized[:, :, 1], _CLIP_INV_255, out=chw[1], casting="unsafe")
+    np.subtract(chw[1], _CLIP_IMAGE_MEAN[1], out=chw[1])
+    np.divide(chw[1], _CLIP_IMAGE_STD[1], out=chw[1])
+
+    np.multiply(resized[:, :, 0], _CLIP_INV_255, out=chw[2], casting="unsafe")
+    np.subtract(chw[2], _CLIP_IMAGE_MEAN[2], out=chw[2])
+    np.divide(chw[2], _CLIP_IMAGE_STD[2], out=chw[2])
+
+    return pixel_values
 
 
 TaskType = Literal["clip_txt", "clip_img", "ocr", "face", "warmup_text"]
@@ -258,14 +290,22 @@ class AIModels:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
     def _init_clip_remote_context(self) -> Optional[Any]:
-        if "GPU" not in CLIP_INFERENCE_DEVICE.upper():
+        clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
+        force_gpu_remote_context = clip_device == "AUTO"
+        wants_gpu_remote_context = force_gpu_remote_context or ("GPU" in clip_device)
+        if not wants_gpu_remote_context:
             return None
         try:
             remote_context = self.core.get_default_context("GPU")
-            LOG.warning("OpenVINO GPU remote context enabled for CLIP.")
+            LOG.warning("OpenVINO GPU remote context enabled for CLIP (device=%s).", CLIP_INFERENCE_DEVICE)
             return remote_context
         except Exception as exc:
-            LOG.warning("GPU remote context unavailable, fallback to normal tensors: %s", exc)
+            if force_gpu_remote_context:
+                raise RuntimeError(
+                    "CLIP_INFERENCE_DEVICE=AUTO requires GPU Remote Context. "
+                    "OpenVINO GPU context initialization failed."
+                ) from exc
+            LOG.warning("GPU remote context unavailable; continue without Remote Context: %s", exc)
             return None
 
     def _queue_size_locked(self) -> int:
@@ -561,11 +601,8 @@ class AIModels:
         }
 
         if self._clip_remote_context is not None:
-            try:
-                model = self.core.read_model(str(model_path))
-                return self.core.compile_model(model, self._clip_remote_context, config)
-            except Exception as exc:
-                LOG.warning("Remote context compile failed, fallback to device compile: %s", exc)
+            model = self.core.read_model(str(model_path))
+            return self.core.compile_model(model, self._clip_remote_context, config)
 
         return self.core.compile_model(str(model_path), CLIP_INFERENCE_DEVICE, config)
 
@@ -720,11 +757,29 @@ class AIModels:
             "CACHE_DIR": str(cfg.get("cache_dir", self.ov_cache_dir)),
         }
 
-    def _resolve_rapidocr_local_asset(self, filename: str) -> Optional[Path]:
-        candidate = self.rapidocr_model_dir_path / filename
-        if candidate.exists() and candidate.is_file():
-            return candidate
-        return None
+    def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
+        required_files = {
+            "det": RAPIDOCR_V5_MOBILE_DET_FILE,
+            "rec": RAPIDOCR_V5_MOBILE_REC_FILE,
+            "dict": RAPIDOCR_V5_DICT_FILE,
+            "cls": RAPIDOCR_CLS_MOBILE_V2_FILE,
+        }
+        resolved: Dict[str, Path] = {}
+        missing: List[str] = []
+        for key, filename in required_files.items():
+            candidate = self.rapidocr_model_dir_path / filename
+            if candidate.exists() and candidate.is_file():
+                resolved[key] = candidate
+            else:
+                missing.append(str(candidate))
+
+        if missing:
+            joined = "; ".join(missing)
+            raise FileNotFoundError(
+                "RapidOCR local assets missing; online download fallback is disabled. "
+                f"Missing files: {joined}"
+            )
+        return resolved
 
     def _build_rapidocr_runtime_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         params: Dict[str, Any] = {
@@ -752,43 +807,12 @@ class AIModels:
         if self.rapidocr_font_path:
             params["Global.font_path"] = self.rapidocr_font_path
 
-        det_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_MOBILE_DET_FILE)
-        rec_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_MOBILE_REC_FILE)
-        rec_dict_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_DICT_FILE)
-        cls_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_CLS_MOBILE_V2_FILE)
-
-        if det_model_path:
-            params["Det.model_path"] = str(det_model_path)
-        else:
-            LOG.warning(
-                "RapidOCR det model not found at %s; fallback to RapidOCR downloader.",
-                self.rapidocr_model_dir_path / RAPIDOCR_V5_MOBILE_DET_FILE,
-            )
-
-        if rec_model_path:
-            params["Rec.model_path"] = str(rec_model_path)
-        else:
-            LOG.warning(
-                "RapidOCR rec model not found at %s; fallback to RapidOCR downloader.",
-                self.rapidocr_model_dir_path / RAPIDOCR_V5_MOBILE_REC_FILE,
-            )
-
-        if rec_dict_path:
-            params["Rec.rec_keys_path"] = str(rec_dict_path)
-        else:
-            LOG.warning(
-                "RapidOCR rec dict not found at %s; fallback to RapidOCR downloader.",
-                self.rapidocr_model_dir_path / RAPIDOCR_V5_DICT_FILE,
-            )
-
-        if cls_model_path:
-            # RapidOCR initializes cls session even when Global.use_cls=false.
-            params["Cls.model_path"] = str(cls_model_path)
-        else:
-            LOG.warning(
-                "RapidOCR cls model not found at %s; fallback to RapidOCR downloader.",
-                self.rapidocr_model_dir_path / RAPIDOCR_CLS_MOBILE_V2_FILE,
-            )
+        assets = self._require_rapidocr_local_assets()
+        params["Det.model_path"] = str(assets["det"])
+        params["Rec.model_path"] = str(assets["rec"])
+        params["Rec.rec_keys_path"] = str(assets["dict"])
+        # RapidOCR initializes cls session even when Global.use_cls=false.
+        params["Cls.model_path"] = str(assets["cls"])
 
         return params
 
@@ -837,17 +861,7 @@ class AIModels:
             common_values["vis_font_path"] = font_path_value
 
         candidate_kwargs: List[Dict[str, Any]] = []
-        if self.rapidocr_config_path.exists():
-            config_path_text = str(self.rapidocr_config_path)
-            candidate_kwargs.extend(
-                [
-                    {"config_path": config_path_text, "params": params},
-                    {"params_path": config_path_text, "params": params},
-                    {"cfg_path": config_path_text, "params": params},
-                    {"config_path": config_path_text},
-                ]
-            )
-        elif params:
+        if params:
             candidate_kwargs.append({"params": params})
 
         candidate_kwargs.extend(
@@ -860,6 +874,7 @@ class AIModels:
                     "ov_config": common_values["ov_config"],
                     "model_dir": model_dir_value,
                     "vis_font_path": font_path_value,
+                    "params": params,
                 },
                 {
                     "engine_type": common_values["engine_type"],
@@ -867,12 +882,14 @@ class AIModels:
                     "openvino_config": common_values["openvino_config"],
                     "model_dir": model_dir_value,
                     "vis_font_path": font_path_value,
+                    "params": params,
                 },
                 {
                     "device_name": common_values["device_name"],
                     "ov_config": common_values["ov_config"],
                     "model_dir": model_dir_value,
                     "vis_font_path": font_path_value,
+                    "params": params,
                 },
             ]
         )
@@ -962,7 +979,7 @@ class AIModels:
             )
         return embeddings.astype(np.float32, copy=False).tolist()
 
-    def _infer_clip_image(self, image: Image.Image, filename: str) -> List[float]:
+    def _infer_clip_image(self, image: np.ndarray, filename: str) -> List[float]:
         if (
             not self._clip_vision_model
             or not self._clip_vision_request
@@ -970,19 +987,22 @@ class AIModels:
         ):
             raise RuntimeError("CLIP vision model is not loaded.")
 
-        pixel_values = _preprocess_clip_image(
-            image=image,
-            image_resolution=self._clip_image_resolution,
-        )
-
         if self._clip_vision_host_tensor is not None and self._clip_vision_host_view is not None:
-            np.copyto(self._clip_vision_host_view, pixel_values, casting="no")
+            _preprocess_clip_image_bgr(
+                image=image,
+                image_resolution=self._clip_image_resolution,
+                out=self._clip_vision_host_view,
+            )
             self._clip_vision_request.set_input_tensor(0, self._clip_vision_host_tensor)
             self._clip_vision_request.infer()
             embedding = np.asarray(self._clip_vision_request.get_output_tensor(0).data).reshape(-1)
         else:
             if not self._clip_vision_input_name:
                 raise RuntimeError("CLIP vision input metadata is not initialized.")
+            pixel_values = _preprocess_clip_image_bgr(
+                image=image,
+                image_resolution=self._clip_image_resolution,
+            )
             outputs = self._clip_vision_request.infer(
                 {self._clip_vision_input_name: pixel_values},
                 share_inputs=True,
@@ -1127,13 +1147,13 @@ class AIModels:
         future = self._submit_task(kind="clip_txt", payload=text, text_priority=True)
         return await self._await_future(future)
 
-    def get_image_embedding(self, image: Image.Image, filename: str = "unknown") -> List[float]:
+    def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         payload = (image, filename)
         future = self._submit_task(kind="clip_img", payload=payload, text_priority=False)
         return self._wait_future(future)
 
     async def get_image_embedding_async(
-        self, image: Image.Image, filename: str = "unknown"
+        self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
         payload = (image, filename)
         future = self._submit_task(kind="clip_img", payload=payload, text_priority=False)

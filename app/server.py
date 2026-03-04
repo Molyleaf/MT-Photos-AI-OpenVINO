@@ -1,7 +1,9 @@
 # app/server.py
 import asyncio
+import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -73,6 +75,9 @@ SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
 TEXT_MODEL_RESTORE_DELAY_MS = ai_models.TEXT_MODEL_RESTORE_DELAY_MS
 idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
+MAX_IMAGE_SIDE = 10000
 
 def idle_timeout_handler():
     global models_instance
@@ -90,6 +95,130 @@ def reset_idle_timer():
     if SERVER_IDLE_TIMEOUT > 0:
         idle_timer = threading.Timer(SERVER_IDLE_TIMEOUT, idle_timeout_handler)
         idle_timer.start()
+
+
+def _probe_image_size(
+    contents: bytes,
+) -> Tuple[Optional[int], Optional[int], Optional[bool], Optional[str]]:
+    probe_cmd = [
+        FFPROBE_BIN,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,pix_fmt,bits_per_raw_sample",
+        "-of",
+        "json",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            probe_cmd,
+            input=contents,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return None, None, None, f"ffprobe not found: {FFPROBE_BIN}"
+    except subprocess.TimeoutExpired:
+        return None, None, None, "ffprobe timeout"
+    except Exception as exc:
+        return None, None, None, f"ffprobe error: {exc}"
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
+        return None, None, None, f"ffprobe failed: {stderr or 'unknown error'}"
+
+    raw_stdout = proc.stdout.decode("utf-8", errors="ignore").strip()
+    try:
+        payload = json.loads(raw_stdout) if raw_stdout else {}
+        streams = payload.get("streams", [])
+        if not streams:
+            return None, None, None, f"ffprobe output parse failed: {raw_stdout}"
+        stream = streams[0] or {}
+        width = int(stream.get("width"))
+        height = int(stream.get("height"))
+        bits_per_raw_sample = stream.get("bits_per_raw_sample")
+        pix_fmt = str(stream.get("pix_fmt") or "").lower()
+        bit_depth = 0
+        if bits_per_raw_sample not in (None, ""):
+            try:
+                bit_depth = int(bits_per_raw_sample)
+            except (TypeError, ValueError):
+                bit_depth = 0
+        if bit_depth <= 0 and pix_fmt:
+            # 常见高位深像素格式：rgb48*/gray16*/yuv420p10* 等。
+            if any(token in pix_fmt for token in ("10", "12", "14", "16", "32", "48", "64")):
+                bit_depth = 16
+        high_bit_depth = bit_depth > 8
+    except Exception:
+        return None, None, None, f"ffprobe output parse failed: {raw_stdout}"
+
+    if width <= 0 or height <= 0:
+        return None, None, None, f"ffprobe invalid image size: {raw_stdout}"
+    return width, height, high_bit_depth, None
+
+
+def _decode_image_with_ffmpeg(
+    contents: bytes,
+    prefer_qsv: bool,
+    width: int,
+    height: int,
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    decode_cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if prefer_qsv:
+        decode_cmd.extend(["-hwaccel", "qsv"])
+    decode_cmd.extend(
+        [
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+    )
+
+    try:
+        proc = subprocess.run(
+            decode_cmd,
+            input=contents,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=20,
+        )
+    except FileNotFoundError:
+        return None, f"ffmpeg not found: {FFMPEG_BIN}"
+    except subprocess.TimeoutExpired:
+        return None, "ffmpeg decode timeout"
+    except Exception as exc:
+        return None, f"ffmpeg decode error: {exc}"
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
+        return None, f"ffmpeg decode failed: {stderr or 'unknown error'}"
+
+    expected_size = width * height * 3
+    if len(proc.stdout) != expected_size:
+        return None, (
+            "ffmpeg decode size mismatch: "
+            f"expected={expected_size}, got={len(proc.stdout)}"
+        )
+
+    decoded = np.frombuffer(proc.stdout, dtype=np.uint8).reshape((height, width, 3))
+    return decoded, None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -139,15 +268,51 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
 
     try:
         # 尝试使用 PIL 打开（主要为了处理 GIF）
-        if file.content_type == 'image/gif':
+        is_gif = file.content_type == "image/gif" or str(file.filename).lower().endswith(".gif")
+        if is_gif:
             with Image.open(BytesIO(contents)) as pil_img:
                 if pil_img.is_animated:
                     pil_img.seek(0)  # 移动到第一帧
-                frame = pil_img.convert('RGB')
+                frame = pil_img.convert("RGB")
                 np_arr = np.array(frame)
                 img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR) # 转为 CV2 BGR
 
-        # 如果不是 GIF 或 PIL 失败，使用 CV2
+        # 非 GIF 优先尝试 ffmpeg(QSV) 解码，再显式降级 ffmpeg(CPU) 和 OpenCV。
+        if img is None:
+            width_probe, height_probe, high_bit_depth, probe_err = await asyncio.to_thread(
+                _probe_image_size, contents
+            )
+            if probe_err:
+                logging.warning("ffprobe 探测失败，将尝试 cv2.imdecode: %s", probe_err)
+            elif width_probe is None or height_probe is None:
+                logging.warning("ffprobe 未返回有效尺寸，将尝试 cv2.imdecode。")
+            elif high_bit_depth:
+                logging.warning("检测到高位深图像，改用 cv2.imdecode 保持 16-bit->8-bit 语义。")
+            elif width_probe is not None and height_probe is not None and (
+                width_probe > MAX_IMAGE_SIDE or height_probe > MAX_IMAGE_SIDE
+            ):
+                logging.warning(f"文件 '{file.filename}' 尺寸超限（ffmpeg probe）")
+                return None, "height or width out of range"
+            else:
+                ffmpeg_qsv_img, ffmpeg_qsv_err = await asyncio.to_thread(
+                    _decode_image_with_ffmpeg, contents, True, width_probe, height_probe
+                )
+                if ffmpeg_qsv_img is not None:
+                    img = ffmpeg_qsv_img
+                else:
+                    logging.warning("ffmpeg(QSV) 解码失败，将尝试 ffmpeg(CPU): %s", ffmpeg_qsv_err)
+                    ffmpeg_cpu_img, ffmpeg_cpu_err = await asyncio.to_thread(
+                        _decode_image_with_ffmpeg, contents, False, width_probe, height_probe
+                    )
+                    if ffmpeg_cpu_img is not None:
+                        img = ffmpeg_cpu_img
+                    else:
+                        logging.warning(
+                            "ffmpeg(CPU) 解码失败，将尝试 cv2.imdecode: %s",
+                            ffmpeg_cpu_err,
+                        )
+
+        # ffmpeg 路径失败后，回退到 cv2.imdecode。
         if img is None:
             nparr = np.frombuffer(contents, np.uint8)
             img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
@@ -164,7 +329,7 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
 
         # 检查尺寸
         height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
-        if width > 10000 or height > 10000:
+        if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
             logging.warning(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
             return None, "height or width out of range"
 
@@ -272,8 +437,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         return {"result": [], "msg": error_msg}
 
     try:
-        image_pil = await asyncio.to_thread(lambda img_arr: Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)), image)
-        embedding = await models_instance.get_image_embedding_async(image_pil, file.filename)
+        embedding = await models_instance.get_image_embedding_async(image, file.filename)
         result_strings = [f"{f:.16f}" for f in embedding]
         # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": result_strings}
