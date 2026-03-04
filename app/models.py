@@ -146,6 +146,7 @@ def _preprocess_clip_image_bgr(
     image: np.ndarray,
     image_resolution: int = CLIP_IMAGE_RESOLUTION,
     out: Optional[np.ndarray] = None,
+    resize_out: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"Invalid image shape for CLIP preprocess: {image.shape}")
@@ -156,7 +157,25 @@ def _preprocess_clip_image_bgr(
         if src_h > image_resolution or src_w > image_resolution
         else cv2.INTER_LINEAR
     )
-    resized = cv2.resize(image, (image_resolution, image_resolution), interpolation=interpolation)
+    if resize_out is None:
+        resized = cv2.resize(image, (image_resolution, image_resolution), interpolation=interpolation)
+    else:
+        expected_resize_shape = (image_resolution, image_resolution, 3)
+        if resize_out.shape != expected_resize_shape:
+            raise ValueError(
+                "Invalid CLIP resize buffer shape: "
+                f"expected={expected_resize_shape}, got={resize_out.shape}"
+            )
+        if resize_out.dtype != np.uint8:
+            raise ValueError(
+                f"Invalid CLIP resize buffer dtype: expected=uint8, got={resize_out.dtype}"
+            )
+        resized = cv2.resize(
+            image,
+            (image_resolution, image_resolution),
+            dst=resize_out,
+            interpolation=interpolation,
+        )
 
     if out is None:
         pixel_values = np.empty((1, 3, image_resolution, image_resolution), dtype=np.float32)
@@ -252,6 +271,8 @@ class AIModels:
         self._clip_vision_host_tensor: Optional[ov.Tensor] = None
         self._clip_vision_host_view: Optional[np.ndarray] = None
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
+        self._clip_vision_numpy_input: Optional[np.ndarray] = None
+        self._clip_vision_resize_buffer: Optional[np.ndarray] = None
         self._clip_image_resolution: Optional[int] = None
         self._rapidocr_engine: Optional[RapidOCR] = None
         self._face_engine: Optional[FaceAnalysis] = None
@@ -305,8 +326,11 @@ class AIModels:
                     "CLIP_INFERENCE_DEVICE=AUTO requires GPU Remote Context. "
                     "OpenVINO GPU context initialization failed."
                 ) from exc
-            LOG.warning("GPU remote context unavailable; continue without Remote Context: %s", exc)
-            return None
+            raise RuntimeError(
+                f"CLIP_INFERENCE_DEVICE={CLIP_INFERENCE_DEVICE} requests GPU execution, "
+                "but GPU Remote Context initialization failed. "
+                "No silent fallback is allowed."
+            ) from exc
 
     def _queue_size_locked(self) -> int:
         return len(self._text_queue) + len(self._normal_queue)
@@ -565,6 +589,8 @@ class AIModels:
             self._clip_vision_input_name = None
             self._clip_vision_host_tensor = None
             self._clip_vision_host_view = None
+            self._clip_vision_numpy_input = None
+            self._clip_vision_resize_buffer = None
             self._clip_image_resolution = None
         elif self._active_family == "ocr":
             self._rapidocr_engine = None
@@ -584,6 +610,8 @@ class AIModels:
         self._clip_vision_input_name = None
         self._clip_vision_host_tensor = None
         self._clip_vision_host_view = None
+        self._clip_vision_numpy_input = None
+        self._clip_vision_resize_buffer = None
         self._clip_image_resolution = None
         self._rapidocr_engine = None
         self._face_engine = None
@@ -689,6 +717,12 @@ class AIModels:
         self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
         self._clip_vision_host_tensor = None
         self._clip_vision_host_view = None
+        self._clip_vision_numpy_input = np.empty(
+            (1, 3, int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION)), dtype=np.float32
+        )
+        self._clip_vision_resize_buffer = np.empty(
+            (int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION), 3), dtype=np.uint8
+        )
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
         if self._clip_vision_host_tensor_enabled and self._clip_remote_context is not None:
             try:
@@ -992,6 +1026,7 @@ class AIModels:
                 image=image,
                 image_resolution=self._clip_image_resolution,
                 out=self._clip_vision_host_view,
+                resize_out=self._clip_vision_resize_buffer,
             )
             self._clip_vision_request.set_input_tensor(0, self._clip_vision_host_tensor)
             self._clip_vision_request.infer()
@@ -1002,6 +1037,8 @@ class AIModels:
             pixel_values = _preprocess_clip_image_bgr(
                 image=image,
                 image_resolution=self._clip_image_resolution,
+                out=self._clip_vision_numpy_input,
+                resize_out=self._clip_vision_resize_buffer,
             )
             outputs = self._clip_vision_request.infer(
                 {self._clip_vision_input_name: pixel_values},

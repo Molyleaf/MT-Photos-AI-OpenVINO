@@ -64,7 +64,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 |---|---|---|
 | `API_AUTH_KEY` | 任意字符串；`no-key` 或空字符串表示关闭鉴权 | `mt_photos_ai_extra` |
 | `INFERENCE_DEVICE` | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO` / `AUTO:GPU,CPU` | `AUTO` |
-| `CLIP_INFERENCE_DEVICE` | 同 `INFERENCE_DEVICE`；仅覆盖 QA-CLIP 设备。`AUTO` 时强制初始化 GPU Remote Context，失败直接报错（无 silent fallback） | 跟随 `INFERENCE_DEVICE` |
+| `CLIP_INFERENCE_DEVICE` | 同 `INFERENCE_DEVICE`；仅覆盖 QA-CLIP 设备。值为 `AUTO` 或显式包含 `GPU` 时都要求成功初始化 GPU Remote Context；失败直接报错（无 silent fallback） | 跟随 `INFERENCE_DEVICE` |
 | `MODEL_PATH` | 模型根目录路径 | `<repo>/models` |
 | `MODEL_NAME` | InsightFace 模型目录名，如 `antelopv2` / `buffalo_l` | `antelopv2` |
 | `WEB_CONCURRENCY` | 整数，建议 `>=1` | `2` |
@@ -228,12 +228,27 @@ docker exec -it mt-photos-ai-openvino vainfo
 docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 ```
 
-服务内 `read_image_from_upload` 对非 GIF 上传默认采用“`ffmpeg(QSV)` -> `ffmpeg(CPU)` -> `cv2.imdecode`”顺序解码，优先使用 Intel 核显链路并显式记录每一级失败原因；检测到高位深图像时会直接使用 `cv2.imdecode` 以保持 16-bit 转 8-bit 语义。
+服务内 `read_image_from_upload` 对非 GIF 上传默认采用“`ffmpeg(QSV)` -> `ffmpeg(CPU)` -> `cv2.imdecode`”顺序解码，优先使用 Intel 核显链路并显式记录每一级失败原因；`ffprobe` 失败/未返回尺寸时仍会先尝试 `ffmpeg(QSV/CPU)`，再回退 `cv2.imdecode`；检测到高位深图像时会直接使用 `cv2.imdecode` 以保持 16-bit 转 8-bit 语义。
 `/clip/img` 端点已去除 `BGR -> RGB -> PIL` 额外拷贝链，模型层直接消费 `numpy BGR` 并优先走 OpenVINO host tensor。
+
+## Windows Server GPU-PV（`/dev/dxg`）能力边界
+
+在 Windows Server + Linux 容器 + GPU-PV（映射 `/dev/dxg`）场景下，当前服务可启用的加速项：
+
+- QA-CLIP OpenVINO GPU 推理（`CLIP_INFERENCE_DEVICE=AUTO/GPU`）；
+- QA-CLIP GPU Remote Context + host tensor 互操作（减少 Host<->Device 拷贝）；
+- InsightFace 的 OpenVINO EP（当 `INSIGHTFACE_OV_DEVICE` 配置为 GPU 类型且运行时可用）。
+
+需要明确的限制：
+
+- RapidOCR 固定 OpenVINO CPU 后端，不走 GPU。
+- `ffmpeg QSV` 在 Linux 容器里通常依赖 `/dev/dri`（VAAPI/oneVPL）链路；仅有 `/dev/dxg` 时不保证可用。若 QSV 不可用，服务会记录原因并按既定顺序显式降级到 `ffmpeg(CPU)` 或 `cv2.imdecode`（无静默 fallback）。
 
 ## RapidOCR 模型预置（强制）
 
 服务已禁用线上下载回退，必须在镜像/部署目录预置以下 4 个本地文件（缺失即失败）：
+
+当前 `Dockerfile` 也会在构建阶段强校验这 4 个文件，缺失将直接 `docker build` 失败（避免部署后才暴露问题）。
 
 - `ch_PP-OCRv5_mobile_det.onnx`
 - `ch_PP-OCRv5_rec_mobile_infer.onnx`

@@ -47,6 +47,8 @@
 - 推理目标设备：`GPU`（Intel Xe 核显），优先减少 Host<->Device 数据搬运。
 - OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
+- 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
+- Windows Server GPU-PV 场景（容器映射 `/dev/dxg`）可用于 OpenVINO GPU 推理/Remote Context；但 `ffmpeg QSV` 硬解链路仍以 `/dev/dri`（VAAPI/oneVPL）为主，需在文档中明确能力边界。
 - `/clip/img` 视觉链路必须直接消费 `numpy BGR`，禁止 `BGR -> RGB -> PIL` 的多余拷贝链。
 
 ### 3.2 QA-CLIP 转换（Hugging Face -> OpenVINO IR）
@@ -106,7 +108,7 @@
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
 
 - GIF：读取第一帧并转 BGR。
-- 非 GIF：优先 `ffmpeg(QSV)` 解码；若失败需显式记录原因，再按顺序尝试 `ffmpeg(CPU)` 与 `cv2.imdecode(..., IMREAD_UNCHANGED)`；若检测到高位深图像，应直接走 `cv2.imdecode` 以保持 16-bit 处理语义。
+- 非 GIF：优先 `ffmpeg(QSV)` 解码；若失败需显式记录原因，再按顺序尝试 `ffmpeg(CPU)` 与 `cv2.imdecode(..., IMREAD_UNCHANGED)`；若 `ffprobe` 失败或未返回尺寸，也应继续尝试 `ffmpeg(QSV/CPU)` 后再回退 `cv2.imdecode`；若检测到高位深图像，应直接走 `cv2.imdecode` 以保持 16-bit 处理语义。
 - 16-bit 图像：降为 8-bit。
 - 宽高任一超过 `10000`：返回错误 `"height or width out of range"`。
 - 统一输出 3 通道 BGR。

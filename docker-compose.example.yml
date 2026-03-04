@@ -28,12 +28,12 @@ services:
 
       # --- INFERENCE DEVICE ---
       # Options: "CPU", "GPU", "AUTO", "AUTO:GPU,CPU"
-      # "AUTO:GPU,CPU" will prioritize GPU and fallback to CPU.
+      # CLIP_INFERENCE_DEVICE 默认跟随该值；若值包含 GPU/AUTO，CLIP 侧会强制初始化 GPU Remote Context，失败直接报错。
       - INFERENCE_DEVICE=GPU
       - WEB_CONCURRENCY=2
       - INFERENCE_QUEUE_MAX_SIZE=64
       - TEXT_CLIP_BATCH_SIZE=8
-      - TEXT_MODEL_RESTORE_DELAY_MS=5000
+      - TEXT_MODEL_RESTORE_DELAY_MS=2000
       - OV_CACHE_DIR=/models/cache/openvino
       - LIBVA_DRIVER_NAME=iHD
       - RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml

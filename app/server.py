@@ -165,8 +165,8 @@ def _probe_image_size(
 def _decode_image_with_ffmpeg(
     contents: bytes,
     prefer_qsv: bool,
-    width: int,
-    height: int,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[str]]:
     decode_cmd = [
         FFMPEG_BIN,
@@ -176,19 +176,13 @@ def _decode_image_with_ffmpeg(
     ]
     if prefer_qsv:
         decode_cmd.extend(["-hwaccel", "qsv"])
-    decode_cmd.extend(
-        [
-            "-i",
-            "pipe:0",
-            "-frames:v",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "pipe:1",
-        ]
-    )
+    decode_cmd.extend(["-i", "pipe:0", "-frames:v", "1"])
+    use_rawvideo = width is not None and height is not None and width > 0 and height > 0
+    if use_rawvideo:
+        decode_cmd.extend(["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"])
+    else:
+        # Width/height unknown: decode one frame to BMP bytes to avoid guessing raw frame shape.
+        decode_cmd.extend(["-f", "image2pipe", "-vcodec", "bmp", "pipe:1"])
 
     try:
         proc = subprocess.run(
@@ -210,14 +204,20 @@ def _decode_image_with_ffmpeg(
         stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
         return None, f"ffmpeg decode failed: {stderr or 'unknown error'}"
 
-    expected_size = width * height * 3
-    if len(proc.stdout) != expected_size:
-        return None, (
-            "ffmpeg decode size mismatch: "
-            f"expected={expected_size}, got={len(proc.stdout)}"
-        )
+    if use_rawvideo:
+        expected_size = int(width) * int(height) * 3
+        if len(proc.stdout) != expected_size:
+            return None, (
+                "ffmpeg decode size mismatch: "
+                f"expected={expected_size}, got={len(proc.stdout)}"
+            )
+        decoded = np.frombuffer(proc.stdout, dtype=np.uint8).reshape((int(height), int(width), 3))
+        return decoded, None
 
-    decoded = np.frombuffer(proc.stdout, dtype=np.uint8).reshape((height, width, 3))
+    frame_buf = np.frombuffer(proc.stdout, dtype=np.uint8)
+    decoded = cv2.imdecode(frame_buf, cv2.IMREAD_COLOR)
+    if decoded is None:
+        return None, "ffmpeg image2pipe decode failed"
     return decoded, None
 
 @asynccontextmanager
@@ -283,9 +283,12 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
                 _probe_image_size, contents
             )
             if probe_err:
-                logging.warning("ffprobe 探测失败，将尝试 cv2.imdecode: %s", probe_err)
+                logging.warning(
+                    "ffprobe 探测失败，将继续尝试 ffmpeg(QSV/CPU) 再回退 cv2.imdecode: %s",
+                    probe_err,
+                )
             elif width_probe is None or height_probe is None:
-                logging.warning("ffprobe 未返回有效尺寸，将尝试 cv2.imdecode。")
+                logging.warning("ffprobe 未返回有效尺寸，将继续尝试 ffmpeg(QSV/CPU)。")
             elif high_bit_depth:
                 logging.warning("检测到高位深图像，改用 cv2.imdecode 保持 16-bit->8-bit 语义。")
             elif width_probe is not None and height_probe is not None and (
@@ -293,7 +296,8 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
             ):
                 logging.warning(f"文件 '{file.filename}' 尺寸超限（ffmpeg probe）")
                 return None, "height or width out of range"
-            else:
+
+            if not high_bit_depth:
                 ffmpeg_qsv_img, ffmpeg_qsv_err = await asyncio.to_thread(
                     _decode_image_with_ffmpeg, contents, True, width_probe, height_probe
                 )

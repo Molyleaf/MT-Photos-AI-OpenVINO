@@ -69,6 +69,12 @@ RUN apt remove -y build-essential gcc libpq-dev; \
 COPY --chown=appuser:appgroup app /app
 COPY --chown=appuser:appgroup models/ /models/
 
+RUN set -eux; \
+    test -f /models/rapidocr/ch_PP-OCRv5_mobile_det.onnx; \
+    test -f /models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx; \
+    test -f /models/rapidocr/ppocrv5_dict.txt; \
+    test -f /models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx
+
 USER appuser
 
 EXPOSE 8060
