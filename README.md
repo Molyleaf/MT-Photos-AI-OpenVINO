@@ -1,6 +1,6 @@
 # MT-Photos AI (OpenVINO)
 
-统一提供 OCR、图文向量（QA-CLIP）和人脸向量（InsightFace）的 FastAPI 服务。本文档仅保留部署相关内容：Windows 本机部署与 Linux Docker 部署。
+统一提供 OCR、图文向量（QA-CLIP）和人脸向量（InsightFace）的 FastAPI 服务。本文档仅保留部署相关内容：Windows 本机部署与 Debian/Linux Docker 部署。
 
 ## 部署前准备
 
@@ -10,6 +10,26 @@
   - `models/insightface/models`
   - `models/rapidocr`（建议提前下载，避免首次请求在线拉取）
 - 服务入口：`app/server.py`
+
+## Debian 容器目标与当前实践
+
+当前仓库已支持 Debian 容器部署，基线为 `python:3.12-slim-bookworm`（Debian 12）。
+
+当前 Docker 实践状态（已落地）：
+
+- 使用 Debian 稳定版基础镜像（避免 `trixie/testing` 漂移风险）
+- APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`
+- PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`
+- 使用 `apt-get install --no-install-recommends`，并清理 apt 索引
+- 以非 root 用户运行服务（可通过 `APP_UID` / `APP_GID` 对齐宿主机权限）
+- 提供容器健康检查（`GET /`，不依赖 API Key）
+- 提供 `.dockerignore`，降低构建上下文体积
+- 内置 OpenVINO 所需驱动（`intel-opencl-icd`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-media-va-driver-non-free`、`libva2`、`vainfo`、`clinfo`）
+
+仍需按宿主机确认项：
+
+- Debian 宿主需正确映射 `/dev/dri` 才能使用 Intel iGPU
+- `VIDEO_GID` / `RENDER_GID` 需与宿主机设备组一致（默认 `44/109`）
 
 ## 环境变量（运行时，全量）
 
@@ -98,7 +118,13 @@ Invoke-WebRequest http://127.0.0.1:8060/ -UseBasicParsing
 
 业务端点（如 `/check`、`/clip/txt`、`/ocr`、`/represent`）请在请求头携带 `api-key`（当 `API_AUTH_KEY` 不是 `no-key` 时）。
 
-## Linux Docker 部署
+## Debian/Linux Docker 部署
+
+推荐宿主环境：
+
+- Debian 12/13（或兼容发行版）
+- Docker Engine 24+ 与 Docker Compose v2
+- Intel iGPU 场景下，宿主机可见 `/dev/dri`（可用 `ls -l /dev/dri` 验证）
 
 ### 方式一：docker compose（推荐）
 
@@ -108,18 +134,28 @@ Invoke-WebRequest http://127.0.0.1:8060/ -UseBasicParsing
 cp docker-compose.example.yml docker-compose.yml
 ```
 
-2. 编辑 `docker-compose.yml`：
+2. 根据宿主机设置用户与 GPU 组（Debian 示例）：
+
+```bash
+export APP_UID=$(id -u)
+export APP_GID=$(id -g)
+export VIDEO_GID=$(getent group video | cut -d: -f3)
+export RENDER_GID=$(getent group render | cut -d: -f3)
+```
+
+3. 编辑 `docker-compose.yml`：
 - 设置 `API_AUTH_KEY`
 - 根据机器情况设置 `INFERENCE_DEVICE`（有 Intel iGPU 且已映射 `/dev/dri` 时可用 `GPU`）
+- 如需替换 PyPI 镜像，可覆盖 `PIP_INDEX_URL`（默认已是浙大镜像）
 - 按需调整并发与缓存目录
 
-3. 启动：
+4. 启动：
 
 ```bash
 docker compose up -d --build
 ```
 
-4. 查看状态：
+5. 查看状态：
 
 ```bash
 docker compose ps
@@ -129,11 +165,18 @@ docker compose logs -f mt-photos-ai-openvino
 ### 方式二：docker run
 
 ```bash
-docker build -t mt-photos-ai-openvino .
+docker build \
+  --build-arg APP_UID=$(id -u) \
+  --build-arg APP_GID=$(id -g) \
+  --build-arg PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
+  -t mt-photos-ai-openvino .
 docker run -d \
   --name mt-photos-ai-openvino \
+  --init \
   -p 8060:8060 \
   --device /dev/dri:/dev/dri \
+  --group-add $(getent group video | cut -d: -f3) \
+  --group-add $(getent group render | cut -d: -f3) \
   -v $(pwd)/models:/models \
   -v $(pwd)/app/config/cfg_openvino_cpu.yaml:/app/config/cfg_openvino_cpu.yaml:ro \
   -e API_AUTH_KEY=your_secret_key \
@@ -143,6 +186,15 @@ docker run -d \
   -e RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
   -e RAPIDOCR_MODEL_DIR=/models/rapidocr \
   mt-photos-ai-openvino
+```
+
+### OpenVINO 驱动检查（容器内）
+
+首次部署建议执行以下检查，确认 OpenVINO GPU 运行环境完整：
+
+```bash
+docker exec -it mt-photos-ai-openvino clinfo
+docker exec -it mt-photos-ai-openvino vainfo
 ```
 
 ## RapidOCR 模型下载

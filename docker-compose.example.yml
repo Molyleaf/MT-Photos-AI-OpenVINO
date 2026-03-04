@@ -3,13 +3,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.zju.edu.cn/pypi/web/simple}
     container_name: mt-photos-ai-openvino
+    init: true
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8060:8060"
     volumes:
       # Persist local models and mount RapidOCR OpenVINO config.
       - ./models:/models
       - ./app/config/cfg_openvino_cpu.yaml:/app/config/cfg_openvino_cpu.yaml:ro
+    group_add:
+      # Debian defaults are usually video=44, render=109.
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
     environment:
       # --- IMPORTANT ---
       # SET YOUR SECRET API KEY HERE

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.run
+.venv
+__pycache__/
+*.py[cod]
+*.log
+cache/
+example/

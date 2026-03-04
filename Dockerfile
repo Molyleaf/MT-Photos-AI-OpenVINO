@@ -1,59 +1,85 @@
-FROM python:3.12-slim-trixie
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APP_UID=1000
+ARG APP_GID=1000
+ARG PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
     INFERENCE_DEVICE=GPU \
     WEB_CONCURRENCY=2 \
     OV_CACHE_DIR=/models/cache/openvino \
     RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
-    RAPIDOCR_MODEL_DIR=/models/rapidocr
-
-USER root
-
-# Optional APT mirror override.
-RUN rm -f /etc/apt/sources.list \
-    && rm -rf /etc/apt/sources.list.d/*
+    RAPIDOCR_MODEL_DIR=/models/rapidocr \
+    LIBVA_DRIVER_NAME=iHD
 
 COPY sources.list /etc/apt/sources.list
 
-RUN apt update \
-    && apt dist-upgrade -y \
-    && apt install -y --no-install-recommends \
-        python3-dev \
-        g++ \
+RUN set -eux; \
+    apt-get update; \
+    required_pkgs=" \
+        ca-certificates \
+        clinfo \
+        libdrm2 \
         libgl1 \
         libglib2.0-0 \
+        libgomp1 \
         libsm6 \
-        libxext6 \
-        libxrender-dev \
-        ocl-icd-libopencl1 \
-        mesa-opencl-icd \
         libva2 \
+        libxext6 \
+        libxrender1 \
+        mesa-opencl-icd \
         mesa-va-drivers \
-        clinfo \
+        ocl-icd-libopencl1 \
         vainfo \
-        mesa-vulkan-drivers \
-        libclang-rt-19-dev \
-    && rm -rf /var/lib/apt/lists/*
+    "; \
+    driver_pkgs_optional=" \
+        intel-opencl-icd \
+        intel-media-va-driver \
+        intel-media-va-driver-non-free \
+        intel-level-zero-gpu \
+        level-zero \
+        libze1 \
+        libze-intel-gpu1 \
+    "; \
+    install_pkgs="${required_pkgs}"; \
+    for pkg in ${driver_pkgs_optional}; do \
+        if apt-cache show "${pkg}" > /dev/null 2>&1; then \
+            install_pkgs="${install_pkgs} ${pkg}"; \
+        fi; \
+    done; \
+    apt-get install -y --no-install-recommends ${install_pkgs}; \
+    dpkg -l | grep -Eq '^ii[[:space:]]+(intel-opencl-icd|mesa-opencl-icd)[[:space:]]' || (echo "Missing OpenCL runtime packages" >&2; exit 1); \
+    dpkg -l | grep -Eq '^ii[[:space:]]+(libze1|level-zero|intel-level-zero-gpu|libze-intel-gpu1)[[:space:]]' || (echo "Missing Level Zero runtime packages" >&2; exit 1); \
+    dpkg -l | grep -Eq '^ii[[:space:]]+(intel-media-va-driver|intel-media-va-driver-non-free|mesa-va-drivers)[[:space:]]' || (echo "Missing VAAPI runtime packages" >&2; exit 1); \
+    rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt /tmp/requirements.txt
 
-RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple/ \
-    && pip install --no-cache-dir -r requirements.txt \
-    && apt remove g++ -y \
-    && apt autoremove -y \
-    && apt autoclean -y
+RUN set -eux; \
+    pip install --no-cache-dir -r /tmp/requirements.txt; \
+    rm -f /tmp/requirements.txt
 
-RUN mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidocr /models/cache/openvino
+RUN set -eux; \
+    groupadd --gid "${APP_GID}" appgroup; \
+    useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
+    mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidocr /models/cache/openvino; \
+    chown -R appuser:appgroup /app /models
 
-COPY models/qa-clip/openvino /models/qa-clip/openvino
-COPY models/insightface/models /models/insightface/models
-COPY app /app
+COPY --chown=appuser:appgroup app /app
+COPY --chown=appuser:appgroup models/qa-clip/openvino /models/qa-clip/openvino
+COPY --chown=appuser:appgroup models/insightface/models /models/insightface/models
+
+USER appuser
 
 EXPOSE 8060
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8060/', timeout=3)" || exit 1
 
 CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port 8060 --workers ${WEB_CONCURRENCY:-2}"]
