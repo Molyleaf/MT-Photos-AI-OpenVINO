@@ -13,23 +13,50 @@
 
 ## Debian 容器目标与当前实践
 
-当前仓库已支持 Debian 容器部署，基线为 `python:3.12-slim-bookworm`（Debian 12）。
+当前仓库已支持 Debian 容器部署，基线为 `python:3.12-slim-trixie`（Debian 13）。
 
 当前 Docker 实践状态（已落地）：
 
-- 使用 Debian 稳定版基础镜像（避免 `trixie/testing` 漂移风险）
+- 使用 Debian 13 基础镜像（`trixie`）
 - APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`
 - PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`
 - 使用 `apt-get install --no-install-recommends`，并清理 apt 索引
 - 以非 root 用户运行服务（可通过 `APP_UID` / `APP_GID` 对齐宿主机权限）
 - 提供容器健康检查（`GET /`，不依赖 API Key）
 - 提供 `.dockerignore`，降低构建上下文体积
-- 内置 OpenVINO 所需驱动（`intel-opencl-icd`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-media-va-driver-non-free`、`libva2`、`vainfo`、`clinfo`）
+- 内置 OpenVINO + Xe 核显图片转码所需驱动（`intel-media-va-driver-non-free`、`libvpl2`、`libmfx-gen1.2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`libva2`、`libva-drm2`、`ffmpeg`、`clinfo`、`vainfo`）
 
 仍需按宿主机确认项：
 
 - Debian 宿主需正确映射 `/dev/dri` 才能使用 Intel iGPU
 - `VIDEO_GID` / `RENDER_GID` 需与宿主机设备组一致（默认 `44/109`）
+
+### Debian 13 Xe 依赖（干净 apt install 清单）
+
+以下列表可直接用于 Debian 13 宿主或容器内安装（与当前 Dockerfile 一致）：
+
+```bash
+apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  ffmpeg \
+  clinfo \
+  vainfo \
+  libdrm2 \
+  libgl1 \
+  libglib2.0-0 \
+  libgomp1 \
+  libsm6 \
+  libxext6 \
+  libxrender1 \
+  libva2 \
+  libva-drm2 \
+  intel-media-va-driver-non-free \
+  libvpl2 \
+  libmfx-gen1.2 \
+  libze1 \
+  ocl-icd-libopencl1 \
+  mesa-opencl-icd
+```
 
 ## 环境变量（运行时，全量）
 
@@ -122,7 +149,7 @@ Invoke-WebRequest http://127.0.0.1:8060/ -UseBasicParsing
 
 推荐宿主环境：
 
-- Debian 12/13（或兼容发行版）
+- Debian 13（或兼容发行版）
 - Docker Engine 24+ 与 Docker Compose v2
 - Intel iGPU 场景下，宿主机可见 `/dev/dri`（可用 `ls -l /dev/dri` 验证）
 
@@ -183,6 +210,7 @@ docker run -d \
   -e INFERENCE_DEVICE=GPU \
   -e WEB_CONCURRENCY=2 \
   -e OV_CACHE_DIR=/models/cache/openvino \
+  -e LIBVA_DRIVER_NAME=iHD \
   -e RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
   -e RAPIDOCR_MODEL_DIR=/models/rapidocr \
   mt-photos-ai-openvino
@@ -195,7 +223,10 @@ docker run -d \
 ```bash
 docker exec -it mt-photos-ai-openvino clinfo
 docker exec -it mt-photos-ai-openvino vainfo
+docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 ```
+
+如需在容器内进行图片转码（例如 `png/jpg/webp` 与帧图像处理链）并强制走 Intel 核显，可优先使用 `ffmpeg` 的 VAAPI/QSV 路径。
 
 ## RapidOCR 模型下载
 

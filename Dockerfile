@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 WORKDIR /app
 
@@ -22,41 +22,26 @@ COPY sources.list /etc/apt/sources.list
 
 RUN set -eux; \
     apt-get update; \
-    required_pkgs=" \
+    apt-get install -y --no-install-recommends \
         ca-certificates \
+        ffmpeg \
         clinfo \
+        vainfo \
         libdrm2 \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
         libsm6 \
-        libva2 \
         libxext6 \
         libxrender1 \
-        mesa-opencl-icd \
-        mesa-va-drivers \
-        ocl-icd-libopencl1 \
-        vainfo \
-    "; \
-    driver_pkgs_optional=" \
-        intel-opencl-icd \
-        intel-media-va-driver \
+        libva2 \
+        libva-drm2 \
         intel-media-va-driver-non-free \
-        intel-level-zero-gpu \
-        level-zero \
+        libvpl2 \
+        libmfx-gen1.2 \
         libze1 \
-        libze-intel-gpu1 \
-    "; \
-    install_pkgs="${required_pkgs}"; \
-    for pkg in ${driver_pkgs_optional}; do \
-        if apt-cache show "${pkg}" > /dev/null 2>&1; then \
-            install_pkgs="${install_pkgs} ${pkg}"; \
-        fi; \
-    done; \
-    apt-get install -y --no-install-recommends ${install_pkgs}; \
-    dpkg -l | grep -Eq '^ii[[:space:]]+(intel-opencl-icd|mesa-opencl-icd)[[:space:]]' || (echo "Missing OpenCL runtime packages" >&2; exit 1); \
-    dpkg -l | grep -Eq '^ii[[:space:]]+(libze1|level-zero|intel-level-zero-gpu|libze-intel-gpu1)[[:space:]]' || (echo "Missing Level Zero runtime packages" >&2; exit 1); \
-    dpkg -l | grep -Eq '^ii[[:space:]]+(intel-media-va-driver|intel-media-va-driver-non-free|mesa-va-drivers)[[:space:]]' || (echo "Missing VAAPI runtime packages" >&2; exit 1); \
+        ocl-icd-libopencl1 \
+        mesa-opencl-icd; \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt

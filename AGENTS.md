@@ -12,7 +12,7 @@
 
 ## 1. 仓库事实与目录结构（先对齐背景）
 
-- 语言与运行时：**Python 3.12**（目标平台：Windows Server + Debian 容器）。
+- 语言与运行时：**Python 3.12**（目标平台：Windows Server + Debian 13 容器）。
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.zju.edu.cn/debian/`，PyPI 使用 `https://mirrors.zju.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。

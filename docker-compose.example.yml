@@ -35,6 +35,7 @@ services:
       - TEXT_CLIP_BATCH_SIZE=8
       - TEXT_MODEL_RESTORE_DELAY_MS=5000
       - OV_CACHE_DIR=/models/cache/openvino
+      - LIBVA_DRIVER_NAME=iHD
       - RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml
       - RAPIDOCR_MODEL_DIR=/models/rapidocr
     devices:
