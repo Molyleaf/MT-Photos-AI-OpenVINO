@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     INFERENCE_DEVICE=GPU \
-    WEB_CONCURRENCY=2 \
+    WEB_CONCURRENCY=1 \
     OV_CACHE_DIR=/models/cache/openvino \
     RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
     RAPIDOCR_MODEL_DIR=/models/rapidocr \
@@ -22,7 +22,7 @@ COPY sources.list /etc/apt/sources.list
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get install -y \
         ca-certificates \
         ffmpeg \
         clinfo \
