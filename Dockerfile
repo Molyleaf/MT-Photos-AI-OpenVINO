@@ -18,6 +18,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RAPIDOCR_MODEL_DIR=/models/rapidocr \
     LIBVA_DRIVER_NAME=iHD
 
+RUN rm -f /etc/apt/sources.list \
+    && rm -rf /etc/apt/sources.list.d/
 COPY sources.list /etc/apt/sources.list
 
 RUN set -eux; \
