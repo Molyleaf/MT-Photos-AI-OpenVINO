@@ -62,7 +62,7 @@ RUN set -eux; \
     mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidocr /models/cache/openvino; \
     chown -R appuser:appgroup /app /models
 
-RUN apt remove -y build-essential gcc libpq-dev curl; \
+RUN apt remove -y build-essential gcc libpq-dev; \
     apt autoremove; \
     apt autoclean
 
