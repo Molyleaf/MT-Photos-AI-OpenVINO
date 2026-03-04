@@ -29,13 +29,13 @@
 | `RESTART_TEXT_RESTORE_DELAY_MS` | 旧变量，仅在未设置 `TEXT_MODEL_RESTORE_DELAY_MS` 时生效 | `2000` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径 | `<repo>/cache/openvino` |
 | `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR 配置文件路径（YAML） | `app/config/cfg_openvino_cpu.yaml` |
-| `RAPIDOCR_MODEL_DIR` | RapidOCR 模型目录（用于兼容不同 RapidOCR 构造参数） | `<repo>/models/rapidocr` |
+| `RAPIDOCR_MODEL_DIR` | RapidOCR 模型目录（服务会优先从该目录加载 `PP-OCRv5 mobile det/rec/dict`） | `<repo>/models/rapidocr` |
 | `RAPIDOCR_FONT_PATH` | 字体文件路径；空表示不指定 | 空 |
-| `RAPIDOCR_INFERENCE_NUM_THREADS` | 整数，建议 `1~CPU核心数` | `8` |
+| `RAPIDOCR_INFERENCE_NUM_THREADS` | 整数，建议 `1~CPU核心数` | `-1`（跟随 `cfg_openvino_cpu.yaml`） |
 | `RAPIDOCR_PERFORMANCE_HINT` | OpenVINO 性能提示，常用：`LATENCY` / `THROUGHPUT` | `LATENCY` |
 | `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | 整数；`-1` 表示自动 | `-1` |
 | `RAPIDOCR_ENABLE_CPU_PINNING` | 布尔：`1/true/yes/on` 或 `0/false/no/off`（大小写不敏感） | `true` |
-| `RAPIDOCR_NUM_STREAMS` | 整数；`-1` 表示自动 | `-1` |
+| `RAPIDOCR_NUM_STREAMS` | 整数；`-1` 表示自动 | `1`（跟随 `cfg_openvino_cpu.yaml`） |
 | `RAPIDOCR_ENABLE_HYPER_THREADING` | 布尔：`1/true/yes/on` 或 `0/false/no/off` | `true` |
 | `RAPIDOCR_SCHEDULING_CORE_TYPE` | OpenVINO 核调度类型，常用：`ANY_CORE` / `PCORE_ONLY` / `ECORE_ONLY` | `ANY_CORE` |
 | `INSIGHTFACE_OV_DEVICE` | 透传给 ORT OpenVINO EP 的 `device_type`；常见：`CPU_FP32` / `CPU_FP16` / `GPU_FP32` / `GPU_FP16` | `CPU_FP32` |
@@ -149,25 +149,25 @@ docker run -d \
 
 ### 方式一：自动下载（最省事）
 
-保持 `app/config/cfg_openvino_cpu.yaml` 里的 `Det/Cls/Rec.model_path` 为 `null`，首次调用 `/ocr` 时会自动下载模型到 RapidOCR 默认目录（通常是 Python 站点包目录下的 `rapidocr/models`）。
+保持 `app/config/cfg_openvino_cpu.yaml` 里的 `Det/Rec.model_path` 为 `null`，首次调用 `/ocr` 时会自动下载模型到 RapidOCR 默认目录（通常是 Python 站点包目录下的 `rapidocr/models`）。
 
 ### 方式二：离线预下载（推荐用于生产/镜像）
 
-本仓库当前配置使用 `PP-OCRv4 + server`，至少需要以下 4 个文件：
+本仓库当前默认配置使用 `PP-OCRv5 + mobile`（核心为 `Det/Rec`），建议预置以下 4 个文件：
 
-- `ch_PP-OCRv4_det_server_infer.onnx`
-- `ch_ppocr_mobile_v2.0_cls_infer.onnx`
-- `ch_PP-OCRv4_rec_server_infer.onnx`
-- `ppocr_keys_v1.txt`
+- `ch_PP-OCRv5_mobile_det.onnx`
+- `ch_PP-OCRv5_rec_mobile_infer.onnx`
+- `ppocrv5_dict.txt`
+- `ch_ppocr_mobile_v2.0_cls_infer.onnx`（RapidOCR 初始化兼容）
 
 Linux/macOS 下载示例：
 
 ```bash
 mkdir -p models/rapidocr
-curl -L -o models/rapidocr/ch_PP-OCRv4_det_server_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/det/ch_PP-OCRv4_det_server_infer.onnx"
+curl -L -o models/rapidocr/ch_PP-OCRv5_mobile_det.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx"
+curl -L -o models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx"
+curl -L -o models/rapidocr/ppocrv5_dict.txt "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt"
 curl -L -o models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-curl -L -o models/rapidocr/ch_PP-OCRv4_rec_server_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_server_infer.onnx"
-curl -L -o models/rapidocr/ppocr_keys_v1.txt "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt"
 ```
 
 Windows PowerShell 下载示例：
@@ -176,27 +176,38 @@ Windows PowerShell 下载示例：
 $dir = "models/rapidocr"
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/det/ch_PP-OCRv4_det_server_infer.onnx" -OutFile "$dir/ch_PP-OCRv4_det_server_infer.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx" -OutFile "$dir/ch_PP-OCRv5_mobile_det.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx" -OutFile "$dir/ch_PP-OCRv5_rec_mobile_infer.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt" -OutFile "$dir/ppocrv5_dict.txt"
 Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx" -OutFile "$dir/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_server_infer.onnx" -OutFile "$dir/ch_PP-OCRv4_rec_server_infer.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt" -OutFile "$dir/ppocr_keys_v1.txt"
 ```
 
 下载后请在 `app/config/cfg_openvino_cpu.yaml` 中指定绝对路径（推荐）：
 
 ```yaml
 Det:
-  model_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ch_PP-OCRv4_det_server_infer.onnx"
+  model_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ch_PP-OCRv5_mobile_det.onnx"
+Rec:
+  model_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx"
+  rec_keys_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ppocrv5_dict.txt"
 Cls:
   model_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-Rec:
-  model_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ch_PP-OCRv4_rec_server_infer.onnx"
-  rec_keys_path: "D:/path/to/mt-photos-ai-openvino/models/rapidocr/ppocr_keys_v1.txt"
 ```
+
+说明：
+- 当前默认配置 `Global.use_cls=false`，即不启用方向分类器（仅使用 `PP-OCRv5 mobile det+rec`）。
+- 如需启用分类器，可将 `Global.use_cls=true`，并额外下载 `ch_ppocr_mobile_v2.0_cls_infer.onnx`。
 
 ## RapidOCR OpenVINO CPU 配置
 
 示例文件：`app/config/cfg_openvino_cpu.yaml`
+
+当前默认值针对 Intel i7-11800H + OpenVINO CPU 的低延迟场景：
+
+- `performance_hint: LATENCY`
+- `inference_num_threads: -1`（交给 OpenVINO 自动决策线程）
+- `num_streams: 1`（避免和应用层并发叠加造成过度订阅）
+- `enable_cpu_pinning: true`
 
 可用关键参数：
 

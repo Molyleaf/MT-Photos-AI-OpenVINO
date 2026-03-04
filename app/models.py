@@ -56,6 +56,10 @@ _SEP_TOKEN_ID = int(_TOKENIZER.vocab["[SEP]"])
 QUEUE_MAX_SIZE = int(os.environ.get("INFERENCE_QUEUE_MAX_SIZE", "64"))
 TEXT_BATCH_SIZE = int(os.environ.get("TEXT_CLIP_BATCH_SIZE", "8"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "120"))
+RAPIDOCR_V5_MOBILE_DET_FILE = "ch_PP-OCRv5_mobile_det.onnx"
+RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
+RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
+RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
 LOG = logging.getLogger(__name__)
 
@@ -192,6 +196,7 @@ class AIModels:
         self.rapidocr_model_dir = os.environ.get(
             "RAPIDOCR_MODEL_DIR", str(self.model_base_path / "rapidocr")
         )
+        self.rapidocr_model_dir_path = Path(self.rapidocr_model_dir).expanduser().resolve()
         self.rapidocr_font_path = os.environ.get("RAPIDOCR_FONT_PATH", "")
 
         self.core = ov.Core()
@@ -672,7 +677,7 @@ class AIModels:
         self._clip_image_resolution = CLIP_IMAGE_RESOLUTION
         LOG.warning("CLIP Vision model loaded on %s.", CLIP_INFERENCE_DEVICE)
 
-    def _load_rapidocr_server_config(self) -> Dict[str, Any]:
+    def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {
             "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), 8),
             "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "LATENCY"),
@@ -715,6 +720,78 @@ class AIModels:
             "CACHE_DIR": str(cfg.get("cache_dir", self.ov_cache_dir)),
         }
 
+    def _resolve_rapidocr_local_asset(self, filename: str) -> Optional[Path]:
+        candidate = self.rapidocr_model_dir_path / filename
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        return None
+
+    def _build_rapidocr_runtime_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "EngineConfig.openvino.inference_num_threads": _as_int(
+                cfg.get("inference_num_threads"), -1
+            ),
+            "EngineConfig.openvino.performance_hint": str(
+                cfg.get("performance_hint", "LATENCY")
+            ),
+            "EngineConfig.openvino.performance_num_requests": _as_int(
+                cfg.get("performance_num_requests"), -1
+            ),
+            "EngineConfig.openvino.enable_cpu_pinning": _as_bool(
+                cfg.get("enable_cpu_pinning"), True
+            ),
+            "EngineConfig.openvino.num_streams": _as_int(cfg.get("num_streams"), -1),
+            "EngineConfig.openvino.enable_hyper_threading": _as_bool(
+                cfg.get("enable_hyper_threading"), True
+            ),
+            "EngineConfig.openvino.scheduling_core_type": str(
+                cfg.get("scheduling_core_type", "ANY_CORE")
+            ),
+        }
+
+        if self.rapidocr_font_path:
+            params["Global.font_path"] = self.rapidocr_font_path
+
+        det_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_MOBILE_DET_FILE)
+        rec_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_MOBILE_REC_FILE)
+        rec_dict_path = self._resolve_rapidocr_local_asset(RAPIDOCR_V5_DICT_FILE)
+        cls_model_path = self._resolve_rapidocr_local_asset(RAPIDOCR_CLS_MOBILE_V2_FILE)
+
+        if det_model_path:
+            params["Det.model_path"] = str(det_model_path)
+        else:
+            LOG.warning(
+                "RapidOCR det model not found at %s; fallback to RapidOCR downloader.",
+                self.rapidocr_model_dir_path / RAPIDOCR_V5_MOBILE_DET_FILE,
+            )
+
+        if rec_model_path:
+            params["Rec.model_path"] = str(rec_model_path)
+        else:
+            LOG.warning(
+                "RapidOCR rec model not found at %s; fallback to RapidOCR downloader.",
+                self.rapidocr_model_dir_path / RAPIDOCR_V5_MOBILE_REC_FILE,
+            )
+
+        if rec_dict_path:
+            params["Rec.rec_keys_path"] = str(rec_dict_path)
+        else:
+            LOG.warning(
+                "RapidOCR rec dict not found at %s; fallback to RapidOCR downloader.",
+                self.rapidocr_model_dir_path / RAPIDOCR_V5_DICT_FILE,
+            )
+
+        if cls_model_path:
+            # RapidOCR initializes cls session even when Global.use_cls=false.
+            params["Cls.model_path"] = str(cls_model_path)
+        else:
+            LOG.warning(
+                "RapidOCR cls model not found at %s; fallback to RapidOCR downloader.",
+                self.rapidocr_model_dir_path / RAPIDOCR_CLS_MOBILE_V2_FILE,
+            )
+
+        return params
+
     @staticmethod
     def _constructor_filter_kwargs(kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
         try:
@@ -733,7 +810,7 @@ class AIModels:
         except (TypeError, ValueError):
             return [kwargs]
 
-    def _instantiate_rapidocr(self, ov_cfg: Dict[str, str]) -> RapidOCR:
+    def _instantiate_rapidocr(self, ov_cfg: Dict[str, str], params: Dict[str, Any]) -> RapidOCR:
         model_dir_value = self.rapidocr_model_dir if self.rapidocr_model_dir else None
         font_path_value = self.rapidocr_font_path if self.rapidocr_font_path else None
 
@@ -764,11 +841,14 @@ class AIModels:
             config_path_text = str(self.rapidocr_config_path)
             candidate_kwargs.extend(
                 [
-                    {"params_path": config_path_text},
+                    {"config_path": config_path_text, "params": params},
+                    {"params_path": config_path_text, "params": params},
+                    {"cfg_path": config_path_text, "params": params},
                     {"config_path": config_path_text},
-                    {"cfg_path": config_path_text},
                 ]
             )
+        elif params:
+            candidate_kwargs.append({"params": params})
 
         candidate_kwargs.extend(
             [
@@ -811,9 +891,10 @@ class AIModels:
         ) from last_error
 
     def _load_rapidocr_locked(self) -> None:
-        config = self._load_rapidocr_server_config()
+        config = self._load_rapidocr_openvino_config()
         ov_cfg = self._to_openvino_plugin_config(config)
-        self._rapidocr_engine = self._instantiate_rapidocr(ov_cfg)
+        rapidocr_params = self._build_rapidocr_runtime_params(config)
+        self._rapidocr_engine = self._instantiate_rapidocr(ov_cfg, rapidocr_params)
         LOG.warning("RapidOCR loaded with OpenVINO CPU backend.")
 
     def _load_face_locked(self) -> None:

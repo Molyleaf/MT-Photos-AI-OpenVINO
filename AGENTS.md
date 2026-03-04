@@ -65,7 +65,10 @@
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
 - 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO CPU** 后端（不使用 GPU）。
-- 使用 server 模型配置。
+- 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
+- 默认关闭方向分类器（`Global.use_cls=false`）；如需开启，必须明确下载并配置分类模型。
+- 即使 `Global.use_cls=false`，也应预置 `ch_ppocr_mobile_v2.0_cls_infer.onnx`，避免 RapidOCR 初始化阶段触发在线下载。
+- OpenVINO CPU 参数基线（面向 i7-11800H 低延迟）：`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=1`、`enable_cpu_pinning=true`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 
@@ -243,7 +246,7 @@
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
-- [ ] RapidOCR 是否为 `rapidocr==3.6.0` 且 OpenVINO CPU 后端
+- [ ] RapidOCR 是否为 `rapidocr==3.6.0` + OpenVINO CPU + PP-OCRv5 mobile（Det/Rec）
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
 - [ ] 是否遵守“待机常驻 Text-CLIP + 单模型族互斥加载 + 文本请求优先”策略
 - [ ] 是否采用多进程 Worker + 有界队列 + Worker 内批处理，并规避线程过度订阅
