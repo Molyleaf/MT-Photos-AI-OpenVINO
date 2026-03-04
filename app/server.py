@@ -18,7 +18,6 @@ from fastapi.security import APIKeyHeader
 import models as ai_models
 from schemas import (
     CheckResponse,
-    OCRResult,
     TextClipRequest,
     # RepresentResponse, # 不再用于 /represent 的响应模型
     RestartResponse
@@ -67,7 +66,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         logging.warning(f"拒绝了无效的 API 密钥: {api_key_header}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="无效的 API 密钥",
+            detail="Invalid API key",
         )
 
 SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
@@ -119,7 +118,6 @@ app = FastAPI(
     title="MT-Photos AI 统一服务",
     description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
     version="2.2.0",
-    dependencies=[Depends(get_api_key)],
     lifespan=lifespan
 )
 
@@ -206,20 +204,16 @@ async def top_info():
     return HTMLResponse(content=html_content)
 
 # --- 【修复：合并 /check 响应】 ---
-@app.post("/check", response_model=CheckResponse)
+@app.post("/check", response_model=CheckResponse, dependencies=[Depends(get_api_key)])
 async def check_service(t: str = ""):
-    if not models_instance:
-        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     return {
         "result": "pass",
-        "title": "MT-Photos AI 统一服务 (OpenVINO 版本)",
+        "title": "mt-photos-ai服务",
         "help": "https://mtmt.tech/docs/advanced/ocr_api",
-        "detector_backend": "insightface",
-        "recognition_model": ai_models.MODEL_NAME
     }
 # --- 修复结束 ---
 
-@app.post("/restart", response_model=RestartResponse)
+@app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
     logging.warning(
         "收到 /restart 请求，正在释放模型。Text-CLIP 将在无其它任务 %sms 后恢复。",
@@ -237,7 +231,7 @@ async def restart_service():
             logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
     return {"result": "pass"}
 
-@app.post("/restart_v2", response_model=RestartResponse)
+@app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_process():
     logging.warning("收到 /restart_v2 请求，将重启整个服务进程！")
     def delayed_restart():
@@ -249,15 +243,14 @@ async def restart_process():
     return {"result": "pass"}
 
 
-@app.post("/ocr")
+@app.post("/ocr", dependencies=[Depends(get_api_key)])
 async def ocr_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
     image, error_msg = await read_image_from_upload(file)
     if image is None:
-        empty_result = OCRResult(texts=[], scores=[], boxes=[]).model_dump()
-        return {"result": empty_result, "msg": error_msg}
+        return {"result": [], "msg": error_msg}
 
     try:
         ocr_results_obj = await models_instance.get_ocr_results_async(image)
@@ -265,10 +258,9 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
-        empty_result = OCRResult(texts=[], scores=[], boxes=[]).model_dump()
-        return {"result": empty_result, "msg": str(e)}
+        return {"result": [], "msg": str(e)}
 
-@app.post("/clip/img")
+@app.post("/clip/img", dependencies=[Depends(get_api_key)])
 async def clip_image_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
@@ -289,14 +281,10 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
         return {"result": [], "msg": str(e)}
 
-@app.post("/clip/txt")
+@app.post("/clip/txt", dependencies=[Depends(get_api_key)])
 async def clip_text_endpoint(request: TextClipRequest):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
-
-    if not request.text or request.text.isspace():
-        logging.warning("收到了空的 CLIP 文本请求。")
-        return {"result": [], "msg": "empty text"}
 
     try:
         embedding = await models_instance.get_text_embedding_async(request.text)
@@ -306,7 +294,7 @@ async def clip_text_endpoint(request: TextClipRequest):
         logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
         return {"result": [], "msg": str(e)}
 
-@app.post("/represent")
+@app.post("/represent", dependencies=[Depends(get_api_key)])
 async def represent_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")

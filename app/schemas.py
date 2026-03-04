@@ -11,8 +11,6 @@ class CheckResponse(BaseModel):
     result: str
     title: str = "MT-Photos AI 统一服务 (OpenVINO 版本)"
     help: str = "https://github.com/Molyleaf/MT-Photos-AI-OpenVINO"
-    detector_backend: str = "insightface"
-    recognition_model: str = os.environ.get("MODEL_NAME", "buffalo_l")
 
 # --- /ocr 响应 ---
 class OCRBox(BaseModel):

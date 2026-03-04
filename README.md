@@ -51,6 +51,15 @@
 > 兼容性：若未设置 `TEXT_MODEL_RESTORE_DELAY_MS`，服务会回退读取旧变量 `RESTART_TEXT_RESTORE_DELAY_MS`。
 > 总并行度建议按 `WEB_CONCURRENCY × inference_num_threads` 评估，避免线程过订阅。
 
+## API 响应兼容约定
+
+- 鉴权 Header 使用 `api-key`，`API_AUTH_KEY=no-key` 时跳过鉴权。
+- 鉴权范围为除 `GET /` 外的业务端点；`GET /` 不鉴权。
+- 鉴权失败固定返回：HTTP 401，`{"detail":"Invalid API key"}`。
+- `POST /check` 返回字段固定为 `result/title/help`。
+- `POST /ocr` 成功返回 `{"result":<OCRResult>}`；失败返回 `{"result":[],"msg":...}`。
+- `POST /clip/txt` 不包含“空文本特判”分支，按常规推理路径处理。
+
 ## RapidOCR OpenVINO CPU 配置
 
 示例文件: [app/config/cfg_openvino_cpu.yaml](app/config/cfg_openvino_cpu.yaml)

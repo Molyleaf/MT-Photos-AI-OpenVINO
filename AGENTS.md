@@ -85,7 +85,8 @@
 - API Key 校验：
   - Header 名：`api-key`
   - `API_AUTH_KEY` 为空或 `"no-key"` 时跳过鉴权
-  - 鉴权失败：HTTP 401，`detail="无效的 API 密钥"`
+  - 鉴权失败：HTTP 401，`detail="Invalid API key"`
+  - 鉴权范围：除 `GET /` 外的所有业务端点
 - 生命周期：
   - 启动时初始化 `AIModels` 并预热加载 Text-CLIP
   - 关闭时释放全部模型
@@ -111,7 +112,7 @@
 
 2. `POST /check`
 - 响应模型：`CheckResponse`
-- 返回字段：`result/title/help/detector_backend/recognition_model`
+- 返回字段：`result/title/help`
 - `result` 固定 `"pass"`。
 
 3. `POST /restart`
@@ -124,9 +125,9 @@
 
 5. `POST /ocr`
 - 入参：`file`。
-- 读图失败：`{"result":{"texts":[],"scores":[],"boxes":[]},"msg":<错误信息>}`
+- 读图失败：`{"result":[],"msg":<错误信息>}`
 - 成功：`{"result":<OCRResult>}`（成功时不返回 `msg`）
-- 运行异常：`{"result":{"texts":[],"scores":[],"boxes":[]},"msg":<异常文本>}`
+- 运行异常：`{"result":[],"msg":<异常文本>}`
 
 6. `POST /clip/img`
 - 入参：`file`。
@@ -136,7 +137,6 @@
 
 7. `POST /clip/txt`
 - 入参：`{"text": "..."}`
-- 空文本：`{"result":[],"msg":"empty text"}`
 - 成功：`{"result":[<16位小数字符串>...]}`（成功时不返回 `msg`）
 - 异常：`{"result":[],"msg":<异常文本>}`
 
