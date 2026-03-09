@@ -48,7 +48,7 @@
 - OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
-- Windows Server GPU-PV 场景（容器映射 `/dev/dxg`）可用于 OpenVINO GPU 推理/Remote Context；但 `ffmpeg QSV` 硬解链路仍以 `/dev/dri`（VAAPI/oneVPL）为主，需在文档中明确能力边界。
+- 当前服务上传读图链不再依赖 `ffmpeg/QSV`；Debian/Linux 容器部署与验收仍以 `/dev/dri` GPU 节点和 OpenVINO/OpenCL 可见性为准，不能把仅有 `/dev/dxg` 视作当前镜像的等价前提。
 - `/clip/img` 视觉链路必须直接消费 `numpy BGR`，禁止 `BGR -> RGB -> PIL` 的多余拷贝链。
 - CLIP 视觉预处理（`resize + 通道转换 + 归一化 + layout`）必须走 OpenVINO PrePostProcessing (PPP) API，禁止回退到手工 `numpy` 链。
 - 当视觉模型输入为动态 shape 时，PPP 的 `resize` 目标尺寸必须显式固定到模型期望分辨率（当前基线 `224x224`），禁止依赖隐式推断导致运行时构图失败。
@@ -119,7 +119,8 @@
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
 
 - GIF：读取第一帧并转 BGR。
-- 非 GIF：优先 `ffmpeg(QSV)` 解码；若失败需显式记录原因，再按顺序尝试 `ffmpeg(CPU)` 与 `cv2.imdecode(..., IMREAD_UNCHANGED)`；若 `ffprobe` 失败或未返回尺寸，也应继续尝试 `ffmpeg(QSV/CPU)` 后再回退 `cv2.imdecode`；若检测到高位深图像，应直接走 `cv2.imdecode` 以保持 16-bit 处理语义。
+- GIF 解码优先使用 OpenCV 动画解码接口（`cv2.imdecodeanimation`，必要时回退 `cv2.imdecodemulti` / `cv2.imdecode`）读取首帧；禁止重新引入 `PIL` 中转链。
+- 非 GIF：统一使用 `cv2.imdecode(..., IMREAD_UNCHANGED)`；禁止重新引入 `ffmpeg/ffprobe` 子进程解码链。
 - 16-bit 图像：降为 8-bit。
 - 宽高任一超过 `10000`：返回错误 `"height or width out of range"`。
 - 统一输出 3 通道 BGR。
@@ -249,7 +250,7 @@
 ## 10. 开发/自检命令（至少执行到可验证）
 
 - `python -V`（确认 3.12）
-- `pip install -r requirements.txt`
+- 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
 - 关键端点冒烟：`/check`、`/clip/txt`、`/ocr`、`/represent`
@@ -289,12 +290,14 @@
 
 - 当前 Docker 基线镜像为 `python:3.12-slim-trixie`（Debian 13）。
 - APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`。
+- `sources.list` 仅保留 `trixie`、`trixie-updates`、`trixie-security`，不默认启用 `trixie-backports`。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
 - 当前 `requirements.txt` 在 Python 3.12 / manylinux 下可直接使用 wheel 安装，不再默认保留 InsightFace 专用构建依赖。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
-- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`（可选诊断工具：`clinfo`）；以及服务运行依赖：`intel-media-va-driver-non-free`、`libvpl2`、`libmfx-gen1.2`、`libva2`、`libva-drm2`、`ffmpeg`。
+- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
+- 服务上传读图链已经切换为 OpenCV 原生解码，镜像默认不再包含 `ffmpeg/ffprobe`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Debian 13 stable 官方仓库默认不提供 `intel-opencl-icd` / `libze-intel-gpu1`；如需启用 sid 或其他额外源补齐 Intel compute runtime，必须明确评估跨发行版核心库升级风险，不能默认混装。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
@@ -304,6 +307,7 @@
 ### 13.2 最近稳定性修复（2026-03）
 
 - 修复 `/clip/img` 在 OpenVINO 动态输入模型上的 PPP 构建失败：视觉预处理 `resize` 显式固定为 `224x224`，保持输出维度 `768` 与接口语义不变。
+- 收敛上传读图链：`read_image_from_upload` 改为 OpenCV 原生解码，GIF 首帧优先走 `cv2.imdecodeanimation`，并移除 `ffmpeg/ffprobe` 与 `PIL` 运行时依赖。
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=CPU/GPU/AUTO`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。

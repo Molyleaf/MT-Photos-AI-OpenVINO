@@ -17,8 +17,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WEB_CONCURRENCY=1 \
     OV_CACHE_DIR=/models/cache/openvino \
     RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
-    RAPIDOCR_MODEL_DIR=/models/rapidocr \
-    LIBVA_DRIVER_NAME=iHD
+    RAPIDOCR_MODEL_DIR=/models/rapidocr
 
 RUN rm -f /etc/apt/sources.list \
     && rm -rf /etc/apt/sources.list.d/
@@ -27,23 +26,16 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN set -eux; \
     ov_opencl_runtime_deps="\
-        clinfo \
         libdrm2 \
-        libva2 \
-        libva-drm2 \
         libze1 \
         ocl-icd-libopencl1 \
         mesa-opencl-icd"; \
     python_runtime_deps="\
         ca-certificates \
-        ffmpeg \
-        intel-media-va-driver-non-free \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
-        libmfx-gen1.2 \
         libsm6 \
-        libvpl2 \
         libxext6 \
         libxrender1"; \
     apt-get update; \

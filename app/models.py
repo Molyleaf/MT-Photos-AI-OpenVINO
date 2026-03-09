@@ -413,7 +413,8 @@ class AIModels:
             runtime_hint = (
                 " Ensure the container exposes a real Intel /dev/dri render node and installs "
                 "OpenVINO/OpenCL runtime packages (Debian 13 stable baseline: libze1, "
-                "ocl-icd-libopencl1, mesa-opencl-icd; optional diagnostics: clinfo)."
+                "ocl-icd-libopencl1, mesa-opencl-icd; optional diagnostics such as clinfo "
+                "are not bundled in the runtime image by default)."
             )
             if force_gpu_remote_context:
                 raise RuntimeError(

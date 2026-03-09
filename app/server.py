@@ -1,9 +1,7 @@
 # app/server.py
 import asyncio
-import json
 import logging
 import os
-import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -11,8 +9,6 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image
-from io import BytesIO
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
@@ -81,8 +77,6 @@ SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
 TEXT_MODEL_RESTORE_DELAY_MS = ai_models.TEXT_MODEL_RESTORE_DELAY_MS
 idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
-FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 MAX_IMAGE_SIDE = 10000
 
 def idle_timeout_handler():
@@ -153,128 +147,36 @@ def _startup_self_check_dri() -> None:
     )
 
 
-def _probe_image_size(
-    contents: bytes,
-) -> Tuple[Optional[int], Optional[int], Optional[bool], Optional[str]]:
-    probe_cmd = [
-        FFPROBE_BIN,
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height,pix_fmt,bits_per_raw_sample",
-        "-of",
-        "json",
-        "-",
-    ]
-    try:
-        proc = subprocess.run(
-            probe_cmd,
-            input=contents,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-        )
-    except FileNotFoundError:
-        return None, None, None, f"ffprobe not found: {FFPROBE_BIN}"
-    except subprocess.TimeoutExpired:
-        return None, None, None, "ffprobe timeout"
-    except Exception as exc:
-        return None, None, None, f"ffprobe error: {exc}"
+def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    buffer = np.frombuffer(contents, np.uint8)
+    errors: list[str] = []
 
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
-        return None, None, None, f"ffprobe failed: {stderr or 'unknown error'}"
+    if hasattr(cv2, "imdecodeanimation"):
+        try:
+            ok, animation = cv2.imdecodeanimation(buffer)
+        except Exception as exc:
+            errors.append(f"cv2.imdecodeanimation failed: {exc}")
+        else:
+            frames = getattr(animation, "frames", None) if ok else None
+            if frames:
+                return np.asarray(frames[0]), None
 
-    raw_stdout = proc.stdout.decode("utf-8", errors="ignore").strip()
-    try:
-        payload = json.loads(raw_stdout) if raw_stdout else {}
-        streams = payload.get("streams", [])
-        if not streams:
-            return None, None, None, f"ffprobe output parse failed: {raw_stdout}"
-        stream = streams[0] or {}
-        width = int(stream.get("width"))
-        height = int(stream.get("height"))
-        bits_per_raw_sample = stream.get("bits_per_raw_sample")
-        pix_fmt = str(stream.get("pix_fmt") or "").lower()
-        bit_depth = 0
-        if bits_per_raw_sample not in (None, ""):
-            try:
-                bit_depth = int(bits_per_raw_sample)
-            except (TypeError, ValueError):
-                bit_depth = 0
-        if bit_depth <= 0 and pix_fmt:
-            # 常见高位深像素格式：rgb48*/gray16*/yuv420p10* 等。
-            if any(token in pix_fmt for token in ("10", "12", "14", "16", "32", "48", "64")):
-                bit_depth = 16
-        high_bit_depth = bit_depth > 8
-    except Exception:
-        return None, None, None, f"ffprobe output parse failed: {raw_stdout}"
+    if hasattr(cv2, "imdecodemulti"):
+        try:
+            ok, frames = cv2.imdecodemulti(buffer, cv2.IMREAD_UNCHANGED)
+        except Exception as exc:
+            errors.append(f"cv2.imdecodemulti failed: {exc}")
+        else:
+            if ok and frames:
+                return np.asarray(frames[0]), None
 
-    if width <= 0 or height <= 0:
-        return None, None, None, f"ffprobe invalid image size: {raw_stdout}"
-    return width, height, high_bit_depth, None
-
-
-def _decode_image_with_ffmpeg(
-    contents: bytes,
-    prefer_qsv: bool,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    decode_cmd = [
-        FFMPEG_BIN,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-    if prefer_qsv:
-        decode_cmd.extend(["-hwaccel", "qsv"])
-    decode_cmd.extend(["-i", "pipe:0", "-frames:v", "1"])
-    use_rawvideo = width is not None and height is not None and width > 0 and height > 0
-    if use_rawvideo:
-        decode_cmd.extend(["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"])
-    else:
-        # Width/height unknown: decode one frame to BMP bytes to avoid guessing raw frame shape.
-        decode_cmd.extend(["-f", "image2pipe", "-vcodec", "bmp", "pipe:1"])
-
-    try:
-        proc = subprocess.run(
-            decode_cmd,
-            input=contents,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=20,
-        )
-    except FileNotFoundError:
-        return None, f"ffmpeg not found: {FFMPEG_BIN}"
-    except subprocess.TimeoutExpired:
-        return None, "ffmpeg decode timeout"
-    except Exception as exc:
-        return None, f"ffmpeg decode error: {exc}"
-
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="ignore").strip()
-        return None, f"ffmpeg decode failed: {stderr or 'unknown error'}"
-
-    if use_rawvideo:
-        expected_size = int(width) * int(height) * 3
-        if len(proc.stdout) != expected_size:
-            return None, (
-                "ffmpeg decode size mismatch: "
-                f"expected={expected_size}, got={len(proc.stdout)}"
-            )
-        decoded = np.frombuffer(proc.stdout, dtype=np.uint8).reshape((int(height), int(width), 3))
-        return decoded, None
-
-    frame_buf = np.frombuffer(proc.stdout, dtype=np.uint8)
-    decoded = cv2.imdecode(frame_buf, cv2.IMREAD_COLOR)
+    decoded = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
     if decoded is None:
-        return None, "ffmpeg image2pipe decode failed"
+        if errors:
+            return None, "; ".join(errors)
+        return None, "GIF first-frame decode failed"
     return decoded, None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -300,12 +202,14 @@ async def lifespan(app: FastAPI):
         else:
             logging.warning("AIModels 实例没有 release_all_models 方法 (lifespan)。")
 
+
 app = FastAPI(
     title="MT-Photos AI 统一服务",
     description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
     version="2.2.0",
     lifespan=lifespan
 )
+
 
 @app.middleware("http")
 async def reset_timer_middleware(request: Request, call_next):
@@ -314,7 +218,6 @@ async def reset_timer_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# --- 【修复：重写 read_image_from_upload 以匹配示例行为】 ---
 async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """
     读取上传的图像文件，处理 GIF、16-bit 和其他格式。
@@ -324,83 +227,34 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
     img = None
 
     try:
-        # 尝试使用 PIL 打开（主要为了处理 GIF）
         is_gif = file.content_type == "image/gif" or str(file.filename).lower().endswith(".gif")
         if is_gif:
-            with Image.open(BytesIO(contents)) as pil_img:
-                if pil_img.is_animated:
-                    pil_img.seek(0)  # 移动到第一帧
-                frame = pil_img.convert("RGB")
-                np_arr = np.array(frame)
-                img = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR) # 转为 CV2 BGR
+            img, gif_err = await asyncio.to_thread(_decode_first_gif_frame, contents)
+            if img is None and gif_err:
+                logging.warning("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
 
-        # 非 GIF 优先尝试 ffmpeg(QSV) 解码，再显式降级 ffmpeg(CPU) 和 OpenCV。
-        if img is None:
-            width_probe, height_probe, high_bit_depth, probe_err = await asyncio.to_thread(
-                _probe_image_size, contents
-            )
-            if probe_err:
-                logging.warning(
-                    "ffprobe 探测失败，将继续尝试 ffmpeg(QSV/CPU) 再回退 cv2.imdecode: %s",
-                    probe_err,
-                )
-            elif width_probe is None or height_probe is None:
-                logging.warning("ffprobe 未返回有效尺寸，将继续尝试 ffmpeg(QSV/CPU)。")
-            elif high_bit_depth:
-                logging.warning("检测到高位深图像，改用 cv2.imdecode 保持 16-bit->8-bit 语义。")
-            elif width_probe is not None and height_probe is not None and (
-                width_probe > MAX_IMAGE_SIDE or height_probe > MAX_IMAGE_SIDE
-            ):
-                logging.warning(f"文件 '{file.filename}' 尺寸超限（ffmpeg probe）")
-                return None, "height or width out of range"
-
-            if not high_bit_depth:
-                ffmpeg_qsv_img, ffmpeg_qsv_err = await asyncio.to_thread(
-                    _decode_image_with_ffmpeg, contents, True, width_probe, height_probe
-                )
-                if ffmpeg_qsv_img is not None:
-                    img = ffmpeg_qsv_img
-                else:
-                    logging.warning("ffmpeg(QSV) 解码失败，将尝试 ffmpeg(CPU): %s", ffmpeg_qsv_err)
-                    ffmpeg_cpu_img, ffmpeg_cpu_err = await asyncio.to_thread(
-                        _decode_image_with_ffmpeg, contents, False, width_probe, height_probe
-                    )
-                    if ffmpeg_cpu_img is not None:
-                        img = ffmpeg_cpu_img
-                    else:
-                        logging.warning(
-                            "ffmpeg(CPU) 解码失败，将尝试 cv2.imdecode: %s",
-                            ffmpeg_cpu_err,
-                        )
-
-        # ffmpeg 路径失败后，回退到 cv2.imdecode。
         if img is None:
             nparr = np.frombuffer(contents, np.uint8)
             img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
 
-        # 检查解码是否成功
         if img is None:
             logging.warning(f"文件 '{file.filename}' 无法被解码为图像。")
             return None, f"文件 '{file.filename}' 无法被解码为图像。"
 
-        # 检查 16-bit 图像并转换
         if img.dtype == np.uint16:
             logging.warning(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
             img = (img / 256).astype(np.uint8)
 
-        # 检查尺寸
         height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
         if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
             logging.warning(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
             return None, "height or width out of range"
 
-        # 转换通道
         if channels == 1:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif channels == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-        # 最后的健壮性检查
         if len(img.shape) < 3 or img.shape[2] != 3:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
@@ -409,7 +263,7 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
     except Exception as e:
         logging.error(f"读取图像 '{file.filename}' 时发生意外错误: {e}", exc_info=True)
         return None, f"处理图像时发生意外错误: {str(e)}"
-# --- 修复结束 ---
+
 
 @app.get("/", response_class=HTMLResponse)
 async def top_info():

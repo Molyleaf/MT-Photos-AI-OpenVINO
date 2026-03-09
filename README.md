@@ -47,8 +47,6 @@
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口                                                      | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`  | `WARNING`                          |
-| `FFMPEG_BIN`                        | `ffmpeg` 可执行文件名/路径                                        | `ffmpeg`                           |
-| `FFPROBE_BIN`                       | `ffprobe` 可执行文件名/路径                                       | `ffprobe`                          |
 
 补充说明：
 
@@ -104,8 +102,6 @@ uvicorn server:app --host 0.0.0.0 --port 8060 --workers 2
 ```bash
 apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
-  clinfo \
-  ffmpeg \
   libdrm2 \
   libgl1 \
   libglib2.0-0 \
@@ -113,11 +109,6 @@ apt-get update && apt-get install -y --no-install-recommends \
   libsm6 \
   libxext6 \
   libxrender1 \
-  libva2 \
-  libva-drm2 \
-  intel-media-va-driver-non-free \
-  libvpl2 \
-  libmfx-gen1.2 \
   libze1 \
   ocl-icd-libopencl1 \
   mesa-opencl-icd
@@ -126,6 +117,8 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 当前 Debian 13 stable 官方仓库可直接安装的 OpenVINO/OpenCL 基线是 `libze1 + ocl-icd-libopencl1 + mesa-opencl-icd`；镜像默认保持这一 stable-only 组合。
+- 参考附件里的 `firmware-intel-graphics`、`intel-opencl-icd`、`libze-intel-gpu1` 属于宿主机固件或 sid/额外仓库补包范畴；当前运行时镜像不打包固件，也不默认混装 sid。
+- 服务上传读图链已统一改为 OpenCV 原生解码，镜像不再包含 `ffmpeg/ffprobe`、VAAPI/oneVPL/QSV 媒体栈，也不预装 `clinfo` 这类诊断工具。
 - `intel-opencl-icd` 与 `libze-intel-gpu1` 属于 sid 侧 Intel compute runtime，不在当前镜像里默认启用；直接混装 sid 包会连带升级核心系统库，需单独评估。
 - 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
 
@@ -177,7 +170,6 @@ docker run -d \
   -e INFERENCE_DEVICE=GPU \
   -e WEB_CONCURRENCY=2 \
   -e OV_CACHE_DIR=/models/cache/openvino \
-  -e LIBVA_DRIVER_NAME=iHD \
   mt-photos-ai-openvino
 ```
 
@@ -187,20 +179,20 @@ docker run -d \
 
 ```bash
 docker exec -it mt-photos-ai-openvino ls -l /dev/dri
-docker exec -it mt-photos-ai-openvino clinfo | grep -i 'Device Name'
-docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
+docker exec -it mt-photos-ai-openvino python -c "import openvino as ov; print(ov.Core().available_devices)"
+docker exec -it mt-photos-ai-openvino python -c 'import cv2; cv2.ocl.setUseOpenCL(True); d=cv2.ocl.Device_getDefault(); print(cv2.ocl.haveOpenCL(), cv2.ocl.useOpenCL(), d.vendorName(), d.name())'
 ```
 
 若请求了 GPU 推理但容器内 GPU 设备不可用，服务会直接报错并终止启动。
 
 ## Windows Server GPU-PV（`/dev/dxg`）说明
 
-在 Windows Server + Linux 容器 + GPU-PV 场景下，QA-CLIP 与 InsightFace 的 OpenVINO GPU 推理可按运行时能力启用。
+在 Windows Server + Linux 容器 + GPU-PV 场景下，QA-CLIP 与 InsightFace 的 OpenVINO GPU 推理仍以当前容器运行时能力为准。
 
 需要注意：
 
-- `ffmpeg QSV` 在 Linux 容器里通常仍依赖 `/dev/dri`
-- 仅有 `/dev/dxg` 时，不应预期 Intel 视频硬解一定可用
+- 当前服务已不依赖 `ffmpeg/QSV` 做上传解码
+- 当前 Debian/Linux 容器启动自检与验收仍以 `/dev/dri` 为准；仅有 `/dev/dxg` 不视为满足当前镜像的 GPU 启动条件
 - 若 `get_default_context("GPU")` 因插件上下文初始化时机失败，服务会自动重试具体 `GPU.*` 设备与 `create_context("GPU", {})`；若仍失败，则保持硬失败并退出启动
 
 ## RapidOCR 模型预置
