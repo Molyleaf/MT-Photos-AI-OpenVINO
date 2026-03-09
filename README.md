@@ -50,6 +50,11 @@
 | `FFMPEG_BIN`                        | `ffmpeg` 可执行文件名/路径                                        | `ffmpeg`                           |
 | `FFPROBE_BIN`                       | `ffprobe` 可执行文件名/路径                                       | `ffprobe`                          |
 
+补充说明：
+
+- 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
+- Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
+
 ## Windows 本机部署
 
 1. 确认 Python 版本：
@@ -188,6 +193,7 @@ docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 
 - `ffmpeg QSV` 在 Linux 容器里通常仍依赖 `/dev/dri`
 - 仅有 `/dev/dxg` 时，不应预期 Intel 视频硬解一定可用
+- 若 `get_default_context("GPU")` 因插件上下文初始化时机失败，服务会自动重试具体 `GPU.*` 设备与 `create_context("GPU", {})`；若仍失败，则保持硬失败并退出启动
 
 ## RapidOCR 模型预置
 

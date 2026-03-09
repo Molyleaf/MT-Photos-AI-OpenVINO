@@ -184,8 +184,45 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _normalize_openvino_devices(devices: Any) -> List[str]:
+    normalized: List[str] = []
+    for item in devices or []:
+        device_name = str(item).strip().upper()
+        if device_name:
+            normalized.append(device_name)
+    return normalized
+
+
+def _get_openvino_gpu_devices(devices: Any) -> List[str]:
+    gpu_devices: List[str] = []
+    seen: set[str] = set()
+    for device_name in _normalize_openvino_devices(devices):
+        if not device_name.startswith("GPU") or device_name in seen:
+            continue
+        gpu_devices.append(device_name)
+        seen.add(device_name)
+    return gpu_devices
+
+
+def _extract_explicit_gpu_devices(device_expr: str) -> List[str]:
+    requested: List[str] = []
+    seen: set[str] = set()
+    for token in str(device_expr or "").strip().upper().replace(":", ",").split(","):
+        candidate = token.strip()
+        if not candidate.startswith("GPU.") or candidate in seen:
+            continue
+        requested.append(candidate)
+        seen.add(candidate)
+    return requested
+
+
+def _summarize_exception(exc: Exception) -> str:
+    message = " ".join(str(exc).split())
+    return message or exc.__class__.__name__
+
+
 def _has_openvino_gpu_device(devices: Any) -> bool:
-    return any(str(item).upper().startswith("GPU") for item in devices)
+    return bool(_get_openvino_gpu_devices(devices))
 
 
 TEXT_MODEL_RESTORE_DELAY_MS = max(
@@ -369,21 +406,97 @@ class AIModels:
         wants_gpu_remote_context = force_gpu_remote_context or ("GPU" in clip_device)
         if not wants_gpu_remote_context:
             return None
-        try:
-            remote_context = self.core.get_default_context("GPU")
-            LOG.warning("OpenVINO GPU remote context enabled for CLIP (device=%s).", CLIP_INFERENCE_DEVICE)
-            return remote_context
-        except Exception as exc:
+
+        available_devices = _normalize_openvino_devices(self.core.available_devices)
+        gpu_devices = _get_openvino_gpu_devices(available_devices)
+        if not gpu_devices:
             if force_gpu_remote_context:
                 raise RuntimeError(
                     "CLIP_INFERENCE_DEVICE=AUTO requires GPU Remote Context. "
-                    "OpenVINO GPU context initialization failed."
-                ) from exc
+                    f"OpenVINO GPU device is unavailable (available_devices={sorted(available_devices)})."
+                )
             raise RuntimeError(
                 f"CLIP_INFERENCE_DEVICE={CLIP_INFERENCE_DEVICE} requests GPU execution, "
-                "but GPU Remote Context initialization failed. "
+                f"but available_devices={sorted(available_devices)}. "
                 "No silent fallback is allowed."
-            ) from exc
+            )
+
+        explicit_gpu_devices = _extract_explicit_gpu_devices(clip_device)
+        context_candidates: List[str] = []
+        for candidate in [*explicit_gpu_devices, "GPU", *gpu_devices]:
+            if candidate not in context_candidates:
+                context_candidates.append(candidate)
+
+        attempt_errors: List[str] = []
+        last_exc: Optional[Exception] = None
+
+        for candidate in context_candidates:
+            try:
+                remote_context = self.core.get_default_context(candidate)
+                resolved_device = str(remote_context.get_device_name()).strip().upper()
+                if explicit_gpu_devices and resolved_device not in explicit_gpu_devices:
+                    raise RuntimeError(
+                        f"resolved device {resolved_device} does not match requested "
+                        f"{explicit_gpu_devices}"
+                    )
+                if candidate == "GPU":
+                    LOG.warning(
+                        "OpenVINO GPU remote context enabled for CLIP (device=%s resolved=%s).",
+                        CLIP_INFERENCE_DEVICE,
+                        resolved_device,
+                    )
+                else:
+                    LOG.warning(
+                        "OpenVINO GPU remote context enabled for CLIP via candidate=%s "
+                        "(request=%s resolved=%s).",
+                        candidate,
+                        CLIP_INFERENCE_DEVICE,
+                        resolved_device,
+                    )
+                return remote_context
+            except Exception as exc:
+                last_exc = exc
+                attempt_errors.append(
+                    f"get_default_context({candidate}) failed: {_summarize_exception(exc)}"
+                )
+
+        try:
+            remote_context = self.core.create_context("GPU", {})
+            resolved_device = str(remote_context.get_device_name()).strip().upper()
+            if explicit_gpu_devices and resolved_device not in explicit_gpu_devices:
+                raise RuntimeError(
+                    f"create_context(GPU) resolved to {resolved_device}, "
+                    f"expected one of {explicit_gpu_devices}"
+                )
+            LOG.warning(
+                "OpenVINO GPU remote context enabled for CLIP via create_context compatibility "
+                "fallback (device=%s resolved=%s).",
+                CLIP_INFERENCE_DEVICE,
+                resolved_device,
+            )
+            return remote_context
+        except Exception as exc:
+            last_exc = exc
+            attempt_errors.append(
+                f"create_context(GPU) failed: {_summarize_exception(exc)}"
+            )
+
+        LOG.error(
+            "CLIP GPU remote context initialization failed: request=%s available_devices=%s attempts=%s",
+            CLIP_INFERENCE_DEVICE,
+            sorted(available_devices),
+            " | ".join(attempt_errors),
+        )
+        if force_gpu_remote_context:
+            raise RuntimeError(
+                "CLIP_INFERENCE_DEVICE=AUTO requires GPU Remote Context. "
+                "OpenVINO GPU context initialization failed."
+            ) from last_exc
+        raise RuntimeError(
+            f"CLIP_INFERENCE_DEVICE={CLIP_INFERENCE_DEVICE} requests GPU execution, "
+            "but GPU Remote Context initialization failed. "
+            "No silent fallback is allowed."
+        ) from last_exc
 
     def _queue_size_locked(self) -> int:
         return len(self._text_queue) + len(self._normal_queue)
