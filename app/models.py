@@ -36,7 +36,7 @@ from schemas import FacialArea, OCRBox, OCRResult, RepresentResult
 INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
 CLIP_INFERENCE_DEVICE = os.environ.get("CLIP_INFERENCE_DEVICE", INFERENCE_DEVICE)
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "antelopv2")
+MODEL_NAME = "antelopev2"
 CLIP_EMBEDDING_DIMS = 768
 CONTEXT_LENGTH = 77
 CLIP_IMAGE_RESOLUTION = 224
@@ -59,6 +59,14 @@ RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
 RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
 LOG = logging.getLogger(__name__)
+
+_CONFIGURED_MODEL_NAME = os.environ.get("MODEL_NAME")
+if _CONFIGURED_MODEL_NAME and _CONFIGURED_MODEL_NAME != MODEL_NAME:
+    LOG.warning(
+        "MODEL_NAME is fixed to %s; ignoring environment value: %s",
+        MODEL_NAME,
+        _CONFIGURED_MODEL_NAME,
+    )
 
 
 def _patch_rapidocr_openvino_multi_output() -> None:

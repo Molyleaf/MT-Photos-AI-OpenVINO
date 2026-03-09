@@ -57,14 +57,20 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # --- 日志配置结束 ---
 
 
-API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "mt_photos_ai_extra")
+API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"
 API_KEY_NAME = "api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
+
+def _get_api_auth_key() -> str:
+    return os.environ.get("API_AUTH_KEY", API_AUTH_KEY_DEFAULT)
+
+
 async def get_api_key(api_key_header: str = Depends(api_key_header)):
-    if not API_AUTH_KEY or API_AUTH_KEY == "no-key":
+    api_auth_key = _get_api_auth_key()
+    if not api_auth_key or api_auth_key == "no-key":
         return
-    if api_key_header != API_AUTH_KEY:
+    if api_key_header != api_auth_key:
         logging.warning(f"拒绝了无效的 API 密钥: {api_key_header}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -95,6 +101,56 @@ def reset_idle_timer():
     if SERVER_IDLE_TIMEOUT > 0:
         idle_timer = threading.Timer(SERVER_IDLE_TIMEOUT, idle_timeout_handler)
         idle_timer.start()
+
+
+def _device_requests_gpu(device_name: str) -> bool:
+    normalized = str(device_name or "").strip().upper()
+    return normalized == "AUTO" or "GPU" in normalized
+
+
+def _startup_self_check_dri() -> None:
+    if os.name == "nt":
+        return
+
+    inference_device = os.environ.get("INFERENCE_DEVICE", "AUTO")
+    clip_device = os.environ.get("CLIP_INFERENCE_DEVICE", inference_device)
+    if not (_device_requests_gpu(inference_device) or _device_requests_gpu(clip_device)):
+        logging.warning("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
+        return
+
+    dri_dir = "/dev/dri"
+    if not os.path.isdir(dri_dir):
+        raise RuntimeError(
+            "启动自检失败：已请求 GPU 推理，但容器内不存在 /dev/dri。"
+            "请映射 --device /dev/dri:/dev/dri 并设置正确的 video/render 组。"
+        )
+
+    try:
+        dri_nodes = [
+            os.path.join(dri_dir, name)
+            for name in sorted(os.listdir(dri_dir))
+            if name.startswith("card") or name.startswith("renderD")
+        ]
+    except Exception as exc:
+        raise RuntimeError(f"启动自检失败：无法读取 {dri_dir}: {exc}") from exc
+
+    if not dri_nodes:
+        raise RuntimeError(
+            "启动自检失败：/dev/dri 未发现 card*/renderD* 节点，无法执行 GPU 推理。"
+        )
+
+    denied_nodes = [node for node in dri_nodes if not os.access(node, os.R_OK | os.W_OK)]
+    if denied_nodes:
+        raise RuntimeError(
+            "启动自检失败：/dev/dri 设备权限不足，请检查容器用户组映射。"
+            f" 无权限节点: {', '.join(denied_nodes)}"
+        )
+
+    logging.warning(
+        "启动自检通过：GPU 设备节点可访问。INFERENCE_DEVICE=%s CLIP_INFERENCE_DEVICE=%s",
+        inference_device,
+        clip_device,
+    )
 
 
 def _probe_image_size(
@@ -223,6 +279,7 @@ def _decode_image_with_ffmpeg(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global models_instance
+    _startup_self_check_dri()
     logging.warning("应用启动... 初始化 AIModels 实例。")
     models_instance = ai_models.AIModels()
     try:

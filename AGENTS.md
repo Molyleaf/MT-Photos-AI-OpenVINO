@@ -81,6 +81,7 @@
 ### 3.4 InsightFace
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
+- 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
 - 保留 CPU 回退路径，但默认 EP 优先顺序应以 OpenVINO EP 在前。
 
 ---

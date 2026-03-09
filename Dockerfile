@@ -10,7 +10,9 @@ ARG PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
+    API_AUTH_KEY=mt_photos_ai_extra \
     INFERENCE_DEVICE=AUTO \
     WEB_CONCURRENCY=1 \
     OV_CACHE_DIR=/models/cache/openvino \
@@ -21,14 +23,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN rm -f /etc/apt/sources.list \
     && rm -rf /etc/apt/sources.list.d/
 COPY sources.list /etc/apt/sources.list
+COPY requirements.txt /tmp/requirements.txt
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y \
+    runtime_deps="\
         ca-certificates \
         ffmpeg \
-        clinfo \
-        vainfo \
         libdrm2 \
         libgl1 \
         libglib2.0-0 \
@@ -43,33 +43,39 @@ RUN set -eux; \
         libmfx-gen1.2 \
         libze1 \
         ocl-icd-libopencl1 \
+        mesa-opencl-icd"; \
+    build_deps="\
         build-essential \
         gcc \
-        libpq-dev \
-        curl \
-        mesa-opencl-icd; \
-    rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt /tmp/requirements.txt
-
-RUN set -eux; \
-    pip install --no-cache-dir -r /tmp/requirements.txt; \
-    rm -f /tmp/requirements.txt
+        g++ \
+        libpq-dev"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends $runtime_deps $build_deps; \
+    pip install --no-cache-dir --prefer-binary -r /tmp/requirements.txt; \
+    apt-get purge -y --auto-remove $build_deps; \
+    rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
 
 RUN set -eux; \
     groupadd --gid "${APP_GID}" appgroup; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
-    mkdir -p /models/qa-clip/openvino /models/insightface/models /models/rapidocr /models/cache/openvino; \
+    mkdir -p /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/rapidocr /models/cache/openvino; \
     chown -R appuser:appgroup /app /models
 
-RUN apt remove -y build-essential gcc libpq-dev; \
-    apt autoremove; \
-    apt autoclean
-
 COPY --chown=appuser:appgroup app /app
-COPY --chown=appuser:appgroup models/ /models/
+COPY --chown=appuser:appgroup models/qa-clip/openvino /models/qa-clip/openvino
+COPY --chown=appuser:appgroup models/insightface/models/antelopev2 /models/insightface/models/antelopev2
+COPY --chown=appuser:appgroup models/rapidocr /models/rapidocr
 
 RUN set -eux; \
+    test -f /models/qa-clip/openvino/openvino_image_fp16.xml; \
+    test -f /models/qa-clip/openvino/openvino_image_fp16.bin; \
+    test -f /models/qa-clip/openvino/openvino_text_fp16.xml; \
+    test -f /models/qa-clip/openvino/openvino_text_fp16.bin; \
+    test -f /models/insightface/models/antelopev2/1k3d68.onnx; \
+    test -f /models/insightface/models/antelopev2/2d106det.onnx; \
+    test -f /models/insightface/models/antelopev2/genderage.onnx; \
+    test -f /models/insightface/models/antelopev2/glintr100.onnx; \
+    test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx; \
     test -f /models/rapidocr/ch_PP-OCRv5_mobile_det.onnx; \
     test -f /models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx; \
     test -f /models/rapidocr/ppocrv5_dict.txt; \
