@@ -119,31 +119,24 @@ apt-get update && apt-get install -y --no-install-recommends \
 
 ### 方式一：docker compose
 
-1. 准备配置文件：
+1. 准备配置文件，并确认 `docker-compose.yml` 里的 `image:` 已指向你实际要使用的镜像标签：
 
 ```bash
 cp docker-compose.example.yml docker-compose.yml
 ```
 
-2. 按宿主机设置用户与 GPU 组（Debian 示例）：
-
-```bash
-export APP_UID=$(id -u)
-export APP_GID=$(id -g)
-export VIDEO_GID=$(getent group video | cut -d: -f3)
-export RENDER_GID=$(getent group render | cut -d: -f3)
-```
+2. 按宿主机实际情况修改 `group_add` 中的 `video` / `render` GID（Debian 默认通常是 `44` / `109`）。
 
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时可设置 `INFERENCE_DEVICE=GPU`
-- 可按需调整并发、缓存目录和镜像源参数
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，保持 `INFERENCE_DEVICE=GPU`、`CLIP_INFERENCE_DEVICE=GPU`、`RAPIDOCR_DEVICE=GPU`
+- 如需挂载自定义模型、RapidOCR 配置或缓存目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 
 4. 启动服务：
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 5. 查看状态：

@@ -1,12 +1,7 @@
 services:
   mt-photos-ai-openvino:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        APP_UID: ${APP_UID:-1000}
-        APP_GID: ${APP_GID:-1000}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.zju.edu.cn/pypi/web/simple}
+    # 按需替换为你实际发布的镜像标签。
+    image: mt-photos-ai-openvino:latest
     container_name: mt-photos-ai-openvino
     init: true
     security_opt:
@@ -14,27 +9,43 @@ services:
     ports:
       - "8060:8060"
     group_add:
-      # Debian defaults are usually video=44, render=109.
-      - "${VIDEO_GID:-44}"
-      - "${RENDER_GID:-109}"
+      # Debian 默认通常是 video=44、render=109。
+      # 如果宿主机 GID 不同，直接修改下面两个值。
+      - "44"
+      - "109"
     environment:
-      # 默认鉴权密钥；可通过环境变量 API_AUTH_KEY 覆盖。
-      - API_AUTH_KEY=${API_AUTH_KEY:-mt_photos_ai_extra}
-
-      # --- INFERENCE DEVICE ---
-      # Options: "CPU", "GPU", "AUTO", "AUTO:GPU,CPU"
-      # CLIP_INFERENCE_DEVICE 默认跟随该值；若值包含 GPU/AUTO，CLIP 侧会强制初始化 GPU Remote Context，失败直接报错。
-      - INFERENCE_DEVICE=GPU
-      - WEB_CONCURRENCY=2
-      - INFERENCE_QUEUE_MAX_SIZE=64
-      - TEXT_CLIP_BATCH_SIZE=8
-      - TEXT_MODEL_RESTORE_DELAY_MS=2000
-      - OV_CACHE_DIR=/models/cache/openvino
-      - LIBVA_DRIVER_NAME=iHD
-      - RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml
-      - RAPIDOCR_MODEL_DIR=/models/rapidocr
+      # 未列出的变量要么是兼容/内部项，要么已由镜像固定，通常不需要覆盖。
+      API_AUTH_KEY: "mt_photos_ai_extra"
+      INFERENCE_DEVICE: "GPU"
+      CLIP_INFERENCE_DEVICE: "GPU"
+      MODEL_PATH: "/models"
+      WEB_CONCURRENCY: "2"
+      INFERENCE_QUEUE_MAX_SIZE: "64"
+      TEXT_CLIP_BATCH_SIZE: "8"
+      INFERENCE_TASK_TIMEOUT: "120"
+      SERVER_IDLE_TIMEOUT: "300"
+      TEXT_MODEL_RESTORE_DELAY_MS: "2000"
+      OV_CACHE_DIR: "/models/cache/openvino"
+      RAPIDOCR_OPENVINO_CONFIG_PATH: "/app/config/cfg_openvino_cpu.yaml"
+      RAPIDOCR_MODEL_DIR: "/models/rapidocr"
+      RAPIDOCR_FONT_PATH: ""
+      RAPIDOCR_DEVICE: "GPU"
+      RAPIDOCR_INFERENCE_NUM_THREADS: "-1"
+      RAPIDOCR_PERFORMANCE_HINT: "LATENCY"
+      RAPIDOCR_PERFORMANCE_NUM_REQUESTS: "-1"
+      RAPIDOCR_ENABLE_CPU_PINNING: "true"
+      RAPIDOCR_NUM_STREAMS: "-1"
+      RAPIDOCR_ENABLE_HYPER_THREADING: "true"
+      RAPIDOCR_SCHEDULING_CORE_TYPE: "ANY_CORE"
+      RAPIDOCR_USE_CLS: "true"
+      RAPIDOCR_MAX_SIDE_LEN: "960"
+      RAPIDOCR_DET_LIMIT_SIDE_LEN: "960"
+      RAPIDOCR_REC_BATCH_NUM: "6"
+      RAPIDOCR_CLS_BATCH_NUM: "6"
+      INSIGHTFACE_OV_DEVICE: "GPU_FP16"
+      OPENCV_OPENCL_DEVICE: "Intel:GPU:0"
+      LOG_LEVEL: "WARNING"
     devices:
-      # This is required to give the container access to the host's GPU (iGPU).
-      # On Linux, this is typically /dev/dri.
+      # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。
       - /dev/dri:/dev/dri
     restart: unless-stopped
