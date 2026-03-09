@@ -78,6 +78,7 @@
 - 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Rec.rec_batch_num=6`（可按场景增至 8）。
 - OpenVINO 参数基线：`device_name=AUTO`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
+- 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
@@ -267,3 +268,124 @@
 - [ ] 是否遵守“待机常驻 Text-CLIP + 单模型族互斥加载 + 文本请求优先”策略
 - [ ] 是否采用多进程 Worker + 有界队列 + Worker 内批处理，并规避线程过度订阅
 - [ ] 是否同步更新 `README.md` 与 `requirements.txt`
+
+---
+
+## 12. README / AGENTS 文档边界
+
+- `README.md` 只保留最终用户直接需要的信息：部署前准备、运行时环境变量、Windows/Docker 部署、模型文件准备、设备检查、基础调用示例、许可证。
+- 下列内容默认只应存在于 `AGENTS.md`，不要重新塞回 `README.md`，除非它直接影响最终用户操作：
+  - 实现约束、后端选择原因、无 silent fallback 规则
+  - 容器构建内部实践、镜像裁剪策略、依赖清理策略
+  - 稳定性修复记录、兼容性说明、上线验收清单
+  - `app/convert.py`、NNCF、IR 导出和模型转换流程说明
+  - Agent/开发自检、压测、调度策略、文档同步要求
+
+---
+
+## 13. 当前部署实现现状与验收附录
+
+### 13.1 Debian 容器当前实践
+
+- 当前 Docker 基线镜像为 `python:3.12-slim-trixie`（Debian 13）。
+- APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`。
+- 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
+- `pip install` 完成后会卸载 InsightFace 构建依赖（`build-essential`、`gcc`、`g++`、`libpq-dev`）。
+- 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
+- 容器健康检查使用 `GET /`，且不依赖 API Key。
+- 仓库应提供 `.dockerignore` 以降低构建上下文体积。
+- 镜像内需包含 OpenVINO + Xe 核显图片转码所需依赖：`intel-media-va-driver-non-free`、`libvpl2`、`libmfx-gen1.2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`libva2`、`libva-drm2`、`ffmpeg`。
+- 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
+- `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
+- 启动阶段必须增加 `/dev/dri` 自检：请求 GPU 推理时，`/dev/dri` 不可用则直接报错并终止启动。
+- Debian 宿主若要启用 Intel iGPU，必须正确映射 `/dev/dri`，并确保 `VIDEO_GID` / `RENDER_GID` 与宿主机设备组一致（默认示例 `44/109`）。
+
+### 13.2 最近稳定性修复（2026-03）
+
+- 修复 `/clip/img` 在 OpenVINO 动态输入模型上的 PPP 构建失败：视觉预处理 `resize` 显式固定为 `224x224`，保持输出维度 `768` 与接口语义不变。
+- 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=CPU/GPU/AUTO`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
+- 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
+
+### 13.3 `/dev/dri` Intel iGPU 上线验收
+
+#### A. `docker-compose.yml` 必备参数
+
+```yaml
+services:
+  mt-photos-ai-openvino:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+    environment:
+      - API_AUTH_KEY=mt_photos_ai_extra
+      - INFERENCE_DEVICE=GPU
+      - CLIP_INFERENCE_DEVICE=GPU
+      - RAPIDOCR_DEVICE=GPU
+      - INSIGHTFACE_OV_DEVICE=GPU_FP16
+      - OPENCV_OPENCL_DEVICE=Intel:GPU:0
+      - OV_CACHE_DIR=/models/cache/openvino
+      - WEB_CONCURRENCY=2
+      - INFERENCE_QUEUE_MAX_SIZE=64
+      - TEXT_CLIP_BATCH_SIZE=8
+      - TEXT_MODEL_RESTORE_DELAY_MS=2000
+```
+
+说明：
+- 若需要自动设备选择，可将 `CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE` 改为 `AUTO`；但验收时仍要求 GPU 实际可用。
+- `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
+
+#### B. 启动与设备可见性判定
+
+通过标准：
+- `docker compose ps` 显示容器 `Up`。
+- `docker inspect <container> --format '{{.State.Health.Status}}'` 返回 `healthy`。
+- 启动日志包含“启动自检通过：GPU 设备节点可访问”。
+- 容器内 `ls -l /dev/dri` 可见 `card*` 与 `renderD*` 节点。
+- 容器用户对 `/dev/dri` 节点具备读写权限。
+
+失败判定（任一命中即失败）：
+- 日志出现“已请求 GPU 推理，但容器内不存在 /dev/dri”。
+- 日志出现“/dev/dri 未发现 card*/renderD* 节点”。
+- 日志出现“/dev/dri 设备权限不足”。
+
+#### C. 端点语义与后端判定
+
+通过标准：
+- `POST /check` 返回 `{"result":"pass", ...}`。
+- `POST /clip/txt` 成功返回 `768` 维字符串数组（成功无 `msg`）。
+- `POST /clip/img` 成功返回 `768` 维字符串数组（成功无 `msg`）。
+- `POST /ocr` 成功返回 `{"result":{"texts","scores","boxes"}}`（成功无 `msg`）。
+- `POST /represent` 返回 `{"detector_backend":"insightface","recognition_model":"antelopev2","result":[...]}` 或在人脸不存在时 `result=[]`。
+
+失败判定（任一命中即失败）：
+- 日志出现 `No silent fallback is allowed`（排除主动构造失败用例）。
+- 日志出现 `OpenCL is unavailable` 或非 Intel OpenCL 设备错误。
+- 日志出现 `provider validation failed` 或 `OpenVINOExecutionProvider` 非首位。
+
+#### D. 回归脚本建议（最小）
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=200 mt-photos-ai-openvino
+
+curl -s http://127.0.0.1:8060/
+curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
+curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
+```
+
+---
+
+## 14. `app/convert.py` 运行环境
+
+| 环境变量 | 可选值 | 默认值 |
+|---|---|---|
+| `PROJECT_ROOT` | 项目根目录路径 | 自动探测 |
+| `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
+| `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
+| `QA_CLIP_ENABLE_NNCF_WEIGHT_COMPRESSION` | `0`（关闭）或 `1`（开启） | `0` |
+| `QA_CLIP_NNCF_WEIGHT_MODE` | NNCF 压缩模式名（常见：`INT8_ASYM` / `INT8_SYM` / `NF4` / `E2M1`） | `INT8_ASYM` |
+
+`convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。
