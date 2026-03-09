@@ -4,7 +4,7 @@ insightface
 fastapi
 pydantic
 openvino
-rapidocr==3.6.0
+rapidocr==3.7.0
 onnxruntime-openvino
 uvicorn
 python-multipart

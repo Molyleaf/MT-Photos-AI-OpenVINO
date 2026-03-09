@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -43,7 +44,6 @@ CLIP_IMAGE_RESOLUTION = 224
 
 _CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
 _CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
-_CLIP_INV_255 = np.float32(1.0 / 255.0)
 
 _TOKENIZER = FullTokenizer()
 _PAD_TOKEN_ID = int(_TOKENIZER.vocab["[PAD]"])
@@ -150,69 +150,42 @@ def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -
     return result
 
 
-def _preprocess_clip_image_bgr(
-    image: np.ndarray,
-    image_resolution: int = CLIP_IMAGE_RESOLUTION,
-    out: Optional[np.ndarray] = None,
-    resize_out: Optional[np.ndarray] = None,
-) -> np.ndarray:
+def _as_contiguous_bgr_uint8(image: np.ndarray, context: str) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f"Invalid image shape for CLIP preprocess: {image.shape}")
+        raise ValueError(f"{context} expects BGR image with shape (H, W, 3), got {image.shape}")
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8, copy=False)
+    if image.flags.c_contiguous:
+        return image
+    return np.ascontiguousarray(image)
 
-    src_h, src_w = image.shape[:2]
-    interpolation = (
-        cv2.INTER_AREA
-        if src_h > image_resolution or src_w > image_resolution
-        else cv2.INTER_LINEAR
-    )
-    if resize_out is None:
-        resized = cv2.resize(image, (image_resolution, image_resolution), interpolation=interpolation)
-    else:
-        expected_resize_shape = (image_resolution, image_resolution, 3)
-        if resize_out.shape != expected_resize_shape:
-            raise ValueError(
-                "Invalid CLIP resize buffer shape: "
-                f"expected={expected_resize_shape}, got={resize_out.shape}"
-            )
-        if resize_out.dtype != np.uint8:
-            raise ValueError(
-                f"Invalid CLIP resize buffer dtype: expected=uint8, got={resize_out.dtype}"
-            )
-        resized = cv2.resize(
-            image,
-            (image_resolution, image_resolution),
-            dst=resize_out,
-            interpolation=interpolation,
+
+def _to_channel_triplet(value: Any) -> List[float]:
+    if isinstance(value, (list, tuple, np.ndarray)):
+        as_list = [float(item) for item in value]
+        if len(as_list) == 1:
+            return [as_list[0], as_list[0], as_list[0]]
+        if len(as_list) != 3:
+            raise ValueError(f"Expected channel scalar or len=3 list, got len={len(as_list)}")
+        return as_list
+    scalar = float(value)
+    return [scalar, scalar, scalar]
+
+
+@dataclass(slots=True)
+class _OpenVinoPreprocessRunner:
+    compiled_model: ov.CompiledModel
+    request: ov.InferRequest
+    input_name: str
+    output_port: Any
+
+    def run(self, tensor: np.ndarray) -> np.ndarray:
+        outputs = self.request.infer(
+            {self.input_name: tensor},
+            share_inputs=True,
+            share_outputs=True,
         )
-
-    if out is None:
-        pixel_values = np.empty((1, 3, image_resolution, image_resolution), dtype=np.float32)
-    else:
-        expected_shape = (1, 3, image_resolution, image_resolution)
-        if out.shape != expected_shape:
-            raise ValueError(
-                f"Invalid CLIP host tensor view shape: expected={expected_shape}, got={out.shape}"
-            )
-        if out.dtype != np.float32:
-            raise ValueError(f"Invalid CLIP host tensor dtype: expected=float32, got={out.dtype}")
-        pixel_values = out
-
-    # CLIP expects RGB order, while API input is BGR.
-    chw = pixel_values[0]
-
-    np.multiply(resized[:, :, 2], _CLIP_INV_255, out=chw[0], casting="unsafe")
-    np.subtract(chw[0], _CLIP_IMAGE_MEAN[0], out=chw[0])
-    np.divide(chw[0], _CLIP_IMAGE_STD[0], out=chw[0])
-
-    np.multiply(resized[:, :, 1], _CLIP_INV_255, out=chw[1], casting="unsafe")
-    np.subtract(chw[1], _CLIP_IMAGE_MEAN[1], out=chw[1])
-    np.divide(chw[1], _CLIP_IMAGE_STD[1], out=chw[1])
-
-    np.multiply(resized[:, :, 0], _CLIP_INV_255, out=chw[2], casting="unsafe")
-    np.subtract(chw[2], _CLIP_IMAGE_MEAN[2], out=chw[2])
-    np.divide(chw[2], _CLIP_IMAGE_STD[2], out=chw[2])
-
-    return pixel_values
+        return np.asarray(outputs[self.output_port])
 
 
 TaskType = Literal["clip_txt", "clip_img", "ocr", "face", "warmup_text"]
@@ -276,14 +249,14 @@ class AIModels:
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
         self._clip_vision_input_name: Optional[str] = None
-        self._clip_vision_host_tensor: Optional[ov.Tensor] = None
-        self._clip_vision_host_view: Optional[np.ndarray] = None
+        self._clip_vision_host_input_cache: Dict[
+            Tuple[int, int], Tuple[ov.Tensor, np.ndarray]
+        ] = {}
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
-        self._clip_vision_numpy_input: Optional[np.ndarray] = None
-        self._clip_vision_resize_buffer: Optional[np.ndarray] = None
-        self._clip_image_resolution: Optional[int] = None
         self._rapidocr_engine: Optional[RapidOCR] = None
         self._face_engine: Optional[FaceAnalysis] = None
+        self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
 
         self._condition = threading.Condition()
         self._text_queue: Deque[_InferenceTask] = deque()
@@ -595,15 +568,13 @@ class AIModels:
             self._clip_vision_request = None
             self._clip_vision_model = None
             self._clip_vision_input_name = None
-            self._clip_vision_host_tensor = None
-            self._clip_vision_host_view = None
-            self._clip_vision_numpy_input = None
-            self._clip_vision_resize_buffer = None
-            self._clip_image_resolution = None
+            self._clip_vision_host_input_cache.clear()
         elif self._active_family == "ocr":
             self._rapidocr_engine = None
         elif self._active_family == "face":
             self._face_engine = None
+            self._face_det_ppp = None
+            self._face_rec_ppp = None
 
         self._active_family = None
         gc.collect()
@@ -616,19 +587,17 @@ class AIModels:
         self._clip_vision_request = None
         self._clip_vision_model = None
         self._clip_vision_input_name = None
-        self._clip_vision_host_tensor = None
-        self._clip_vision_host_view = None
-        self._clip_vision_numpy_input = None
-        self._clip_vision_resize_buffer = None
-        self._clip_image_resolution = None
+        self._clip_vision_host_input_cache.clear()
         self._rapidocr_engine = None
         self._face_engine = None
+        self._face_det_ppp = None
+        self._face_rec_ppp = None
         self._active_family = None
         gc.collect()
 
     def _compile_clip_model(
         self,
-        model_path: Path,
+        model_or_path: Any,
         performance_hint: str,
     ) -> ov.CompiledModel:
         config = {
@@ -637,10 +606,84 @@ class AIModels:
         }
 
         if self._clip_remote_context is not None:
-            model = self.core.read_model(str(model_path))
+            if isinstance(model_or_path, Path):
+                model = self.core.read_model(str(model_or_path))
+            else:
+                model = model_or_path
             return self.core.compile_model(model, self._clip_remote_context, config)
 
-        return self.core.compile_model(str(model_path), CLIP_INFERENCE_DEVICE, config)
+        if isinstance(model_or_path, Path):
+            return self.core.compile_model(str(model_or_path), CLIP_INFERENCE_DEVICE, config)
+        return self.core.compile_model(model_or_path, CLIP_INFERENCE_DEVICE, config)
+
+    def _build_clip_vision_ppp_model(self, model_path: Path) -> ov.Model:
+        model = self.core.read_model(str(model_path))
+        input_shape = model.inputs[0].get_partial_shape()
+        if not input_shape.rank.is_static or input_shape.rank.get_length() != 4:
+            raise RuntimeError(
+                "CLIP vision input rank must be 4, "
+                f"got rank={input_shape.rank}"
+            )
+
+        model_height = input_shape[2]
+        model_width = input_shape[3]
+        if model_height.is_static and int(model_height.get_length()) != int(CLIP_IMAGE_RESOLUTION):
+            raise RuntimeError(
+                "CLIP image height mismatch: "
+                f"expected={CLIP_IMAGE_RESOLUTION}, got={int(model_height.get_length())}"
+            )
+        if model_width.is_static and int(model_width.get_length()) != int(CLIP_IMAGE_RESOLUTION):
+            raise RuntimeError(
+                "CLIP image width mismatch: "
+                f"expected={CLIP_IMAGE_RESOLUTION}, got={int(model_width.get_length())}"
+            )
+
+        ppp = ov.preprocess.PrePostProcessor(model)
+        ppp.input().tensor().set_shape([1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
+            ov.Layout("NHWC")
+        ).set_color_format(ov.preprocess.ColorFormat.BGR)
+        ppp.input().preprocess().resize(ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR)
+        ppp.input().preprocess().convert_color(ov.preprocess.ColorFormat.RGB)
+        ppp.input().preprocess().convert_element_type(ov.Type.f32)
+        ppp.input().preprocess().scale([255.0, 255.0, 255.0])
+        ppp.input().preprocess().mean(_CLIP_IMAGE_MEAN.tolist())
+        ppp.input().preprocess().scale(_CLIP_IMAGE_STD.tolist())
+        ppp.input().model().set_layout(ov.Layout("NCHW"))
+        return ppp.build()
+
+    def _get_clip_vision_host_input(
+        self, image_height: int, image_width: int
+    ) -> Optional[Tuple[ov.Tensor, np.ndarray]]:
+        if (
+            not self._clip_vision_host_tensor_enabled
+            or self._clip_remote_context is None
+            or self._clip_vision_model is None
+        ):
+            return None
+
+        cache_key = (int(image_height), int(image_width))
+        cached = self._clip_vision_host_input_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            input_port = self._clip_vision_model.inputs[0]
+            input_shape = ov.Shape([1, int(image_height), int(image_width), 3])
+            input_tensor = self._clip_remote_context.create_host_tensor(
+                input_port.get_element_type(), input_shape
+            )
+            input_view = np.asarray(input_tensor.data)
+            cache_entry = (input_tensor, input_view)
+            self._clip_vision_host_input_cache[cache_key] = cache_entry
+            return cache_entry
+        except Exception as exc:
+            LOG.warning(
+                "CLIP vision host tensor allocation failed, fallback to shared numpy inputs: %s",
+                exc,
+            )
+            self._clip_vision_host_tensor_enabled = False
+            self._clip_vision_host_input_cache.clear()
+            return None
 
     def _get_text_host_tensors(
         self, batch_size: int
@@ -686,7 +729,7 @@ class AIModels:
             raise FileNotFoundError(f"Missing text model: {text_model_path}")
 
         compiled_model = self._compile_clip_model(
-            model_path=text_model_path,
+            model_or_path=text_model_path,
             performance_hint="LATENCY",
         )
         output_dim = compiled_model.outputs[0].get_partial_shape()[1].get_length()
@@ -710,8 +753,9 @@ class AIModels:
         if not vision_model_path.exists():
             raise FileNotFoundError(f"Missing vision model: {vision_model_path}")
 
+        ppp_model = self._build_clip_vision_ppp_model(vision_model_path)
         compiled_model = self._compile_clip_model(
-            model_path=vision_model_path,
+            model_or_path=ppp_model,
             performance_hint="THROUGHPUT",
         )
         output_dim = compiled_model.outputs[0].get_partial_shape()[1].get_length()
@@ -723,38 +767,12 @@ class AIModels:
         self._clip_vision_model = compiled_model
         self._clip_vision_request = compiled_model.create_infer_request()
         self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
-        self._clip_vision_host_tensor = None
-        self._clip_vision_host_view = None
-        self._clip_vision_numpy_input = np.empty(
-            (1, 3, int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION)), dtype=np.float32
-        )
-        self._clip_vision_resize_buffer = np.empty(
-            (int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION), 3), dtype=np.uint8
-        )
+        self._clip_vision_host_input_cache.clear()
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
-        if self._clip_vision_host_tensor_enabled and self._clip_remote_context is not None:
-            try:
-                input_port = self._clip_vision_model.inputs[0]
-                # Vision input may expose dynamic batch dimension; use fixed single-image shape.
-                input_shape = ov.Shape(
-                    [1, 3, int(CLIP_IMAGE_RESOLUTION), int(CLIP_IMAGE_RESOLUTION)]
-                )
-                self._clip_vision_host_tensor = self._clip_remote_context.create_host_tensor(
-                    input_port.get_element_type(),
-                    input_shape,
-                )
-                self._clip_vision_host_view = np.asarray(self._clip_vision_host_tensor.data)
-                LOG.warning("CLIP Vision host tensor path enabled for GPU context.")
-            except Exception as exc:
-                LOG.warning(
-                    "CLIP Vision host tensor unavailable, fallback to shared numpy inputs: %s",
-                    exc,
-                )
-                self._clip_vision_host_tensor = None
-                self._clip_vision_host_view = None
-                self._clip_vision_host_tensor_enabled = False
-        self._clip_image_resolution = CLIP_IMAGE_RESOLUTION
-        LOG.warning("CLIP Vision model loaded on %s.", CLIP_INFERENCE_DEVICE)
+        LOG.warning(
+            "CLIP Vision model loaded on %s with OpenVINO PPP preprocessing.",
+            CLIP_INFERENCE_DEVICE,
+        )
 
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {
@@ -956,6 +974,250 @@ class AIModels:
         self._rapidocr_engine = self._instantiate_rapidocr(ov_cfg, rapidocr_params)
         LOG.warning("RapidOCR loaded with OpenVINO CPU backend.")
 
+    def _build_openvino_preprocess_runner(
+        self,
+        runner_name: str,
+        output_height: int,
+        output_width: int,
+        mean_values: List[float],
+        std_values: List[float],
+    ) -> _OpenVinoPreprocessRunner:
+        parameter = ov.opset13.parameter(
+            ov.PartialShape([ov.Dimension.dynamic(), 3, int(output_height), int(output_width)]),
+            ov.Type.f32,
+            name=f"{runner_name}_input",
+        )
+        preprocess_model = ov.Model(
+            [ov.opset13.result(parameter)],
+            [parameter],
+            f"{runner_name}_ppp",
+        )
+        ppp = ov.preprocess.PrePostProcessor(preprocess_model)
+        ppp.input().tensor().set_shape([-1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
+            ov.Layout("NHWC")
+        ).set_color_format(ov.preprocess.ColorFormat.BGR)
+        ppp.input().preprocess().resize(ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR)
+        ppp.input().preprocess().convert_color(ov.preprocess.ColorFormat.RGB)
+        ppp.input().preprocess().convert_element_type(ov.Type.f32)
+        ppp.input().preprocess().mean(mean_values)
+        ppp.input().preprocess().scale(std_values)
+        ppp.input().model().set_layout(ov.Layout("NCHW"))
+
+        compiled = self.core.compile_model(
+            ppp.build(),
+            "CPU",
+            {
+                "PERFORMANCE_HINT": "LATENCY",
+                "CACHE_DIR": str(self.ov_cache_dir),
+            },
+        )
+        return _OpenVinoPreprocessRunner(
+            compiled_model=compiled,
+            request=compiled.create_infer_request(),
+            input_name=compiled.inputs[0].any_name,
+            output_port=compiled.outputs[0],
+        )
+
+    @staticmethod
+    def _enable_insightface_opencl_alignment() -> None:
+        cv2.ocl.setUseOpenCL(True)
+        if not cv2.ocl.haveOpenCL() or not cv2.ocl.useOpenCL():
+            LOG.warning(
+                "OpenCV OpenCL unavailable; InsightFace alignment will fallback to CPU warpAffine."
+            )
+            return
+
+        device = cv2.ocl.Device_getDefault()
+        vendor = str(device.vendorName())
+        name = str(device.name())
+        if "INTEL" not in vendor.upper():
+            LOG.warning(
+                "OpenCV OpenCL enabled, but default device is '%s' (%s). "
+                "Set OPENCV_OPENCL_DEVICE to Intel GPU for best alignment latency.",
+                name,
+                vendor,
+            )
+            return
+
+        LOG.warning(
+            "OpenCV OpenCL enabled for InsightFace alignment on Intel device: %s (%s).",
+            name,
+            vendor,
+        )
+
+    @staticmethod
+    def _patch_insightface_norm_crop_opencl() -> None:
+        from insightface.utils import face_align
+
+        if getattr(face_align, "_mt_opencl_norm_crop_patch", False):
+            return
+
+        def _norm_crop_opencl(
+            img: np.ndarray,
+            landmark: np.ndarray,
+            image_size: int = 112,
+            mode: str = "arcface",
+        ) -> np.ndarray:
+            matrix = face_align.estimate_norm(landmark, image_size, mode)
+            source = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace alignment")
+
+            if cv2.ocl.useOpenCL():
+                try:
+                    warped_umat = cv2.warpAffine(
+                        cv2.UMat(source),
+                        matrix,
+                        (int(image_size), int(image_size)),
+                        borderValue=0.0,
+                    )
+                    if isinstance(warped_umat, cv2.UMat):
+                        return warped_umat.get()
+                    return np.asarray(warped_umat)
+                except Exception as exc:
+                    LOG.debug("OpenCL warpAffine failed, fallback to CPU: %s", exc)
+
+            return cv2.warpAffine(source, matrix, (int(image_size), int(image_size)), borderValue=0.0)
+
+        face_align.norm_crop = _norm_crop_opencl
+        face_align._mt_opencl_norm_crop_patch = True
+
+    def _patch_face_detector_forward(
+        self,
+        det_model: Any,
+        preprocess_runner: _OpenVinoPreprocessRunner,
+    ) -> None:
+        module = sys.modules.get(det_model.__class__.__module__)
+        if module is None:
+            raise RuntimeError(
+                f"Cannot resolve module for detector class: {det_model.__class__.__module__}"
+            )
+        distance2bbox = getattr(module, "distance2bbox", None)
+        distance2kps = getattr(module, "distance2kps", None)
+        if distance2bbox is None:
+            raise RuntimeError("InsightFace detector module missing distance2bbox helper.")
+        if getattr(det_model, "use_kps", False) and distance2kps is None:
+            raise RuntimeError("InsightFace detector module missing distance2kps helper.")
+
+        def _forward_with_ppp(model_self: Any, img: np.ndarray, threshold: float) -> Any:
+            scores_list: List[np.ndarray] = []
+            bboxes_list: List[np.ndarray] = []
+            kpss_list: List[np.ndarray] = []
+
+            image_bgr = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace detector")
+            blob = preprocess_runner.run(image_bgr[np.newaxis, ...])
+            net_outs = model_self.session.run(model_self.output_names, {model_self.input_name: blob})
+
+            input_height = int(blob.shape[2])
+            input_width = int(blob.shape[3])
+            fmc = model_self.fmc
+            batched_output = bool(getattr(model_self, "batched", False))
+
+            for idx, stride in enumerate(model_self._feat_stride_fpn):
+                if batched_output:
+                    scores = net_outs[idx][0]
+                    bbox_preds = net_outs[idx + fmc][0] * stride
+                    if model_self.use_kps:
+                        kps_preds = net_outs[idx + fmc * 2][0] * stride
+                else:
+                    scores = net_outs[idx]
+                    bbox_preds = net_outs[idx + fmc] * stride
+                    if model_self.use_kps:
+                        kps_preds = net_outs[idx + fmc * 2] * stride
+
+                height = input_height // stride
+                width = input_width // stride
+                key = (height, width, stride)
+                if key in model_self.center_cache:
+                    anchor_centers = model_self.center_cache[key]
+                else:
+                    anchor_centers = np.stack(
+                        np.mgrid[:height, :width][::-1], axis=-1
+                    ).astype(np.float32)
+                    anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+                    if model_self._num_anchors > 1:
+                        anchor_centers = np.stack([anchor_centers] * model_self._num_anchors, axis=1)
+                        anchor_centers = anchor_centers.reshape((-1, 2))
+                    if len(model_self.center_cache) < 100:
+                        model_self.center_cache[key] = anchor_centers
+
+                pos_inds = np.where(scores >= threshold)[0]
+                bboxes = distance2bbox(anchor_centers, bbox_preds)
+                pos_scores = scores[pos_inds]
+                pos_bboxes = bboxes[pos_inds]
+                scores_list.append(pos_scores)
+                bboxes_list.append(pos_bboxes)
+
+                if model_self.use_kps:
+                    kpss = distance2kps(anchor_centers, kps_preds)
+                    kpss = kpss.reshape((kpss.shape[0], -1, 2))
+                    pos_kpss = kpss[pos_inds]
+                    kpss_list.append(pos_kpss)
+
+            return scores_list, bboxes_list, kpss_list
+
+        det_model.forward = types.MethodType(_forward_with_ppp, det_model)
+
+    @staticmethod
+    def _patch_face_recognition_get_feat(
+        rec_model: Any,
+        preprocess_runner: _OpenVinoPreprocessRunner,
+    ) -> None:
+        def _get_feat_with_ppp(model_self: Any, imgs: Any) -> np.ndarray:
+            if not isinstance(imgs, list):
+                imgs = [imgs]
+            if not imgs:
+                return np.empty((0, 0), dtype=np.float32)
+
+            prepared = [
+                _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
+                for item in imgs
+            ]
+            try:
+                batch = np.stack(prepared, axis=0)
+                blob = preprocess_runner.run(batch)
+                return model_self.session.run(model_self.output_names, {model_self.input_name: blob})[0]
+            except ValueError:
+                features: List[np.ndarray] = []
+                for item in prepared:
+                    blob = preprocess_runner.run(item[np.newaxis, ...])
+                    single = model_self.session.run(
+                        model_self.output_names,
+                        {model_self.input_name: blob},
+                    )[0]
+                    features.append(np.asarray(single))
+                return np.concatenate(features, axis=0)
+
+        rec_model.get_feat = types.MethodType(_get_feat_with_ppp, rec_model)
+
+    def _attach_insightface_preprocess(self, face_app: FaceAnalysis) -> None:
+        det_model = getattr(face_app, "det_model", None)
+        rec_model = getattr(face_app, "models", {}).get("recognition")
+        if det_model is None or rec_model is None:
+            raise RuntimeError("InsightFace detection/recognition model not found.")
+
+        det_width, det_height = map(int, det_model.input_size)
+        rec_width, rec_height = map(int, rec_model.input_size)
+
+        self._face_det_ppp = self._build_openvino_preprocess_runner(
+            runner_name="insightface_det",
+            output_height=det_height,
+            output_width=det_width,
+            mean_values=_to_channel_triplet(getattr(det_model, "input_mean", 127.5)),
+            std_values=_to_channel_triplet(getattr(det_model, "input_std", 127.5)),
+        )
+        self._face_rec_ppp = self._build_openvino_preprocess_runner(
+            runner_name="insightface_rec",
+            output_height=rec_height,
+            output_width=rec_width,
+            mean_values=_to_channel_triplet(getattr(rec_model, "input_mean", 127.5)),
+            std_values=_to_channel_triplet(getattr(rec_model, "input_std", 127.5)),
+        )
+
+        self._patch_face_detector_forward(det_model, self._face_det_ppp)
+        self._patch_face_recognition_get_feat(rec_model, self._face_rec_ppp)
+        self._enable_insightface_opencl_alignment()
+        self._patch_insightface_norm_crop_opencl()
+        LOG.warning("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
+
     def _load_face_locked(self) -> None:
         provider_device = os.environ.get("INSIGHTFACE_OV_DEVICE", "CPU_FP32")
         providers: List[Any] = [
@@ -970,10 +1232,14 @@ class AIModels:
                 allowed_modules=["detection", "recognition"],
             )
             face_app.prepare(ctx_id=0, det_size=(640, 640))
+            self._attach_insightface_preprocess(face_app)
             self._face_engine = face_app
             LOG.warning("InsightFace loaded with providers=%s", providers)
-        except Exception as ov_exc:
-            LOG.warning("OpenVINO EP unavailable for InsightFace, fallback to CPU EP: %s", ov_exc)
+        except Exception as primary_exc:
+            LOG.warning(
+                "InsightFace primary load failed, fallback to CPU EP. reason=%s",
+                primary_exc,
+            )
             fallback = FaceAnalysis(
                 name=MODEL_NAME,
                 root=str(self.insightface_root),
@@ -981,6 +1247,7 @@ class AIModels:
                 allowed_modules=["detection", "recognition"],
             )
             fallback.prepare(ctx_id=0, det_size=(640, 640))
+            self._attach_insightface_preprocess(fallback)
             self._face_engine = fallback
             LOG.warning("InsightFace fallback providers=['CPUExecutionProvider']")
 
@@ -1022,34 +1289,24 @@ class AIModels:
         return embeddings.astype(np.float32, copy=False).tolist()
 
     def _infer_clip_image(self, image: np.ndarray, filename: str) -> List[float]:
-        if (
-            not self._clip_vision_model
-            or not self._clip_vision_request
-            or self._clip_image_resolution is None
-        ):
+        if not self._clip_vision_model or not self._clip_vision_request:
             raise RuntimeError("CLIP vision model is not loaded.")
 
-        if self._clip_vision_host_tensor is not None and self._clip_vision_host_view is not None:
-            _preprocess_clip_image_bgr(
-                image=image,
-                image_resolution=self._clip_image_resolution,
-                out=self._clip_vision_host_view,
-                resize_out=self._clip_vision_resize_buffer,
-            )
-            self._clip_vision_request.set_input_tensor(0, self._clip_vision_host_tensor)
+        image_bgr = _as_contiguous_bgr_uint8(image, context="CLIP vision")
+        height, width = image_bgr.shape[:2]
+        host_input = self._get_clip_vision_host_input(height, width)
+
+        if host_input is not None:
+            input_tensor, input_view = host_input
+            np.copyto(input_view[0], image_bgr, casting="no")
+            self._clip_vision_request.set_input_tensor(0, input_tensor)
             self._clip_vision_request.infer()
             embedding = np.asarray(self._clip_vision_request.get_output_tensor(0).data).reshape(-1)
         else:
             if not self._clip_vision_input_name:
                 raise RuntimeError("CLIP vision input metadata is not initialized.")
-            pixel_values = _preprocess_clip_image_bgr(
-                image=image,
-                image_resolution=self._clip_image_resolution,
-                out=self._clip_vision_numpy_input,
-                resize_out=self._clip_vision_resize_buffer,
-            )
             outputs = self._clip_vision_request.infer(
-                {self._clip_vision_input_name: pixel_values},
+                {self._clip_vision_input_name: image_bgr[np.newaxis, ...]},
                 share_inputs=True,
                 share_outputs=True,
             )
@@ -1065,7 +1322,9 @@ class AIModels:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
 
-        raw_result = self._rapidocr_engine(image)
+        # Zero-copy fast path: keep contiguous OpenCV BGR buffer when possible.
+        ocr_input = _as_contiguous_bgr_uint8(image, context="OCR")
+        raw_result = self._rapidocr_engine(ocr_input)
         ocr_items: Any
         if all(hasattr(raw_result, field) for field in ("boxes", "txts", "scores")):
             boxes_data = getattr(raw_result, "boxes", None)
@@ -1115,7 +1374,8 @@ class AIModels:
         if self._face_engine is None:
             raise RuntimeError("Face model is not loaded.")
 
-        faces = self._face_engine.get(image)
+        face_input = _as_contiguous_bgr_uint8(image, context="InsightFace")
+        faces = self._face_engine.get(face_input)
         if not faces:
             return []
 

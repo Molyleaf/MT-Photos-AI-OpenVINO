@@ -50,6 +50,7 @@
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
 - Windows Server GPU-PV 场景（容器映射 `/dev/dxg`）可用于 OpenVINO GPU 推理/Remote Context；但 `ffmpeg QSV` 硬解链路仍以 `/dev/dri`（VAAPI/oneVPL）为主，需在文档中明确能力边界。
 - `/clip/img` 视觉链路必须直接消费 `numpy BGR`，禁止 `BGR -> RGB -> PIL` 的多余拷贝链。
+- CLIP 视觉预处理（`resize + 通道转换 + 归一化 + layout`）必须走 OpenVINO PrePostProcessing (PPP) API，禁止回退到手工 `numpy` 链。
 
 ### 3.2 QA-CLIP 转换（Hugging Face -> OpenVINO IR）
 
@@ -77,12 +78,15 @@
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
+- OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
 
 ### 3.4 InsightFace
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
 - 保留 CPU 回退路径，但默认 EP 优先顺序应以 OpenVINO EP 在前。
+- 对齐阶段必须使用 OpenCV，并优先启用 Intel OpenCL 驱动（`warpAffine` OpenCL 路径）；不可用时才允许回退 CPU。
+- 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 
 ---
 

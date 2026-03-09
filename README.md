@@ -87,6 +87,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 | `RAPIDOCR_ENABLE_HYPER_THREADING` | 布尔：`1/true/yes/on` 或 `0/false/no/off` | `true` |
 | `RAPIDOCR_SCHEDULING_CORE_TYPE` | OpenVINO 核调度类型，常用：`ANY_CORE` / `PCORE_ONLY` / `ECORE_ONLY` | `ANY_CORE` |
 | `INSIGHTFACE_OV_DEVICE` | 透传给 ORT OpenVINO EP 的 `device_type`；常见：`CPU_FP32` / `CPU_FP16` / `GPU_FP32` / `GPU_FP16` | `CPU_FP32` |
+| `OPENCV_OPENCL_DEVICE` | OpenCV OpenCL 设备选择（可选，如 `Intel:GPU:0`），用于 InsightFace 对齐阶段 OpenCL 路径 | OpenCV 默认设备 |
 | `PORT` | 端口号（整数） | `8060` |
 | `LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` | `WARNING` |
 | `FFMPEG_BIN` | 图片解码 ffmpeg 可执行文件名/路径（服务内非 GIF 上传默认优先走 QSV+ffmpeg） | `ffmpeg` |
@@ -227,7 +228,9 @@ docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 若服务启动时请求了 GPU 推理（`INFERENCE_DEVICE/CLIP_INFERENCE_DEVICE` 含 `GPU` 或 `AUTO`），应用会在启动阶段强制执行 `/dev/dri` 自检；自检失败会直接报错并终止启动（无静默回退）。
 
 服务内 `read_image_from_upload` 对非 GIF 上传默认采用“`ffmpeg(QSV)` -> `ffmpeg(CPU)` -> `cv2.imdecode`”顺序解码，优先使用 Intel 核显链路并显式记录每一级失败原因；`ffprobe` 失败/未返回尺寸时仍会先尝试 `ffmpeg(QSV/CPU)`，再回退 `cv2.imdecode`；检测到高位深图像时会直接使用 `cv2.imdecode` 以保持 16-bit 转 8-bit 语义。
-`/clip/img` 端点已去除 `BGR -> RGB -> PIL` 额外拷贝链，模型层直接消费 `numpy BGR` 并优先走 OpenVINO host tensor。
+`/clip/img` 端点已去除 `BGR -> RGB -> PIL` 额外拷贝链，模型层直接消费 `numpy BGR`，并使用 OpenVINO PPP 执行 `resize + BGR->RGB + 归一化 + layout` 预处理。
+`/represent`（InsightFace）链路使用 OpenCV 对齐，优先启用 OpenCL（Intel 驱动）加速 `warpAffine`；检测/识别输入的归一化与通道转换由 OpenVINO PPP 执行，替代 `cv2.dnn.blobFromImage(s)`。
+`/ocr` 链路采用 OpenCV `numpy BGR` 零拷贝优先输入（连续 `uint8` 直接透传 RapidOCR，必要时才补齐连续内存）。
 
 ## Windows Server GPU-PV（`/dev/dxg`）能力边界
 
@@ -235,7 +238,7 @@ docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 
 - QA-CLIP OpenVINO GPU 推理（`CLIP_INFERENCE_DEVICE=AUTO/GPU`）；
 - QA-CLIP GPU Remote Context + host tensor 互操作（减少 Host<->Device 拷贝）；
-- InsightFace 的 OpenVINO EP（当 `INSIGHTFACE_OV_DEVICE` 配置为 GPU 类型且运行时可用）。
+- InsightFace 的 OpenVINO EP（当 `INSIGHTFACE_OV_DEVICE` 配置为 GPU 类型且运行时可用），并配合 OpenCV(OpenCL) 对齐 + OpenVINO PPP 预处理链路。
 
 需要明确的限制：
 
