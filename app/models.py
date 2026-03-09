@@ -3,6 +3,7 @@ import gc
 import inspect
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -282,6 +283,7 @@ class AIModels:
             os.environ.get("MODEL_PATH", str(_PROJECT_ROOT / "models"))
         )
         self.insightface_root = self.model_base_path / "insightface"
+        self.insightface_model_root = self.insightface_root / "models"
         self.qa_clip_path = self.model_base_path / "qa-clip" / "openvino"
 
         self.ov_cache_dir = Path(
@@ -712,7 +714,12 @@ class AIModels:
         ppp.input().tensor().set_shape([1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
             ov.Layout("NHWC")
         ).set_color_format(ov.preprocess.ColorFormat.BGR)
-        ppp.input().preprocess().resize(ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR)
+        # openvino_image_fp16 may have dynamic NCHW input; explicit target size avoids PPP static-shape errors.
+        ppp.input().preprocess().resize(
+            ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR,
+            int(CLIP_IMAGE_RESOLUTION),
+            int(CLIP_IMAGE_RESOLUTION),
+        )
         ppp.input().preprocess().convert_color(ov.preprocess.ColorFormat.RGB)
         ppp.input().preprocess().convert_element_type(ov.Type.f32)
         ppp.input().preprocess().scale([255.0, 255.0, 255.0])
@@ -901,6 +908,67 @@ class AIModels:
                 LOG.warning("RapidOCR OpenVINO config loaded: %s", self.rapidocr_config_path)
             except Exception as exc:
                 LOG.warning("Unable to parse RapidOCR config %s: %s", self.rapidocr_config_path, exc)
+
+        # Explicit runtime env vars must override YAML to avoid stale cfg forcing unintended devices.
+        env_override_map: Dict[str, Tuple[str, Any]] = {
+            "RAPIDOCR_DEVICE": (
+                "device_name",
+                lambda value, default: str(value).strip().upper() or default,
+            ),
+            "RAPIDOCR_INFERENCE_NUM_THREADS": (
+                "inference_num_threads",
+                lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_PERFORMANCE_HINT": (
+                "performance_hint",
+                lambda value, default: str(value).strip() or default,
+            ),
+            "RAPIDOCR_PERFORMANCE_NUM_REQUESTS": (
+                "performance_num_requests",
+                lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_ENABLE_CPU_PINNING": (
+                "enable_cpu_pinning",
+                lambda value, default: _as_bool(value, default),
+            ),
+            "RAPIDOCR_NUM_STREAMS": (
+                "num_streams",
+                lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_ENABLE_HYPER_THREADING": (
+                "enable_hyper_threading",
+                lambda value, default: _as_bool(value, default),
+            ),
+            "RAPIDOCR_SCHEDULING_CORE_TYPE": (
+                "scheduling_core_type",
+                lambda value, default: str(value).strip() or default,
+            ),
+            "RAPIDOCR_USE_CLS": (
+                "use_cls",
+                lambda value, default: _as_bool(value, default),
+            ),
+            "RAPIDOCR_MAX_SIDE_LEN": (
+                "max_side_len",
+                lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_DET_LIMIT_SIDE_LEN": (
+                "det_limit_side_len",
+                lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_REC_BATCH_NUM": (
+                "rec_batch_num",
+                lambda value, default: max(1, _as_int(value, default)),
+            ),
+            "RAPIDOCR_CLS_BATCH_NUM": (
+                "cls_batch_num",
+                lambda value, default: max(1, _as_int(value, default)),
+            ),
+        }
+        for env_name, (cfg_name, parser) in env_override_map.items():
+            raw_env = os.environ.get(env_name)
+            if raw_env is None or str(raw_env).strip() == "":
+                continue
+            config[cfg_name] = parser(raw_env, config[cfg_name])
 
         config["device_name"] = str(config.get("device_name", "AUTO")).strip().upper() or "AUTO"
         config["cache_dir"] = str(self.ov_cache_dir)
@@ -1365,6 +1433,70 @@ class AIModels:
         self._patch_insightface_norm_crop_opencl()
         LOG.warning("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
 
+    def _resolve_insightface_root(self) -> Path:
+        candidate_roots = (self.insightface_model_root, self.insightface_root)
+        for root in candidate_roots:
+            if (root / MODEL_NAME).is_dir():
+                return root
+        raise FileNotFoundError(
+            "InsightFace model directory missing for antelopev2. Checked paths: "
+            f"{self.insightface_model_root / MODEL_NAME}, {self.insightface_root / MODEL_NAME}"
+        )
+
+    @staticmethod
+    def _enforce_insightface_openvino_provider(face_app: FaceAnalysis, provider_device: str) -> None:
+        models_map = getattr(face_app, "models", {})
+        configured_sessions = 0
+        for task_name, model in models_map.items():
+            session = getattr(model, "session", None)
+            if session is None or not hasattr(session, "set_providers"):
+                continue
+            try:
+                session.set_providers(
+                    ["OpenVINOExecutionProvider"],
+                    [{"device_type": provider_device}],
+                )
+            except TypeError:
+                session.set_providers(
+                    [("OpenVINOExecutionProvider", {"device_type": provider_device})]
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "InsightFace failed to set OpenVINOExecutionProvider for task="
+                    f"{task_name}. No silent fallback is allowed."
+                ) from exc
+            configured_sessions += 1
+
+        if configured_sessions == 0:
+            raise RuntimeError(
+            "InsightFace session initialization missing; cannot enforce OpenVINOExecutionProvider."
+            )
+
+    def _prepare_legacy_insightface_runtime_root(self, source_root: Path) -> Path:
+        source_model_dir = source_root / MODEL_NAME
+        runtime_root = self.insightface_root / "_runtime_models"
+        runtime_model_dir = runtime_root / MODEL_NAME
+        runtime_model_dir.mkdir(parents=True, exist_ok=True)
+
+        # insightface<=0.2.1 model router cannot parse all antelopev2 heads.
+        # Keep only detection+recognition ONNX files required by /represent.
+        required_files = ("scrfd_10g_bnkps.onnx", "glintr100.onnx")
+        for filename in required_files:
+            src = source_model_dir / filename
+            dst = runtime_model_dir / filename
+            if not src.is_file():
+                raise FileNotFoundError(f"InsightFace required model missing: {src}")
+            if dst.exists():
+                continue
+            try:
+                os.symlink(src, dst)
+            except Exception:
+                try:
+                    os.link(src, dst)
+                except Exception:
+                    shutil.copy2(src, dst)
+        return runtime_root
+
     @staticmethod
     def _validate_insightface_openvino_provider(face_app: FaceAnalysis) -> None:
         models_map = getattr(face_app, "models", {})
@@ -1387,17 +1519,33 @@ class AIModels:
             ("OpenVINOExecutionProvider", {"device_type": provider_device}),
         ]
         try:
-            face_app = FaceAnalysis(
-                name=MODEL_NAME,
-                root=str(self.insightface_root),
-                providers=providers,
-                allowed_modules=["detection", "recognition"],
-            )
+            root_for_runtime = self._resolve_insightface_root()
+            init_signature = inspect.signature(FaceAnalysis.__init__)
+            legacy_face_analysis = "providers" not in init_signature.parameters
+            if legacy_face_analysis:
+                root_for_runtime = self._prepare_legacy_insightface_runtime_root(root_for_runtime)
+            face_analysis_kwargs: Dict[str, Any] = {
+                "name": MODEL_NAME,
+                "root": str(root_for_runtime),
+            }
+            if "providers" in init_signature.parameters:
+                face_analysis_kwargs["providers"] = providers
+            if "allowed_modules" in init_signature.parameters:
+                face_analysis_kwargs["allowed_modules"] = ["detection", "recognition"]
+
+            face_app = FaceAnalysis(**face_analysis_kwargs)
+            # InsightFace<=0.2.1 ignores providers in __init__; enforce OpenVINO EP explicitly.
+            self._enforce_insightface_openvino_provider(face_app, provider_device)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
+            self._enforce_insightface_openvino_provider(face_app, provider_device)
             self._validate_insightface_openvino_provider(face_app)
             self._attach_insightface_preprocess(face_app)
             self._face_engine = face_app
-            LOG.warning("InsightFace loaded with providers=%s", providers)
+            LOG.warning(
+                "InsightFace loaded with providers=%s (runtime_root=%s)",
+                providers,
+                root_for_runtime,
+            )
         except Exception as exc:
             raise RuntimeError(
                 "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL alignment. "
