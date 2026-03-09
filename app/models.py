@@ -410,15 +410,21 @@ class AIModels:
         available_devices = _normalize_openvino_devices(self.core.available_devices)
         gpu_devices = _get_openvino_gpu_devices(available_devices)
         if not gpu_devices:
+            runtime_hint = (
+                " Ensure the container exposes a real Intel /dev/dri render node and installs "
+                "OpenVINO/OpenCL runtime packages (Debian 13 stable baseline: libze1, "
+                "ocl-icd-libopencl1, mesa-opencl-icd; optional diagnostics: clinfo)."
+            )
             if force_gpu_remote_context:
                 raise RuntimeError(
                     "CLIP_INFERENCE_DEVICE=AUTO requires GPU Remote Context. "
                     f"OpenVINO GPU device is unavailable (available_devices={sorted(available_devices)})."
+                    f"{runtime_hint}"
                 )
             raise RuntimeError(
                 f"CLIP_INFERENCE_DEVICE={CLIP_INFERENCE_DEVICE} requests GPU execution, "
                 f"but available_devices={sorted(available_devices)}. "
-                "No silent fallback is allowed."
+                f"No silent fallback is allowed.{runtime_hint}"
             )
 
         explicit_gpu_devices = _extract_explicit_gpu_devices(clip_device)

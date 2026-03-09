@@ -104,6 +104,7 @@ uvicorn server:app --host 0.0.0.0 --port 8060 --workers 2
 ```bash
 apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
+  clinfo \
   ffmpeg \
   libdrm2 \
   libgl1 \
@@ -121,6 +122,12 @@ apt-get update && apt-get install -y --no-install-recommends \
   ocl-icd-libopencl1 \
   mesa-opencl-icd
 ```
+
+说明：
+
+- 当前 Debian 13 stable 官方仓库可直接安装的 OpenVINO/OpenCL 基线是 `libze1 + ocl-icd-libopencl1 + mesa-opencl-icd`；镜像默认保持这一 stable-only 组合。
+- `intel-opencl-icd` 与 `libze-intel-gpu1` 属于 sid 侧 Intel compute runtime，不在当前镜像里默认启用；直接混装 sid 包会连带升级核心系统库，需单独评估。
+- 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
 
 ### 方式一：docker compose
 
@@ -180,6 +187,7 @@ docker run -d \
 
 ```bash
 docker exec -it mt-photos-ai-openvino ls -l /dev/dri
+docker exec -it mt-photos-ai-openvino clinfo | grep -i 'Device Name'
 docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 ```
 

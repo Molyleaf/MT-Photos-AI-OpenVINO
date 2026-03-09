@@ -26,33 +26,29 @@ COPY sources.list /etc/apt/sources.list
 COPY requirements.txt /tmp/requirements.txt
 
 RUN set -eux; \
-    runtime_deps="\
-        ca-certificates \
-        ffmpeg \
+    ov_opencl_runtime_deps="\
+        clinfo \
         libdrm2 \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
         libva2 \
         libva-drm2 \
-        intel-media-va-driver-non-free \
-        libvpl2 \
-        libmfx-gen1.2 \
         libze1 \
         ocl-icd-libopencl1 \
         mesa-opencl-icd"; \
-    build_deps="\
-        build-essential \
-        gcc \
-        g++ \
-        libpq-dev"; \
+    python_runtime_deps="\
+        ca-certificates \
+        ffmpeg \
+        intel-media-va-driver-non-free \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libmfx-gen1.2 \
+        libsm6 \
+        libvpl2 \
+        libxext6 \
+        libxrender1"; \
     apt-get update; \
-    apt-get install -y --no-install-recommends $runtime_deps $build_deps; \
+    apt-get install -y --no-install-recommends $ov_opencl_runtime_deps $python_runtime_deps; \
     pip install --no-cache-dir --prefer-binary -r /tmp/requirements.txt; \
-    apt-get purge -y --auto-remove $build_deps; \
     rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
 
 RUN set -eux; \

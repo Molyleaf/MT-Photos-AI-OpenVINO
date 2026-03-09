@@ -290,11 +290,12 @@
 - 当前 Docker 基线镜像为 `python:3.12-slim-trixie`（Debian 13）。
 - APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
-- `pip install` 完成后会卸载 InsightFace 构建依赖（`build-essential`、`gcc`、`g++`、`libpq-dev`）。
+- 当前 `requirements.txt` 在 Python 3.12 / manylinux 下可直接使用 wheel 安装，不再默认保留 InsightFace 专用构建依赖。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
-- 镜像内需包含 OpenVINO + Xe 核显图片转码所需依赖：`intel-media-va-driver-non-free`、`libvpl2`、`libmfx-gen1.2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`libva2`、`libva-drm2`、`ffmpeg`。
+- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`（可选诊断工具：`clinfo`）；以及服务运行依赖：`intel-media-va-driver-non-free`、`libvpl2`、`libmfx-gen1.2`、`libva2`、`libva-drm2`、`ffmpeg`。
+- Debian 13 stable 官方仓库默认不提供 `intel-opencl-icd` / `libze-intel-gpu1`；如需启用 sid 或其他额外源补齐 Intel compute runtime，必须明确评估跨发行版核心库升级风险，不能默认混装。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - 启动阶段必须增加 `/dev/dri` 自检：请求 GPU 推理时，`/dev/dri` 不可用则直接报错并终止启动。
@@ -306,6 +307,7 @@
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=CPU/GPU/AUTO`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
+- 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。
 
 ### 13.3 `/dev/dri` Intel iGPU 上线验收
 
