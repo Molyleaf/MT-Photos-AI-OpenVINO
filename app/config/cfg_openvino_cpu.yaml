@@ -1,11 +1,11 @@
 Global:
   text_score: 0.5
   use_det: true
-  use_cls: false
+  use_cls: true
   use_rec: true
   min_height: 30
   width_height_ratio: 8
-  max_side_len: 2000
+  max_side_len: 960
   min_side_len: 30
   return_word_box: false
   return_single_char_box: false
@@ -14,11 +14,12 @@ Global:
 
 EngineConfig:
   openvino:
+    device_name: "AUTO"
     inference_num_threads: -1
     performance_hint: "LATENCY"
     performance_num_requests: -1
     enable_cpu_pinning: true
-    num_streams: 1
+    num_streams: -1
     enable_hyper_threading: true
     scheduling_core_type: "ANY_CORE"
 
@@ -30,7 +31,7 @@ Det:
   task_type: "det"
   model_path: null
   model_dir: null
-  limit_side_len: 736
+  limit_side_len: 960
   limit_type: "min"
   std: [0.5, 0.5, 0.5]
   mean: [0.5, 0.5, 0.5]

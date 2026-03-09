@@ -79,13 +79,19 @@ apt-get update && apt-get install -y --no-install-recommends \
 | `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR 配置文件路径（YAML） | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR` | RapidOCR 模型目录（必须包含 `PP-OCRv5 mobile det/rec/dict` 与 `ch_ppocr_mobile_v2.0_cls_infer.onnx`，缺失即失败） | `<repo>/models/rapidocr` |
 | `RAPIDOCR_FONT_PATH` | 字体文件路径；空表示不指定 | 空 |
+| `RAPIDOCR_DEVICE` | RapidOCR OpenVINO 设备字符串（如 `AUTO` / `GPU` / `AUTO:GPU,CPU`）；`AUTO` 或包含 `GPU` 且无 GPU 设备时会直接报错（无 silent fallback） | `AUTO` |
 | `RAPIDOCR_INFERENCE_NUM_THREADS` | 整数，建议 `1~CPU核心数` | `-1`（跟随 `cfg_openvino_cpu.yaml`） |
 | `RAPIDOCR_PERFORMANCE_HINT` | OpenVINO 性能提示，常用：`LATENCY` / `THROUGHPUT` | `LATENCY` |
 | `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | 整数；`-1` 表示自动 | `-1` |
 | `RAPIDOCR_ENABLE_CPU_PINNING` | 布尔：`1/true/yes/on` 或 `0/false/no/off`（大小写不敏感） | `true` |
-| `RAPIDOCR_NUM_STREAMS` | 整数；`-1` 表示自动 | `1`（跟随 `cfg_openvino_cpu.yaml`） |
+| `RAPIDOCR_NUM_STREAMS` | 整数；`-1` 表示自动 | `-1`（跟随 `cfg_openvino_cpu.yaml`） |
 | `RAPIDOCR_ENABLE_HYPER_THREADING` | 布尔：`1/true/yes/on` 或 `0/false/no/off` | `true` |
 | `RAPIDOCR_SCHEDULING_CORE_TYPE` | OpenVINO 核调度类型，常用：`ANY_CORE` / `PCORE_ONLY` / `ECORE_ONLY` | `ANY_CORE` |
+| `RAPIDOCR_USE_CLS` | 布尔：是否启用方向分类器（`true` 表示开启） | `true` |
+| `RAPIDOCR_MAX_SIDE_LEN` | OCR 全图预处理最大边限制（建议 960/1280） | `960` |
+| `RAPIDOCR_DET_LIMIT_SIDE_LEN` | 检测模型输入边长限制 | `960` |
+| `RAPIDOCR_REC_BATCH_NUM` | 识别批大小（建议 6~8） | `6` |
+| `RAPIDOCR_CLS_BATCH_NUM` | 方向分类批大小 | `6` |
 | `INSIGHTFACE_OV_DEVICE` | 透传给 ORT OpenVINO EP 的 `device_type`；常见：`CPU_FP32` / `CPU_FP16` / `GPU_FP32` / `GPU_FP16` | `CPU_FP32` |
 | `OPENCV_OPENCL_DEVICE` | OpenCV OpenCL 设备选择（可选，如 `Intel:GPU:0`），用于 InsightFace 对齐阶段 OpenCL 路径 | OpenCV 默认设备 |
 | `PORT` | 端口号（整数） | `8060` |
@@ -229,8 +235,8 @@ docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 
 服务内 `read_image_from_upload` 对非 GIF 上传默认采用“`ffmpeg(QSV)` -> `ffmpeg(CPU)` -> `cv2.imdecode`”顺序解码，优先使用 Intel 核显链路并显式记录每一级失败原因；`ffprobe` 失败/未返回尺寸时仍会先尝试 `ffmpeg(QSV/CPU)`，再回退 `cv2.imdecode`；检测到高位深图像时会直接使用 `cv2.imdecode` 以保持 16-bit 转 8-bit 语义。
 `/clip/img` 端点已去除 `BGR -> RGB -> PIL` 额外拷贝链，模型层直接消费 `numpy BGR`，并使用 OpenVINO PPP 执行 `resize + BGR->RGB + 归一化 + layout` 预处理。
-`/represent`（InsightFace）链路使用 OpenCV 对齐，优先启用 OpenCL（Intel 驱动）加速 `warpAffine`；检测/识别输入的归一化与通道转换由 OpenVINO PPP 执行，替代 `cv2.dnn.blobFromImage(s)`。
-`/ocr` 链路采用 OpenCV `numpy BGR` 零拷贝优先输入（连续 `uint8` 直接透传 RapidOCR，必要时才补齐连续内存）。
+`/represent`（InsightFace）链路使用 OpenCV + OpenCL（Intel 驱动）执行对齐 `warpAffine`；检测/识别输入的归一化与通道转换由 OpenVINO PPP 执行，替代 `cv2.dnn.blobFromImage(s)`。OpenCL 不可用或 OpenVINO EP 不生效会直接报错（无 silent fallback）。
+`/ocr` 链路采用 OpenCV `numpy BGR` 零拷贝优先输入（连续 `uint8` 直接透传 RapidOCR，必要时才补齐连续内存），默认开启方向分类器（`use_cls=true`），并使用 `max_side_len=960`、`rec_batch_num=6` 的 11800H 核显基线配置。
 
 ## Windows Server GPU-PV（`/dev/dxg`）能力边界
 
@@ -242,10 +248,12 @@ docker exec -it mt-photos-ai-openvino ffmpeg -hide_banner -hwaccels
 
 需要明确的限制：
 
-- RapidOCR 固定 OpenVINO CPU 后端，不走 GPU。
+- RapidOCR 默认 OpenVINO `AUTO`（可显式 `GPU`）；若请求 `AUTO/GPU` 但运行时无 GPU 设备，会直接报错而不是回退到纯 CPU。
 - `ffmpeg QSV` 在 Linux 容器里通常依赖 `/dev/dri`（VAAPI/oneVPL）链路；仅有 `/dev/dxg` 时不保证可用。若 QSV 不可用，服务会记录原因并按既定顺序显式降级到 `ffmpeg(CPU)` 或 `cv2.imdecode`（无静默 fallback）。
 
 ## RapidOCR 模型预置（强制）
+
+当前服务依赖 `rapidocr==3.7.0`。
 
 服务已禁用线上下载回退，必须在镜像/部署目录预置以下 4 个本地文件（缺失即失败）：
 
@@ -260,10 +268,10 @@ Linux/macOS 下载示例：
 
 ```bash
 mkdir -p models/rapidocr
-curl -L -o models/rapidocr/ch_PP-OCRv5_mobile_det.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx"
-curl -L -o models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx"
-curl -L -o models/rapidocr/ppocrv5_dict.txt "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt"
-curl -L -o models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx"
+curl -L -o models/rapidocr/ch_PP-OCRv5_mobile_det.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx"
+curl -L -o models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx"
+curl -L -o models/rapidocr/ppocrv5_dict.txt "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt"
+curl -L -o models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx"
 ```
 
 Windows PowerShell 下载示例：
@@ -272,10 +280,10 @@ Windows PowerShell 下载示例：
 $dir = "models/rapidocr"
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx" -OutFile "$dir/ch_PP-OCRv5_mobile_det.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx" -OutFile "$dir/ch_PP-OCRv5_rec_mobile_infer.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt" -OutFile "$dir/ppocrv5_dict.txt"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx" -OutFile "$dir/ch_ppocr_mobile_v2.0_cls_infer.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx" -OutFile "$dir/ch_PP-OCRv5_mobile_det.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx" -OutFile "$dir/ch_PP-OCRv5_rec_mobile_infer.onnx"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt" -OutFile "$dir/ppocrv5_dict.txt"
+Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx" -OutFile "$dir/ch_ppocr_mobile_v2.0_cls_infer.onnx"
 ```
 
 下载后请在 `app/config/cfg_openvino_cpu.yaml` 中指定绝对路径（推荐）：
@@ -291,22 +299,27 @@ Cls:
 ```
 
 说明：
-- 当前默认配置 `Global.use_cls=false`，即不启用方向分类器（仅使用 `PP-OCRv5 mobile det+rec`）。
-- 即使 `Global.use_cls=false`，服务仍会强校验 `ch_ppocr_mobile_v2.0_cls_infer.onnx` 是否存在。
+- 当前默认配置 `Global.use_cls=true`，启用方向分类器以处理拍照文本旋转场景。
+- 即使你手动关闭 `Global.use_cls`，服务仍会强校验 `ch_ppocr_mobile_v2.0_cls_infer.onnx` 是否存在（避免初始化路径触发下载）。
 
-## RapidOCR OpenVINO CPU 配置
+## RapidOCR OpenVINO(AUTO/GPU) 配置
 
 示例文件：`app/config/cfg_openvino_cpu.yaml`
 
-当前默认值针对 Intel i7-11800H + OpenVINO CPU 的低延迟场景：
+当前默认值针对 Intel i7-11800H + 核显场景：
 
+- `device_name: AUTO`
 - `performance_hint: LATENCY`
 - `inference_num_threads: -1`（交给 OpenVINO 自动决策线程）
-- `num_streams: 1`（避免和应用层并发叠加造成过度订阅）
-- `enable_cpu_pinning: true`
+- `num_streams: -1`（由 OpenVINO 自动调度）
+- `max_side_len: 960`
+- `det_limit_side_len: 960`
+- `rec_batch_num: 6`
+- `use_cls: true`
 
 可用关键参数：
 
+- `device_name`
 - `inference_num_threads`
 - `performance_hint`
 - `performance_num_requests`

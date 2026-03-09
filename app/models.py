@@ -78,7 +78,7 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
         return
 
-    # RapidOCR 3.6.0 OpenVINO session assumes single output; server det models are multi-output.
+    # RapidOCR OpenVINO session may expose multi-output det heads; normalize __call__ behavior.
     def _patched_call(self: Any, input_content: np.ndarray) -> Any:
         try:
             self.session.infer(inputs=[input_content])
@@ -94,7 +94,73 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     OpenVINOInferSession._mt_multi_output_patch = True  # type: ignore[attr-defined]
 
 
+def _patch_rapidocr_openvino_device_selection() -> None:
+    try:
+        from rapidocr.inference_engine.openvino.main import Core, OpenVINOInferSession
+    except Exception:
+        return
+
+    if getattr(OpenVINOInferSession, "_mt_device_patch", False):
+        return
+
+    original_init = OpenVINOInferSession.__init__
+
+    def _patched_init(self: Any, cfg: Any) -> None:
+        original_init(self, cfg)
+
+        engine_cfg = cfg.get("engine_cfg", {}) or {}
+        selected_device = str(
+            engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", "AUTO"))
+        ).strip().upper()
+        if not selected_device:
+            selected_device = "AUTO"
+
+        requires_gpu = selected_device == "AUTO" or ("GPU" in selected_device)
+        core = Core()
+        available_devices = [str(item).upper() for item in core.available_devices]
+        if requires_gpu and not _has_openvino_gpu_device(available_devices):
+            raise RuntimeError(
+                f"RapidOCR OpenVINO device={selected_device} requires GPU, "
+                f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
+            )
+
+        if selected_device == "CPU":
+            self._mt_device_name = selected_device
+            return
+
+        compile_cfg: Dict[str, str] = {}
+        for key, ov_key in (
+            ("performance_hint", "PERFORMANCE_HINT"),
+            ("performance_num_requests", "PERFORMANCE_HINT_NUM_REQUESTS"),
+            ("num_streams", "NUM_STREAMS"),
+            ("cache_dir", "CACHE_DIR"),
+        ):
+            value = engine_cfg.get(key)
+            if value in (None, "", -1):
+                continue
+            compile_cfg[ov_key] = str(value)
+
+        try:
+            compiled_model = core.compile_model(
+                model=self.model,
+                device_name=selected_device,
+                config=compile_cfg,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"RapidOCR OpenVINO compile_model failed on device={selected_device}. "
+                "No silent fallback is allowed."
+            ) from exc
+
+        self.session = compiled_model.create_infer_request()
+        self._mt_device_name = selected_device
+
+    OpenVINOInferSession.__init__ = _patched_init  # type: ignore[assignment]
+    OpenVINOInferSession._mt_device_patch = True  # type: ignore[attr-defined]
+
+
 _patch_rapidocr_openvino_multi_output()
+_patch_rapidocr_openvino_device_selection()
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -115,6 +181,10 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _has_openvino_gpu_device(devices: Any) -> bool:
+    return any(str(item).upper().startswith("GPU") for item in devices)
 
 
 TEXT_MODEL_RESTORE_DELAY_MS = max(
@@ -776,7 +846,8 @@ class AIModels:
 
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {
-            "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), 8),
+            "device_name": str(os.environ.get("RAPIDOCR_DEVICE", "AUTO")).strip().upper() or "AUTO",
+            "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
             "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "LATENCY"),
             "performance_num_requests": _as_int(
                 os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), -1
@@ -787,6 +858,11 @@ class AIModels:
                 os.environ.get("RAPIDOCR_ENABLE_HYPER_THREADING"), True
             ),
             "scheduling_core_type": os.environ.get("RAPIDOCR_SCHEDULING_CORE_TYPE", "ANY_CORE"),
+            "use_cls": _as_bool(os.environ.get("RAPIDOCR_USE_CLS"), True),
+            "max_side_len": _as_int(os.environ.get("RAPIDOCR_MAX_SIDE_LEN"), 960),
+            "det_limit_side_len": _as_int(os.environ.get("RAPIDOCR_DET_LIMIT_SIDE_LEN"), 960),
+            "rec_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_REC_BATCH_NUM"), 6)),
+            "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 6)),
         }
 
         if self.rapidocr_config_path.exists():
@@ -796,26 +872,77 @@ class AIModels:
                 for key in list(config.keys()):
                     if key in ov_cfg:
                         config[key] = ov_cfg[key]
+
+                global_cfg = loaded.get("Global", {})
+                if "use_cls" in global_cfg:
+                    config["use_cls"] = _as_bool(global_cfg.get("use_cls"), config["use_cls"])
+                if "max_side_len" in global_cfg:
+                    config["max_side_len"] = _as_int(
+                        global_cfg.get("max_side_len"), config["max_side_len"]
+                    )
+
+                det_cfg = loaded.get("Det", {})
+                if "limit_side_len" in det_cfg:
+                    config["det_limit_side_len"] = _as_int(
+                        det_cfg.get("limit_side_len"), config["det_limit_side_len"]
+                    )
+
+                rec_cfg = loaded.get("Rec", {})
+                if "rec_batch_num" in rec_cfg:
+                    config["rec_batch_num"] = max(
+                        1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
+                    )
+
+                cls_cfg = loaded.get("Cls", {})
+                if "cls_batch_num" in cls_cfg:
+                    config["cls_batch_num"] = max(
+                        1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
+                    )
                 LOG.warning("RapidOCR OpenVINO config loaded: %s", self.rapidocr_config_path)
             except Exception as exc:
                 LOG.warning("Unable to parse RapidOCR config %s: %s", self.rapidocr_config_path, exc)
 
+        config["device_name"] = str(config.get("device_name", "AUTO")).strip().upper() or "AUTO"
         config["cache_dir"] = str(self.ov_cache_dir)
+
+        available_devices = [str(item).upper() for item in self.core.available_devices]
+        requires_gpu = config["device_name"] == "AUTO" or ("GPU" in config["device_name"])
+        if requires_gpu and not _has_openvino_gpu_device(available_devices):
+            raise RuntimeError(
+                f"RapidOCR OpenVINO device={config['device_name']} requires GPU, "
+                f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
+            )
         return config
 
     def _to_openvino_plugin_config(self, cfg: Dict[str, Any]) -> Dict[str, str]:
-        return {
-            "INFERENCE_NUM_THREADS": str(_as_int(cfg.get("inference_num_threads"), 8)),
-            "PERFORMANCE_HINT": str(cfg.get("performance_hint", "LATENCY")),
-            "PERFORMANCE_NUM_REQUESTS": str(_as_int(cfg.get("performance_num_requests"), -1)),
-            "ENABLE_CPU_PINNING": _format_ov_bool(_as_bool(cfg.get("enable_cpu_pinning"), True)),
-            "NUM_STREAMS": str(_as_int(cfg.get("num_streams"), -1)),
-            "ENABLE_HYPER_THREADING": _format_ov_bool(
-                _as_bool(cfg.get("enable_hyper_threading"), True)
-            ),
-            "SCHEDULING_CORE_TYPE": str(cfg.get("scheduling_core_type", "ANY_CORE")),
+        plugin_cfg: Dict[str, str] = {
+            "DEVICE_NAME": str(cfg.get("device_name", "AUTO")),
             "CACHE_DIR": str(cfg.get("cache_dir", self.ov_cache_dir)),
         }
+        infer_threads = _as_int(cfg.get("inference_num_threads"), -1)
+        if infer_threads > 0:
+            plugin_cfg["INFERENCE_NUM_THREADS"] = str(infer_threads)
+        perf_hint = cfg.get("performance_hint")
+        if perf_hint not in (None, ""):
+            plugin_cfg["PERFORMANCE_HINT"] = str(perf_hint)
+        perf_req = _as_int(cfg.get("performance_num_requests"), -1)
+        if perf_req >= 0:
+            plugin_cfg["PERFORMANCE_NUM_REQUESTS"] = str(perf_req)
+        num_streams = _as_int(cfg.get("num_streams"), -1)
+        if num_streams >= 0:
+            plugin_cfg["NUM_STREAMS"] = str(num_streams)
+        if cfg.get("enable_cpu_pinning") is not None:
+            plugin_cfg["ENABLE_CPU_PINNING"] = _format_ov_bool(
+                _as_bool(cfg.get("enable_cpu_pinning"), True)
+            )
+        if cfg.get("enable_hyper_threading") is not None:
+            plugin_cfg["ENABLE_HYPER_THREADING"] = _format_ov_bool(
+                _as_bool(cfg.get("enable_hyper_threading"), True)
+            )
+        core_type = cfg.get("scheduling_core_type")
+        if core_type not in (None, ""):
+            plugin_cfg["SCHEDULING_CORE_TYPE"] = str(core_type)
+        return plugin_cfg
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
         required_files = {
@@ -843,11 +970,9 @@ class AIModels:
 
     def _build_rapidocr_runtime_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         params: Dict[str, Any] = {
+            "EngineConfig.openvino.device_name": str(cfg.get("device_name", "AUTO")),
             "EngineConfig.openvino.inference_num_threads": _as_int(
                 cfg.get("inference_num_threads"), -1
-            ),
-            "EngineConfig.openvino.performance_hint": str(
-                cfg.get("performance_hint", "LATENCY")
             ),
             "EngineConfig.openvino.performance_num_requests": _as_int(
                 cfg.get("performance_num_requests"), -1
@@ -862,7 +987,17 @@ class AIModels:
             "EngineConfig.openvino.scheduling_core_type": str(
                 cfg.get("scheduling_core_type", "ANY_CORE")
             ),
+            "EngineConfig.openvino.cache_dir": str(cfg.get("cache_dir", self.ov_cache_dir)),
+            "Global.use_cls": _as_bool(cfg.get("use_cls"), True),
+            "Global.max_side_len": _as_int(cfg.get("max_side_len"), 960),
+            "Det.limit_side_len": _as_int(cfg.get("det_limit_side_len"), 960),
+            "Rec.rec_batch_num": max(1, _as_int(cfg.get("rec_batch_num"), 6)),
+            "Cls.cls_batch_num": max(1, _as_int(cfg.get("cls_batch_num"), 6)),
         }
+        if cfg.get("performance_hint") not in (None, ""):
+            params["EngineConfig.openvino.performance_hint"] = str(
+                cfg.get("performance_hint", "LATENCY")
+            )
 
         if self.rapidocr_font_path:
             params["Global.font_path"] = self.rapidocr_font_path
@@ -897,10 +1032,11 @@ class AIModels:
     def _instantiate_rapidocr(self, ov_cfg: Dict[str, str], params: Dict[str, Any]) -> RapidOCR:
         model_dir_value = self.rapidocr_model_dir if self.rapidocr_model_dir else None
         font_path_value = self.rapidocr_font_path if self.rapidocr_font_path else None
+        rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "AUTO")).upper()
 
         common_values: Dict[str, Any] = {
-            "device": "CPU",
-            "device_name": "CPU",
+            "device": rapidocr_device,
+            "device_name": rapidocr_device,
             "ov_config": ov_cfg,
             "openvino_config": ov_cfg,
             "inference_engine": "openvino",
@@ -964,7 +1100,7 @@ class AIModels:
                     last_error = exc
 
         raise RuntimeError(
-            "RapidOCR 初始化失败，无法以 OpenVINO CPU 配置启动。"
+            f"RapidOCR 初始化失败，无法以 OpenVINO({rapidocr_device}) 配置启动。"
         ) from last_error
 
     def _load_rapidocr_locked(self) -> None:
@@ -972,7 +1108,13 @@ class AIModels:
         ov_cfg = self._to_openvino_plugin_config(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(ov_cfg, rapidocr_params)
-        LOG.warning("RapidOCR loaded with OpenVINO CPU backend.")
+        LOG.warning(
+            "RapidOCR loaded with OpenVINO backend (device=%s, use_cls=%s, max_side_len=%s, rec_batch_num=%s).",
+            config.get("device_name"),
+            config.get("use_cls"),
+            config.get("max_side_len"),
+            config.get("rec_batch_num"),
+        )
 
     def _build_openvino_preprocess_runner(
         self,
@@ -1022,22 +1164,21 @@ class AIModels:
     def _enable_insightface_opencl_alignment() -> None:
         cv2.ocl.setUseOpenCL(True)
         if not cv2.ocl.haveOpenCL() or not cv2.ocl.useOpenCL():
-            LOG.warning(
-                "OpenCV OpenCL unavailable; InsightFace alignment will fallback to CPU warpAffine."
+            raise RuntimeError(
+                "InsightFace alignment requires OpenCV OpenCL, but OpenCL is unavailable. "
+                "No silent fallback is allowed."
             )
-            return
 
         device = cv2.ocl.Device_getDefault()
         vendor = str(device.vendorName())
         name = str(device.name())
         if "INTEL" not in vendor.upper():
-            LOG.warning(
-                "OpenCV OpenCL enabled, but default device is '%s' (%s). "
-                "Set OPENCV_OPENCL_DEVICE to Intel GPU for best alignment latency.",
-                name,
-                vendor,
+            raise RuntimeError(
+                "InsightFace alignment requires Intel OpenCL device. "
+                f"Current OpenCL device: {name} ({vendor}). "
+                "Set OPENCV_OPENCL_DEVICE to Intel GPU and retry. "
+                "No silent fallback is allowed."
             )
-            return
 
         LOG.warning(
             "OpenCV OpenCL enabled for InsightFace alignment on Intel device: %s (%s).",
@@ -1061,21 +1202,27 @@ class AIModels:
             matrix = face_align.estimate_norm(landmark, image_size, mode)
             source = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace alignment")
 
-            if cv2.ocl.useOpenCL():
-                try:
-                    warped_umat = cv2.warpAffine(
-                        cv2.UMat(source),
-                        matrix,
-                        (int(image_size), int(image_size)),
-                        borderValue=0.0,
-                    )
-                    if isinstance(warped_umat, cv2.UMat):
-                        return warped_umat.get()
-                    return np.asarray(warped_umat)
-                except Exception as exc:
-                    LOG.debug("OpenCL warpAffine failed, fallback to CPU: %s", exc)
+            if not cv2.ocl.useOpenCL():
+                raise RuntimeError(
+                    "OpenCV OpenCL was disabled during InsightFace alignment. "
+                    "No silent fallback is allowed."
+                )
+            try:
+                warped_umat = cv2.warpAffine(
+                    cv2.UMat(source),
+                    matrix,
+                    (int(image_size), int(image_size)),
+                    borderValue=0.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "OpenCV OpenCL warpAffine failed in InsightFace alignment. "
+                    "No silent fallback is allowed."
+                ) from exc
 
-            return cv2.warpAffine(source, matrix, (int(image_size), int(image_size)), borderValue=0.0)
+            if isinstance(warped_umat, cv2.UMat):
+                return warped_umat.get()
+            return np.asarray(warped_umat)
 
         face_align.norm_crop = _norm_crop_opencl
         face_align._mt_opencl_norm_crop_patch = True
@@ -1218,11 +1365,26 @@ class AIModels:
         self._patch_insightface_norm_crop_opencl()
         LOG.warning("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
 
+    @staticmethod
+    def _validate_insightface_openvino_provider(face_app: FaceAnalysis) -> None:
+        models_map = getattr(face_app, "models", {})
+        for task_name, model in models_map.items():
+            session = getattr(model, "session", None)
+            if session is None or not hasattr(session, "get_providers"):
+                continue
+            providers = [str(item) for item in session.get_providers()]
+            if not providers or providers[0] != "OpenVINOExecutionProvider":
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}, providers={providers}. "
+                    "OpenVINOExecutionProvider must be the active primary provider. "
+                    "No silent fallback is allowed."
+                )
+
     def _load_face_locked(self) -> None:
         provider_device = os.environ.get("INSIGHTFACE_OV_DEVICE", "CPU_FP32")
         providers: List[Any] = [
             ("OpenVINOExecutionProvider", {"device_type": provider_device}),
-            "CPUExecutionProvider",
         ]
         try:
             face_app = FaceAnalysis(
@@ -1232,24 +1394,15 @@ class AIModels:
                 allowed_modules=["detection", "recognition"],
             )
             face_app.prepare(ctx_id=0, det_size=(640, 640))
+            self._validate_insightface_openvino_provider(face_app)
             self._attach_insightface_preprocess(face_app)
             self._face_engine = face_app
             LOG.warning("InsightFace loaded with providers=%s", providers)
-        except Exception as primary_exc:
-            LOG.warning(
-                "InsightFace primary load failed, fallback to CPU EP. reason=%s",
-                primary_exc,
-            )
-            fallback = FaceAnalysis(
-                name=MODEL_NAME,
-                root=str(self.insightface_root),
-                providers=["CPUExecutionProvider"],
-                allowed_modules=["detection", "recognition"],
-            )
-            fallback.prepare(ctx_id=0, det_size=(640, 640))
-            self._attach_insightface_preprocess(fallback)
-            self._face_engine = fallback
-            LOG.warning("InsightFace fallback providers=['CPUExecutionProvider']")
+        except Exception as exc:
+            raise RuntimeError(
+                "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL alignment. "
+                "No silent fallback is allowed."
+            ) from exc
 
     def _infer_clip_text_batch(self, texts: List[str]) -> List[List[float]]:
         if not self._clip_text_model or not self._clip_text_request:

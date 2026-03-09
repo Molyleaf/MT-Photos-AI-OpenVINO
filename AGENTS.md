@@ -67,14 +67,15 @@
 
 ### 3.3 RapidOCR
 
-- 依赖固定：`rapidocr==3.6.0`。
+- 依赖固定：`rapidocr==3.7.0`。
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
-- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO CPU** 后端（不使用 GPU）。
+- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端，设备默认 `AUTO`（可显式 `GPU`）。
+- 当 RapidOCR 设备为 `AUTO` 或显式包含 `GPU` 时，若 OpenVINO 无 GPU 设备必须直接报错，禁止 silent fallback 到纯 CPU。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
-- 默认关闭方向分类器（`Global.use_cls=false`）；如需开启，必须明确下载并配置分类模型。
-- 即使 `Global.use_cls=false`，也应预置 `ch_ppocr_mobile_v2.0_cls_infer.onnx`，避免 RapidOCR 初始化阶段触发在线下载。
-- OpenVINO CPU 参数基线（面向 i7-11800H 低延迟）：`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=1`、`enable_cpu_pinning=true`。
+- 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
+- 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Rec.rec_batch_num=6`（可按场景增至 8）。
+- OpenVINO 参数基线：`device_name=AUTO`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
@@ -84,8 +85,8 @@
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
-- 保留 CPU 回退路径，但默认 EP 优先顺序应以 OpenVINO EP 在前。
-- 对齐阶段必须使用 OpenCV，并优先启用 Intel OpenCL 驱动（`warpAffine` OpenCL 路径）；不可用时才允许回退 CPU。
+- 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
+- 对齐阶段必须使用 OpenCV + Intel OpenCL（`warpAffine` OpenCL 路径）；OpenCL 不可用或设备非 Intel 时必须直接报错，禁止静默回退 CPU。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 
 ---
@@ -236,7 +237,7 @@
   - `AGENTS.md`
   - `README.md`
   - `requirements.txt`
-- 若引入 RapidOCR OpenVINO CPU 参数文件，需提供示例 `cfg_openvino_cpu.yaml` 并说明关键参数。
+- 若引入/调整 RapidOCR OpenVINO 参数文件，需提供示例 `cfg_openvino_cpu.yaml` 并说明关键参数（含设备与批量策略）。
 
 ---
 
@@ -257,7 +258,7 @@
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
-- [ ] RapidOCR 是否为 `rapidocr==3.6.0` + OpenVINO CPU + PP-OCRv5 mobile（Det/Rec）
+- [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO(AUTO/GPU) + PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
 - [ ] 是否遵守“待机常驻 Text-CLIP + 单模型族互斥加载 + 文本请求优先”策略
 - [ ] 是否采用多进程 Worker + 有界队列 + Worker 内批处理，并规避线程过度订阅
