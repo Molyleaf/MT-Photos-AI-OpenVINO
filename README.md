@@ -122,6 +122,22 @@ apt-get update && apt-get install -y --no-install-recommends \
 - `intel-opencl-icd` 与 `libze-intel-gpu1` 属于 sid 侧 Intel compute runtime，不在当前镜像里默认启用；直接混装 sid 包会连带升级核心系统库，需单独评估。
 - 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
 
+若必须在容器内启用 Intel GPU runtime（用于 OpenVINO GPU/Remote Context），可在构建时显式开启：
+
+```bash
+docker build \
+  --build-arg APP_UID=$(id -u) \
+  --build-arg APP_GID=$(id -g) \
+  --build-arg PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
+  --build-arg ENABLE_INTEL_GPU_RUNTIME=1 \
+  -t mt-photos-ai-openvino:gpu .
+```
+
+说明：
+
+- `ENABLE_INTEL_GPU_RUNTIME=1` 会临时启用 sid 源，仅安装 `intel-opencl-icd` 与 `libze-intel-gpu1`，构建后会清理 sid 源与 pin 文件。
+- 启用后建议先验证 `ov.Core().available_devices` 包含 `GPU`，再以 `INFERENCE_DEVICE/CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE=AUTO` 启动服务。
+
 ### 方式一：docker compose
 
 1. 准备配置文件，并确认 `docker-compose.yml` 里的 `image:` 已指向你实际要使用的镜像标签：
@@ -158,6 +174,8 @@ docker build \
   --build-arg APP_UID=$(id -u) \
   --build-arg APP_GID=$(id -g) \
   --build-arg PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
+  # 可选：在镜像内补齐 Intel GPU runtime（sid 包）
+  # --build-arg ENABLE_INTEL_GPU_RUNTIME=1 \
   -t mt-photos-ai-openvino .
 docker run -d \
   --name mt-photos-ai-openvino \
