@@ -1,5 +1,4 @@
 numpy==2.3.5
-opencv-python-headless
 insightface
 fastapi
 pydantic
