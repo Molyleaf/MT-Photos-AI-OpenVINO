@@ -3,6 +3,7 @@ insightface
 fastapi
 pydantic
 openvino
+# RapidOCR 3.7.0 runs with the upstream package plus OpenVINO runtime selection.
 rapidocr==3.7.0
 onnxruntime-openvino
 uvicorn

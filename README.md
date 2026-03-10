@@ -16,21 +16,20 @@
 | 环境变量                                | 说明                                                        | 默认值                                |
 |-------------------------------------|-----------------------------------------------------------|------------------------------------|
 | `API_AUTH_KEY`                      | API Key；`no-key` 或空字符串表示关闭鉴权                              | `mt_photos_ai_extra`               |
-| `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO` / `AUTO:GPU,CPU`  | `AUTO`                             |
-| `CLIP_INFERENCE_DEVICE`             | 仅覆盖 QA-CLIP 设备；请求 `AUTO/GPU` 时需保证 GPU 可用                  | 跟随 `INFERENCE_DEVICE`              |
+| `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO` / `MULTI:GPU,CPU` | `AUTO`                             |
+| `CLIP_INFERENCE_DEVICE`             | 仅覆盖 QA-CLIP 设备；请求 `AUTO/GPU` 时需保证 GPU 可用，且会强制初始化 GPU Remote Context | 跟随 `INFERENCE_DEVICE`              |
 | `MODEL_PATH`                        | 模型根目录路径                                                   | `<repo>/models`                    |
 | `WEB_CONCURRENCY`                   | Uvicorn worker 数                                          | `2`                                |
 | `INFERENCE_QUEUE_MAX_SIZE`          | 推理队列长度                                                    | `64`                               |
 | `TEXT_CLIP_BATCH_SIZE`              | 文本 CLIP 批大小                                               | `8`                                |
 | `INFERENCE_TASK_TIMEOUT`            | 单任务超时时间（秒）                                                | `120`                              |
-| `SERVER_IDLE_TIMEOUT`               | 空闲释放时间（秒）；`<=0` 表示禁用                                      | `300`                              |
 | `TEXT_MODEL_RESTORE_DELAY_MS`       | 非文本任务结束后的 Text-CLIP 恢复延迟（毫秒）                              | `2000`                             |
 | `RESTART_TEXT_RESTORE_DELAY_MS`     | 兼容旧变量；仅在未设置 `TEXT_MODEL_RESTORE_DELAY_MS` 时生效             | `2000`                             |
 | `OV_CACHE_DIR`                      | OpenVINO 编译缓存目录                                           | `<repo>/cache/openvino`            |
-| `RAPIDOCR_OPENVINO_CONFIG_PATH`     | RapidOCR YAML 配置文件路径                                      | `app/config/cfg_openvino_cpu.yaml` |
+| `RAPIDOCR_OPENVINO_CONFIG_PATH`     | RapidOCR YAML 配置文件路径；服务会将该文件直接作为 `config_path` 传给 `RapidOCR` | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR`                | RapidOCR 模型目录                                             | `<repo>/models/rapidocr`           |
 | `RAPIDOCR_FONT_PATH`                | RapidOCR 字体文件路径；空表示不指定                                    | 空                                  |
-| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串；请求 `AUTO/GPU` 时需保证 GPU 可用         | `AUTO`                             |
+| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串；运行时会归一化为 `MULTI:*`，默认解析为 `MULTI:GPU,CPU` | `MULTI:GPU,CPU`                    |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `LATENCY`                          |
 | `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数；`-1` 表示自动                                    | `-1`                               |
@@ -43,7 +42,7 @@
 | `RAPIDOCR_DET_LIMIT_SIDE_LEN`       | 检测模型输入边长限制                                                | `960`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `6`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `6`                                |
-| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`，如 `CPU_FP32` / `GPU_FP16`   | `CPU_FP32`                         |
+| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；运行时统一使用 `MULTI:*` 设备表达式       | `MULTI:GPU,CPU`                    |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口                                                      | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`  | `WARNING`                          |
@@ -52,6 +51,8 @@
 
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
+- RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
+- RapidOCR、InsightFace 以及 InsightFace 的 OpenVINO PPP 预处理会把 `AUTO/GPU/GPU_FP16` 等输入归一化为 `MULTI:*` 设备字符串；默认基线为 `MULTI:GPU,CPU`。
 
 ## Windows 本机部署
 
@@ -78,7 +79,10 @@ pip install -r requirements.txt
 
 ```powershell
 $env:API_AUTH_KEY="your_secret_key"
-$env:INFERENCE_DEVICE="GPU"
+$env:INFERENCE_DEVICE="AUTO"
+$env:CLIP_INFERENCE_DEVICE="AUTO"
+$env:RAPIDOCR_DEVICE="MULTI:GPU,CPU"
+$env:INSIGHTFACE_OV_DEVICE="MULTI:GPU,CPU"
 $env:WEB_CONCURRENCY="2"
 ```
 
@@ -137,7 +141,7 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`（若 GPU 不可用会按规则硬失败）
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=MULTI:GPU,CPU`、`INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU`（若 GPU 不可用会按规则硬失败）
 - 如需挂载自定义模型、RapidOCR 配置或缓存目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 
 4. 启动服务：
@@ -171,7 +175,8 @@ docker run -d \
   -e API_AUTH_KEY=mt_photos_ai_extra \
   -e INFERENCE_DEVICE=AUTO \
   -e CLIP_INFERENCE_DEVICE=AUTO \
-  -e RAPIDOCR_DEVICE=AUTO \
+  -e RAPIDOCR_DEVICE=MULTI:GPU,CPU \
+  -e INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU \
   -e WEB_CONCURRENCY=2 \
   -e OV_CACHE_DIR=/models/cache/openvino \
   mt-photos-ai-openvino

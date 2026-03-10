@@ -3,13 +3,12 @@ import asyncio
 import logging
 import os
 import sys
-import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
@@ -73,28 +72,9 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
             detail="Invalid API key",
         )
 
-SERVER_IDLE_TIMEOUT = int(os.environ.get("SERVER_IDLE_TIMEOUT", "300"))
 TEXT_MODEL_RESTORE_DELAY_MS = ai_models.TEXT_MODEL_RESTORE_DELAY_MS
-idle_timer: Optional[threading.Timer] = None
 models_instance: Optional[ai_models.AIModels] = None
 MAX_IMAGE_SIDE = 10000
-
-def idle_timeout_handler():
-    global models_instance
-    if models_instance:
-        logging.warning(f"服务器已空闲 {SERVER_IDLE_TIMEOUT} 秒。正在释放 (按需) 模型以节省内存...")
-        if hasattr(models_instance, 'release_models') and callable(models_instance.release_models):
-            models_instance.release_models()
-        else:
-            logging.error("AIModels 实例没有 release_models 方法 (idle_timeout_handler)。")
-
-def reset_idle_timer():
-    global idle_timer
-    if idle_timer:
-        idle_timer.cancel()
-    if SERVER_IDLE_TIMEOUT > 0:
-        idle_timer = threading.Timer(SERVER_IDLE_TIMEOUT, idle_timeout_handler)
-        idle_timer.start()
 
 
 def _device_requests_gpu(device_name: str) -> bool:
@@ -109,7 +89,7 @@ def _startup_self_check_dri() -> None:
     inference_device = os.environ.get("INFERENCE_DEVICE", "AUTO")
     clip_device = os.environ.get("CLIP_INFERENCE_DEVICE", inference_device)
     if not (_device_requests_gpu(inference_device) or _device_requests_gpu(clip_device)):
-        logging.warning("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
+        logging.info("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
         return
 
     dri_dir = "/dev/dri"
@@ -140,7 +120,7 @@ def _startup_self_check_dri() -> None:
             f" 无权限节点: {', '.join(denied_nodes)}"
         )
 
-    logging.warning(
+    logging.info(
         "启动自检通过：GPU 设备节点可访问。INFERENCE_DEVICE=%s CLIP_INFERENCE_DEVICE=%s",
         inference_device,
         clip_device,
@@ -182,41 +162,28 @@ def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Opti
 async def lifespan(app: FastAPI):
     global models_instance
     _startup_self_check_dri()
-    logging.warning("应用启动... 初始化 AIModels 实例。")
+    logging.info("应用启动：初始化 AIModels 实例并预热加载 Text CLIP 模型。")
     models_instance = ai_models.AIModels()
     try:
-        logging.warning("应用启动... 正在预热加载 Text CLIP 模型。")
         await models_instance.ensure_clip_text_model_loaded_async()
     except Exception as e:
         logging.critical(f"应用启动时基础模型加载失败: {e}", exc_info=True)
 
-    reset_idle_timer()
     yield
-    global idle_timer
-    if idle_timer:
-        idle_timer.cancel()
-    logging.warning("应用关闭。正在释放所有模型...")
+    logging.info("应用关闭：正在释放所有模型。")
     if models_instance:
         if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
             models_instance.release_all_models()
         else:
-            logging.warning("AIModels 实例没有 release_all_models 方法 (lifespan)。")
+            logging.info("AIModels 实例没有 release_all_models 方法 (lifespan)。")
 
 
 app = FastAPI(
     title="MT-Photos AI 统一服务",
-    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务 (支持自动内存释放)。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
+    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
     version="2.2.0",
     lifespan=lifespan
 )
-
-
-@app.middleware("http")
-async def reset_timer_middleware(request: Request, call_next):
-    if request.url.path not in ["/check", "/", "/clip/txt"]:
-        reset_idle_timer()
-    response = await call_next(request)
-    return response
 
 async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """
@@ -231,23 +198,23 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
         if is_gif:
             img, gif_err = await asyncio.to_thread(_decode_first_gif_frame, contents)
             if img is None and gif_err:
-                logging.warning("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
+                logging.info("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
 
         if img is None:
             nparr = np.frombuffer(contents, np.uint8)
             img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
 
         if img is None:
-            logging.warning(f"文件 '{file.filename}' 无法被解码为图像。")
+            logging.info(f"文件 '{file.filename}' 无法被解码为图像。")
             return None, f"文件 '{file.filename}' 无法被解码为图像。"
 
         if img.dtype == np.uint16:
-            logging.warning(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
+            logging.info(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
             img = (img / 256).astype(np.uint8)
 
         height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
         if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
-            logging.warning(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
+            logging.info(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
             return None, "height or width out of range"
 
         if channels == 1:
@@ -295,7 +262,7 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
-    logging.warning(
+    logging.info(
         "收到 /restart 请求，正在释放模型。Text-CLIP 将在无其它任务 %sms 后恢复。",
         TEXT_MODEL_RESTORE_DELAY_MS,
     )
@@ -313,7 +280,7 @@ async def restart_service():
 
 @app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_process():
-    logging.warning("收到 /restart_v2 请求，将重启整个服务进程！")
+    logging.info("收到 /restart_v2 请求，将重启整个服务进程。")
     def delayed_restart():
         import time
         time.sleep(1)

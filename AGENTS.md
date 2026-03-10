@@ -71,12 +71,13 @@
 - 依赖固定：`rapidocr==3.7.0`。
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
-- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端，设备默认 `AUTO`（可显式 `GPU`）。
-- 当 RapidOCR 设备为 `AUTO` 或显式包含 `GPU` 时，若 OpenVINO 无 GPU 设备必须直接报错，禁止 silent fallback 到纯 CPU。
+- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；必须把 `app/config/cfg_openvino_cpu.yaml` 作为 `RapidOCR(config_path=...)` 传入，禁止继续依赖库内默认 YAML。
+- RapidOCR OpenVINO 设备基线使用 `MULTI` 表达式；默认 `device_name=MULTI:GPU,CPU`。若配置来源为 `AUTO` / `GPU` / `GPU_FP16` 等语义，运行时也必须先归一化为 `MULTI:*` 再传给 OpenVINO。
+- 当 RapidOCR 设备显式包含 `GPU`（如 `MULTI:GPU,CPU`、`MULTI:GPU.0,CPU`）时，若 OpenVINO 无 GPU 设备必须直接报错，禁止 silent fallback 到纯 CPU。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
 - 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Rec.rec_batch_num=6`（可按场景增至 8）。
-- OpenVINO 参数基线：`device_name=AUTO`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
+- OpenVINO 参数基线：`device_name=MULTI:GPU,CPU`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
@@ -88,6 +89,7 @@
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
+- InsightFace OpenVINO EP 的 `device_type` 基线必须使用 `MULTI` 表达式（默认 `MULTI:GPU,CPU`）；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - 必须兼容 `insightface` 旧版 `FaceAnalysis.__init__` 不支持 `providers/allowed_modules` 的情况；此时必须在会话级显式设置 `OpenVINOExecutionProvider` 并校验 provider 顺序。
 - 对 `insightface` 旧版模型路由不兼容时，允许运行时构造仅含检测+识别必需 ONNX 的模型目录用于初始化，但不得改变 `/represent` 接口语义与返回字段。
@@ -110,10 +112,7 @@
 - 生命周期：
   - 启动时初始化 `AIModels` 并预热加载 Text-CLIP
   - 关闭时释放全部模型
-- 空闲计时：
-  - 默认 `SERVER_IDLE_TIMEOUT=300`
-  - 中间件会在非 `"/check"`, `"/"`, `"/clip/txt"` 请求上重置空闲计时器
-  - 空闲超时触发按需模型释放
+- 当前实现不再基于空闲计时自动释放模型；模型释放仅由 `/restart`、`/restart_v2` 或进程关闭触发。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
@@ -264,7 +263,7 @@
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
-- [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO(AUTO/GPU) + PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
+- [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO(MULTI) + PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
 - [ ] 是否遵守“待机常驻 Text-CLIP + 单模型族互斥加载 + 文本请求优先”策略
 - [ ] 是否采用多进程 Worker + 有界队列 + Worker 内批处理，并规避线程过度订阅
@@ -311,7 +310,9 @@
 
 - 修复 `/clip/img` 在 OpenVINO 动态输入模型上的 PPP 构建失败：视觉预处理 `resize` 显式固定为 `224x224`，保持输出维度 `768` 与接口语义不变。
 - 收敛上传读图链：`read_image_from_upload` 改为 OpenCV 原生解码，GIF 首帧优先走 `cv2.imdecodeanimation`，并移除 `ffmpeg/ffprobe` 与 `PIL` 运行时依赖。
-- 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=CPU/GPU/AUTO`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
+- 修复 RapidOCR 后端锁定问题：服务会直接把 `RAPIDOCR_OPENVINO_CONFIG_PATH` 作为 `config_path` 传给 `RapidOCR`，并在初始化后校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
+- 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=MULTI:GPU,CPU`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
+- 收敛 OpenVINO cache 配置：缓存目录只做全局 Core 级设置，不再对每次 `compile_model` 重复传 `CACHE_DIR`，减少运行时重复噪声日志。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
@@ -333,8 +334,8 @@ services:
       - API_AUTH_KEY=mt_photos_ai_extra
       - INFERENCE_DEVICE=AUTO
       - CLIP_INFERENCE_DEVICE=AUTO
-      - RAPIDOCR_DEVICE=AUTO
-      - INSIGHTFACE_OV_DEVICE=GPU_FP16
+      - RAPIDOCR_DEVICE=MULTI:GPU,CPU
+      - INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU
       - OPENCV_OPENCL_DEVICE=Intel:GPU:0
       - OV_CACHE_DIR=/models/cache/openvino
       - WEB_CONCURRENCY=2
@@ -344,7 +345,7 @@ services:
 ```
 
 说明：
-- `INFERENCE_DEVICE/CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE` 推荐使用 `AUTO`；但验收时仍要求 GPU 实际可用。
+- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径（RapidOCR / InsightFace / PPP）推荐使用 `MULTI:GPU,CPU`，且验收时仍要求 GPU 实际可用。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
 
 #### B. 启动与设备可见性判定

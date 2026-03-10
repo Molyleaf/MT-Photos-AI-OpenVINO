@@ -21,6 +21,7 @@ import openvino as ov
 import yaml
 from insightface.app import FaceAnalysis
 from rapidocr import RapidOCR
+from rapidocr.utils.typings import EngineType
 
 _APP_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _APP_DIR.parent
@@ -60,6 +61,7 @@ RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
 RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
 LOG = logging.getLogger(__name__)
+_DEFAULT_NON_TEXT_OV_DEVICE = "MULTI:GPU,CPU"
 
 _CONFIGURED_MODEL_NAME = os.environ.get("MODEL_NAME")
 if _CONFIGURED_MODEL_NAME and _CONFIGURED_MODEL_NAME != MODEL_NAME:
@@ -110,13 +112,11 @@ def _patch_rapidocr_openvino_device_selection() -> None:
         original_init(self, cfg)
 
         engine_cfg = cfg.get("engine_cfg", {}) or {}
-        selected_device = str(
-            engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", "AUTO"))
-        ).strip().upper()
-        if not selected_device:
-            selected_device = "AUTO"
+        selected_device = _normalize_non_text_openvino_device(
+            str(engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)))
+        )
 
-        requires_gpu = selected_device == "AUTO" or ("GPU" in selected_device)
+        requires_gpu = "GPU" in selected_device
         core = Core()
         available_devices = [str(item).upper() for item in core.available_devices]
         if requires_gpu and not _has_openvino_gpu_device(available_devices):
@@ -125,7 +125,11 @@ def _patch_rapidocr_openvino_device_selection() -> None:
                 f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
             )
 
-        if selected_device == "CPU":
+        cache_dir = engine_cfg.get("cache_dir")
+        if cache_dir not in (None, ""):
+            core.set_property({"CACHE_DIR": str(cache_dir)})
+
+        if selected_device in {"CPU", "MULTI:CPU"}:
             self._mt_device_name = selected_device
             return
 
@@ -134,7 +138,6 @@ def _patch_rapidocr_openvino_device_selection() -> None:
             ("performance_hint", "PERFORMANCE_HINT"),
             ("performance_num_requests", "PERFORMANCE_HINT_NUM_REQUESTS"),
             ("num_streams", "NUM_STREAMS"),
-            ("cache_dir", "CACHE_DIR"),
         ):
             value = engine_cfg.get(key)
             if value in (None, "", -1):
@@ -225,6 +228,69 @@ def _has_openvino_gpu_device(devices: Any) -> bool:
     return bool(_get_openvino_gpu_devices(devices))
 
 
+def _dedupe_preserve_order(tokens: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        deduped.append(token)
+        seen.add(token)
+    return deduped
+
+
+def _split_openvino_device_expr(device_expr: str) -> List[str]:
+    normalized = str(device_expr or "").strip().upper()
+    if not normalized:
+        return []
+
+    prefix, separator, suffix = normalized.partition(":")
+    if prefix in {"AUTO", "MULTI", "HETERO", "BATCH"} and separator:
+        raw_tokens = suffix.split(",")
+    else:
+        raw_tokens = normalized.replace(";", ",").split(",")
+
+    return _dedupe_preserve_order([token.strip() for token in raw_tokens if token.strip()])
+
+
+def _normalize_non_text_openvino_device(device_expr: str) -> str:
+    tokens = _split_openvino_device_expr(device_expr)
+    normalized_tokens: List[str] = []
+
+    for token in tokens:
+        if token == "AUTO":
+            normalized_tokens.extend(["GPU", "CPU"])
+            continue
+        if token in {"GPU_FP16", "GPU_FP32"}:
+            normalized_tokens.append("GPU")
+            continue
+        if token in {"CPU_FP16", "CPU_FP32"}:
+            normalized_tokens.append("CPU")
+            continue
+        if token.startswith("GPU."):
+            normalized_tokens.append(token)
+            continue
+        if token.startswith("GPU"):
+            normalized_tokens.append("GPU")
+            continue
+        if token.startswith("CPU"):
+            normalized_tokens.append("CPU")
+            continue
+        if token.startswith("NPU"):
+            normalized_tokens.append("NPU")
+            continue
+        normalized_tokens.append(token)
+
+    normalized_tokens = _dedupe_preserve_order(normalized_tokens)
+    if not normalized_tokens:
+        normalized_tokens = ["GPU", "CPU"]
+
+    if any(token.startswith(("GPU", "NPU")) for token in normalized_tokens) and "CPU" not in normalized_tokens:
+        normalized_tokens.append("CPU")
+
+    return f"MULTI:{','.join(normalized_tokens)}"
+
+
 TEXT_MODEL_RESTORE_DELAY_MS = max(
     0,
     _as_int(
@@ -235,11 +301,6 @@ TEXT_MODEL_RESTORE_DELAY_MS = max(
         2000,
     ),
 )
-
-
-def _format_ov_bool(value: bool) -> str:
-    return "YES" if value else "NO"
-
 
 def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -> np.ndarray:
     if context_length < 2:
@@ -343,6 +404,7 @@ class AIModels:
         self.core = ov.Core()
         self._configure_openvino_cache()
 
+        self._clip_remote_context_device_name: Optional[str] = None
         self._clip_remote_context = self._init_clip_remote_context()
 
         self._model_lock = threading.Lock()
@@ -385,9 +447,11 @@ class AIModels:
         )
         self._worker.start()
 
-        LOG.warning(
-            "AIModels ready: clip_device=%s queue=%s text_batch=%s text_restore_delay_ms=%s",
+        LOG.info(
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s text_batch=%s text_restore_delay_ms=%s",
             CLIP_INFERENCE_DEVICE,
+            self._clip_remote_context_device_name or "disabled",
+            self.ov_cache_dir,
             self._queue_capacity,
             self._text_batch_size,
             TEXT_MODEL_RESTORE_DELAY_MS,
@@ -396,7 +460,6 @@ class AIModels:
     def _configure_openvino_cache(self) -> None:
         try:
             self.core.set_property({"CACHE_DIR": str(self.ov_cache_dir)})
-            LOG.warning("OpenVINO cache enabled: %s", self.ov_cache_dir)
         except Exception as exc:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
@@ -416,7 +479,7 @@ class AIModels:
             "are not bundled in the runtime image by default)."
         )
         if not gpu_devices:
-            LOG.warning(
+            LOG.info(
                 "OpenVINO available_devices does not include GPU for CLIP request=%s "
                 "(available_devices=%s). Continue probing explicit GPU remote context APIs.",
                 CLIP_INFERENCE_DEVICE,
@@ -441,20 +504,7 @@ class AIModels:
                         f"resolved device {resolved_device} does not match requested "
                         f"{explicit_gpu_devices}"
                     )
-                if candidate == "GPU":
-                    LOG.warning(
-                        "OpenVINO GPU remote context enabled for CLIP (device=%s resolved=%s).",
-                        CLIP_INFERENCE_DEVICE,
-                        resolved_device,
-                    )
-                else:
-                    LOG.warning(
-                        "OpenVINO GPU remote context enabled for CLIP via candidate=%s "
-                        "(request=%s resolved=%s).",
-                        candidate,
-                        CLIP_INFERENCE_DEVICE,
-                        resolved_device,
-                    )
+                self._clip_remote_context_device_name = resolved_device
                 return remote_context
             except Exception as exc:
                 last_exc = exc
@@ -470,12 +520,7 @@ class AIModels:
                     f"create_context(GPU) resolved to {resolved_device}, "
                     f"expected one of {explicit_gpu_devices}"
                 )
-            LOG.warning(
-                "OpenVINO GPU remote context enabled for CLIP via create_context compatibility "
-                "fallback (device=%s resolved=%s).",
-                CLIP_INFERENCE_DEVICE,
-                resolved_device,
-            )
+            self._clip_remote_context_device_name = resolved_device
             return remote_context
         except Exception as exc:
             last_exc = exc
@@ -522,7 +567,7 @@ class AIModels:
                 and self._deferred_text_restore_deadline is not None
             ):
                 self._deferred_text_restore_deadline = None
-                LOG.warning(
+                LOG.debug(
                     "Deferred text restore was cancelled by incoming %s task.", kind
                 )
             if text_priority:
@@ -791,7 +836,6 @@ class AIModels:
     ) -> ov.CompiledModel:
         config = {
             "PERFORMANCE_HINT": performance_hint,
-            "CACHE_DIR": str(self.ov_cache_dir),
         }
 
         if self._clip_remote_context is not None:
@@ -940,7 +984,7 @@ class AIModels:
         )
         self._clip_text_host_input_cache.clear()
         self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
-        LOG.warning("CLIP Text model loaded on %s.", CLIP_INFERENCE_DEVICE)
+        LOG.info("CLIP Text model loaded on %s.", CLIP_INFERENCE_DEVICE)
 
     def _load_clip_vision_locked(self) -> None:
         vision_model_path = self.qa_clip_path / "openvino_image_fp16.xml"
@@ -963,14 +1007,24 @@ class AIModels:
         self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
         self._clip_vision_host_input_cache.clear()
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
-        LOG.warning(
+        LOG.info(
             "CLIP Vision model loaded on %s with OpenVINO PPP preprocessing.",
             CLIP_INFERENCE_DEVICE,
         )
 
+    def _require_rapidocr_config_path(self) -> Path:
+        if not self.rapidocr_config_path.is_file():
+            raise FileNotFoundError(
+                "RapidOCR OpenVINO config file is required and must exist. "
+                f"Configured path: {self.rapidocr_config_path}"
+            )
+        return self.rapidocr_config_path
+
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {
-            "device_name": str(os.environ.get("RAPIDOCR_DEVICE", "AUTO")).strip().upper() or "AUTO",
+            "device_name": _normalize_non_text_openvino_device(
+                os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)
+            ),
             "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
             "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "LATENCY"),
             "performance_num_requests": _as_int(
@@ -989,48 +1043,50 @@ class AIModels:
             "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 6)),
         }
 
-        if self.rapidocr_config_path.exists():
-            try:
-                loaded = yaml.safe_load(self.rapidocr_config_path.read_text(encoding="utf-8")) or {}
-                ov_cfg = loaded.get("EngineConfig", {}).get("openvino", {})
-                for key in list(config.keys()):
-                    if key in ov_cfg:
-                        config[key] = ov_cfg[key]
+        config_path = self._require_rapidocr_config_path()
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            ov_cfg = loaded.get("EngineConfig", {}).get("openvino", {})
+            for key in list(config.keys()):
+                if key in ov_cfg:
+                    config[key] = ov_cfg[key]
 
-                global_cfg = loaded.get("Global", {})
-                if "use_cls" in global_cfg:
-                    config["use_cls"] = _as_bool(global_cfg.get("use_cls"), config["use_cls"])
-                if "max_side_len" in global_cfg:
-                    config["max_side_len"] = _as_int(
-                        global_cfg.get("max_side_len"), config["max_side_len"]
-                    )
+            global_cfg = loaded.get("Global", {})
+            if "use_cls" in global_cfg:
+                config["use_cls"] = _as_bool(global_cfg.get("use_cls"), config["use_cls"])
+            if "max_side_len" in global_cfg:
+                config["max_side_len"] = _as_int(
+                    global_cfg.get("max_side_len"), config["max_side_len"]
+                )
 
-                det_cfg = loaded.get("Det", {})
-                if "limit_side_len" in det_cfg:
-                    config["det_limit_side_len"] = _as_int(
-                        det_cfg.get("limit_side_len"), config["det_limit_side_len"]
-                    )
+            det_cfg = loaded.get("Det", {})
+            if "limit_side_len" in det_cfg:
+                config["det_limit_side_len"] = _as_int(
+                    det_cfg.get("limit_side_len"), config["det_limit_side_len"]
+                )
 
-                rec_cfg = loaded.get("Rec", {})
-                if "rec_batch_num" in rec_cfg:
-                    config["rec_batch_num"] = max(
-                        1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
-                    )
+            rec_cfg = loaded.get("Rec", {})
+            if "rec_batch_num" in rec_cfg:
+                config["rec_batch_num"] = max(
+                    1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
+                )
 
-                cls_cfg = loaded.get("Cls", {})
-                if "cls_batch_num" in cls_cfg:
-                    config["cls_batch_num"] = max(
-                        1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
-                    )
-                LOG.warning("RapidOCR OpenVINO config loaded: %s", self.rapidocr_config_path)
-            except Exception as exc:
-                LOG.warning("Unable to parse RapidOCR config %s: %s", self.rapidocr_config_path, exc)
+            cls_cfg = loaded.get("Cls", {})
+            if "cls_batch_num" in cls_cfg:
+                config["cls_batch_num"] = max(
+                    1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
+                )
+        except Exception as exc:
+            LOG.warning("Unable to parse RapidOCR config %s: %s", config_path, exc)
+            raise
 
         # Explicit runtime env vars must override YAML to avoid stale cfg forcing unintended devices.
         env_override_map: Dict[str, Tuple[str, Any]] = {
             "RAPIDOCR_DEVICE": (
                 "device_name",
-                lambda value, default: str(value).strip().upper() or default,
+                lambda value, default: _normalize_non_text_openvino_device(
+                    str(value).strip() or default
+                ),
             ),
             "RAPIDOCR_INFERENCE_NUM_THREADS": (
                 "inference_num_threads",
@@ -1087,47 +1143,19 @@ class AIModels:
                 continue
             config[cfg_name] = parser(raw_env, config[cfg_name])
 
-        config["device_name"] = str(config.get("device_name", "AUTO")).strip().upper() or "AUTO"
+        config["device_name"] = _normalize_non_text_openvino_device(
+            config.get("device_name", _DEFAULT_NON_TEXT_OV_DEVICE)
+        )
         config["cache_dir"] = str(self.ov_cache_dir)
 
         available_devices = [str(item).upper() for item in self.core.available_devices]
-        requires_gpu = config["device_name"] == "AUTO" or ("GPU" in config["device_name"])
+        requires_gpu = "GPU" in str(config["device_name"]).upper()
         if requires_gpu and not _has_openvino_gpu_device(available_devices):
             raise RuntimeError(
                 f"RapidOCR OpenVINO device={config['device_name']} requires GPU, "
                 f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
             )
         return config
-
-    def _to_openvino_plugin_config(self, cfg: Dict[str, Any]) -> Dict[str, str]:
-        plugin_cfg: Dict[str, str] = {
-            "DEVICE_NAME": str(cfg.get("device_name", "AUTO")),
-            "CACHE_DIR": str(cfg.get("cache_dir", self.ov_cache_dir)),
-        }
-        infer_threads = _as_int(cfg.get("inference_num_threads"), -1)
-        if infer_threads > 0:
-            plugin_cfg["INFERENCE_NUM_THREADS"] = str(infer_threads)
-        perf_hint = cfg.get("performance_hint")
-        if perf_hint not in (None, ""):
-            plugin_cfg["PERFORMANCE_HINT"] = str(perf_hint)
-        perf_req = _as_int(cfg.get("performance_num_requests"), -1)
-        if perf_req >= 0:
-            plugin_cfg["PERFORMANCE_NUM_REQUESTS"] = str(perf_req)
-        num_streams = _as_int(cfg.get("num_streams"), -1)
-        if num_streams >= 0:
-            plugin_cfg["NUM_STREAMS"] = str(num_streams)
-        if cfg.get("enable_cpu_pinning") is not None:
-            plugin_cfg["ENABLE_CPU_PINNING"] = _format_ov_bool(
-                _as_bool(cfg.get("enable_cpu_pinning"), True)
-            )
-        if cfg.get("enable_hyper_threading") is not None:
-            plugin_cfg["ENABLE_HYPER_THREADING"] = _format_ov_bool(
-                _as_bool(cfg.get("enable_hyper_threading"), True)
-            )
-        core_type = cfg.get("scheduling_core_type")
-        if core_type not in (None, ""):
-            plugin_cfg["SCHEDULING_CORE_TYPE"] = str(core_type)
-        return plugin_cfg
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
         required_files = {
@@ -1155,6 +1183,9 @@ class AIModels:
 
     def _build_rapidocr_runtime_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         params: Dict[str, Any] = {
+            "Det.engine_type": EngineType.OPENVINO,
+            "Cls.engine_type": EngineType.OPENVINO,
+            "Rec.engine_type": EngineType.OPENVINO,
             "EngineConfig.openvino.device_name": str(cfg.get("device_name", "AUTO")),
             "EngineConfig.openvino.inference_num_threads": _as_int(
                 cfg.get("inference_num_threads"), -1
@@ -1197,104 +1228,44 @@ class AIModels:
         return params
 
     @staticmethod
-    def _constructor_filter_kwargs(kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
-        try:
-            signature = inspect.signature(RapidOCR)
-            parameters = signature.parameters
-            has_var_kwargs = any(
-                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    def _validate_rapidocr_backend(engine: RapidOCR) -> None:
+        cfg = getattr(engine, "cfg", None)
+        if cfg is None:
+            raise RuntimeError("RapidOCR initialized without runtime cfg metadata.")
+
+        backend_errors: List[str] = []
+        for section_name in ("Det", "Cls", "Rec"):
+            section_cfg = getattr(cfg, section_name, None)
+            engine_type = getattr(section_cfg, "engine_type", None)
+            engine_name = str(getattr(engine_type, "value", engine_type)).strip().lower()
+            if engine_name != EngineType.OPENVINO.value:
+                backend_errors.append(f"{section_name}.engine_type={engine_name or 'missing'}")
+
+        if backend_errors:
+            raise RuntimeError(
+                "RapidOCR backend validation failed after initialization: "
+                f"{', '.join(backend_errors)}. No silent fallback is allowed."
             )
-            if has_var_kwargs:
-                return [kwargs]
 
-            filtered = {k: v for k, v in kwargs.items() if k in parameters}
-            if filtered:
-                return [filtered]
-            return []
-        except (TypeError, ValueError):
-            return [kwargs]
-
-    def _instantiate_rapidocr(self, ov_cfg: Dict[str, str], params: Dict[str, Any]) -> RapidOCR:
-        model_dir_value = self.rapidocr_model_dir if self.rapidocr_model_dir else None
-        font_path_value = self.rapidocr_font_path if self.rapidocr_font_path else None
+    def _instantiate_rapidocr(self, params: Dict[str, Any]) -> RapidOCR:
         rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "AUTO")).upper()
-
-        common_values: Dict[str, Any] = {
-            "device": rapidocr_device,
-            "device_name": rapidocr_device,
-            "ov_config": ov_cfg,
-            "openvino_config": ov_cfg,
-            "inference_engine": "openvino",
-            "engine_type": "openvino",
-            "det_engine": "openvino",
-            "cls_engine": "openvino",
-            "rec_engine": "openvino",
-        }
-        if model_dir_value:
-            common_values.update(
-                {
-                    "model_dir": model_dir_value,
-                    "models_dir": model_dir_value,
-                    "model_path": model_dir_value,
-                }
-            )
-        if font_path_value:
-            common_values["vis_font_path"] = font_path_value
-
-        candidate_kwargs: List[Dict[str, Any]] = []
-        if params:
-            candidate_kwargs.append({"params": params})
-
-        candidate_kwargs.extend(
-            [
-                {
-                    "det_engine": common_values["det_engine"],
-                    "cls_engine": common_values["cls_engine"],
-                    "rec_engine": common_values["rec_engine"],
-                    "device_name": common_values["device_name"],
-                    "ov_config": common_values["ov_config"],
-                    "model_dir": model_dir_value,
-                    "vis_font_path": font_path_value,
-                    "params": params,
-                },
-                {
-                    "engine_type": common_values["engine_type"],
-                    "device": common_values["device"],
-                    "openvino_config": common_values["openvino_config"],
-                    "model_dir": model_dir_value,
-                    "vis_font_path": font_path_value,
-                    "params": params,
-                },
-                {
-                    "device_name": common_values["device_name"],
-                    "ov_config": common_values["ov_config"],
-                    "model_dir": model_dir_value,
-                    "vis_font_path": font_path_value,
-                    "params": params,
-                },
-            ]
-        )
-
-        last_error: Optional[Exception] = None
-        for kwargs in candidate_kwargs:
-            compact_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            for filtered_kwargs in self._constructor_filter_kwargs(compact_kwargs):
-                try:
-                    return RapidOCR(**filtered_kwargs)
-                except Exception as exc:
-                    last_error = exc
-
-        raise RuntimeError(
-            f"RapidOCR 初始化失败，无法以 OpenVINO({rapidocr_device}) 配置启动。"
-        ) from last_error
+        config_path = self._require_rapidocr_config_path()
+        try:
+            engine = RapidOCR(config_path=str(config_path), params=params)
+        except Exception as exc:
+            raise RuntimeError(
+                f"RapidOCR 初始化失败，无法以 OpenVINO({rapidocr_device}) 配置启动。"
+            ) from exc
+        self._validate_rapidocr_backend(engine)
+        return engine
 
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
-        ov_cfg = self._to_openvino_plugin_config(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
-        self._rapidocr_engine = self._instantiate_rapidocr(ov_cfg, rapidocr_params)
-        LOG.warning(
-            "RapidOCR loaded with OpenVINO backend (device=%s, use_cls=%s, max_side_len=%s, rec_batch_num=%s).",
+        self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
+        LOG.info(
+            "RapidOCR ready: config=%s device=%s use_cls=%s max_side_len=%s rec_batch_num=%s",
+            self.rapidocr_config_path,
             config.get("device_name"),
             config.get("use_cls"),
             config.get("max_side_len"),
@@ -1304,6 +1275,7 @@ class AIModels:
     def _build_openvino_preprocess_runner(
         self,
         runner_name: str,
+        device_name: str,
         output_height: int,
         output_width: int,
         mean_values: List[float],
@@ -1332,10 +1304,9 @@ class AIModels:
 
         compiled = self.core.compile_model(
             ppp.build(),
-            "CPU",
+            device_name,
             {
                 "PERFORMANCE_HINT": "LATENCY",
-                "CACHE_DIR": str(self.ov_cache_dir),
             },
         )
         return _OpenVinoPreprocessRunner(
@@ -1365,7 +1336,7 @@ class AIModels:
                 "No silent fallback is allowed."
             )
 
-        LOG.warning(
+        LOG.info(
             "OpenCV OpenCL enabled for InsightFace alignment on Intel device: %s (%s).",
             name,
             vendor,
@@ -1520,7 +1491,7 @@ class AIModels:
 
         rec_model.get_feat = types.MethodType(_get_feat_with_ppp, rec_model)
 
-    def _attach_insightface_preprocess(self, face_app: FaceAnalysis) -> None:
+    def _attach_insightface_preprocess(self, face_app: FaceAnalysis, device_name: str) -> None:
         det_model = getattr(face_app, "det_model", None)
         rec_model = getattr(face_app, "models", {}).get("recognition")
         if det_model is None or rec_model is None:
@@ -1531,6 +1502,7 @@ class AIModels:
 
         self._face_det_ppp = self._build_openvino_preprocess_runner(
             runner_name="insightface_det",
+            device_name=device_name,
             output_height=det_height,
             output_width=det_width,
             mean_values=_to_channel_triplet(getattr(det_model, "input_mean", 127.5)),
@@ -1538,6 +1510,7 @@ class AIModels:
         )
         self._face_rec_ppp = self._build_openvino_preprocess_runner(
             runner_name="insightface_rec",
+            device_name=device_name,
             output_height=rec_height,
             output_width=rec_width,
             mean_values=_to_channel_triplet(getattr(rec_model, "input_mean", 127.5)),
@@ -1548,7 +1521,7 @@ class AIModels:
         self._patch_face_recognition_get_feat(rec_model, self._face_rec_ppp)
         self._enable_insightface_opencl_alignment()
         self._patch_insightface_norm_crop_opencl()
-        LOG.warning("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
+        LOG.info("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
 
     def _resolve_insightface_root(self) -> Path:
         candidate_roots = (self.insightface_model_root, self.insightface_root)
@@ -1631,7 +1604,9 @@ class AIModels:
                 )
 
     def _load_face_locked(self) -> None:
-        provider_device = os.environ.get("INSIGHTFACE_OV_DEVICE", "CPU_FP32")
+        provider_device = _normalize_non_text_openvino_device(
+            os.environ.get("INSIGHTFACE_OV_DEVICE", INFERENCE_DEVICE)
+        )
         providers: List[Any] = [
             ("OpenVINOExecutionProvider", {"device_type": provider_device}),
         ]
@@ -1656,9 +1631,9 @@ class AIModels:
             face_app.prepare(ctx_id=0, det_size=(640, 640))
             self._enforce_insightface_openvino_provider(face_app, provider_device)
             self._validate_insightface_openvino_provider(face_app)
-            self._attach_insightface_preprocess(face_app)
+            self._attach_insightface_preprocess(face_app, device_name=provider_device)
             self._face_engine = face_app
-            LOG.warning(
+            LOG.info(
                 "InsightFace loaded with providers=%s (runtime_root=%s)",
                 providers,
                 root_for_runtime,
@@ -1860,7 +1835,7 @@ class AIModels:
 
         with self._model_lock:
             self._unload_everything_locked()
-        LOG.warning("All models released.")
+        LOG.info("All models released.")
 
     def get_text_embedding(self, text: str) -> List[float]:
         future = self._submit_task(kind="clip_txt", payload=text, text_priority=True)

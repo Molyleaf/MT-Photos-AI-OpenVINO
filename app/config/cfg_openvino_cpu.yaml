@@ -10,11 +10,11 @@ Global:
   return_word_box: false
   return_single_char_box: false
   font_path: null
-  log_level: "info"
+  log_level: "warning"
 
 EngineConfig:
   openvino:
-    device_name: "AUTO"
+    device_name: "MULTI:GPU,CPU"
     inference_num_threads: -1
     performance_hint: "LATENCY"
     performance_num_requests: -1
