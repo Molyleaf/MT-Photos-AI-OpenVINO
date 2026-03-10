@@ -3,7 +3,7 @@ FROM python:3.12-slim-trixie
 WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG APP_UID=1024
+ARG APP_UID=1000
 ARG APP_GID=1000
 ARG PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple
 
@@ -33,17 +33,10 @@ RUN set -eux; \
     intel_compute_runtime_deps="\
         intel-opencl-icd \
         libze-intel-gpu1"; \
-    intel_media_runtime_deps="\
-        mesa-vulkan-drivers \
-        intel-media-va-driver-non-free"; \
     python_runtime_deps="\
         ca-certificates \
-        libgl1 \
         libglib2.0-0 \
-        libgomp1 \
-        libsm6 \
-        libxext6 \
-        libxrender1"; \
+        libgomp1"; \
     printf '%s\n' \
         'deb https://mirrors.zju.edu.cn/debian sid main contrib non-free non-free-firmware' \
         > /etc/apt/sources.list.d/sid.list; \
@@ -58,11 +51,12 @@ RUN set -eux; \
         > /etc/apt/preferences.d/intel-gpu-runtime; \
     apt-get update; \
     apt-get install -y --no-install-recommends $ov_opencl_runtime_deps $python_runtime_deps; \
-    firmware_pkg="firmware-misc-nonfree"; \
-    if apt-cache show firmware-misc-non-free >/dev/null 2>&1; then firmware_pkg="firmware-misc-non-free"; fi; \
     apt-get install -y --no-install-recommends -t sid $intel_compute_runtime_deps; \
-    apt-get install -y --no-install-recommends $intel_media_runtime_deps "${firmware_pkg}"; \
     pip install --no-cache-dir --prefer-binary -r /tmp/requirements.txt; \
+    if pip show opencv-python >/dev/null 2>&1; then pip uninstall -y opencv-python; fi; \
+    if pip show opencv-contrib-python >/dev/null 2>&1; then pip uninstall -y opencv-contrib-python; fi; \
+    rm -rf /root/.cache/pip; \
+    pip install --no-cache-dir --prefer-binary opencv-python-headless; \
     rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime; \
     rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
 
