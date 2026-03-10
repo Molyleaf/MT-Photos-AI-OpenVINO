@@ -6,7 +6,6 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG APP_UID=1024
 ARG APP_GID=100
 ARG PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple
-ARG ENABLE_INTEL_GPU_RUNTIME=1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -31,6 +30,9 @@ RUN set -eux; \
         libze1 \
         ocl-icd-libopencl1 \
         mesa-opencl-icd"; \
+    intel_gpu_runtime_deps="\
+        intel-opencl-icd \
+        libze-intel-gpu1"; \
     python_runtime_deps="\
         ca-certificates \
         libgl1 \
@@ -39,25 +41,21 @@ RUN set -eux; \
         libsm6 \
         libxext6 \
         libxrender1"; \
-    if [ "${ENABLE_INTEL_GPU_RUNTIME}" = "1" ]; then \
-        printf '%s\n' \
-            'deb https://mirrors.zju.edu.cn/debian sid main contrib non-free non-free-firmware' \
-            > /etc/apt/sources.list.d/sid.list; \
-        printf '%s\n' \
-            'Package: *' \
-            'Pin: release n=sid' \
-            'Pin-Priority: 100' \
-            '' \
-            'Package: intel-opencl-icd libze-intel-gpu1' \
-            'Pin: release n=sid' \
-            'Pin-Priority: 990' \
-            > /etc/apt/preferences.d/intel-gpu-runtime; \
-    fi; \
+    printf '%s\n' \
+        'deb https://mirrors.zju.edu.cn/debian sid main contrib non-free non-free-firmware' \
+        > /etc/apt/sources.list.d/sid.list; \
+    printf '%s\n' \
+        'Package: *' \
+        'Pin: release n=sid' \
+        'Pin-Priority: 100' \
+        '' \
+        'Package: intel-opencl-icd libze-intel-gpu1' \
+        'Pin: release n=sid' \
+        'Pin-Priority: 990' \
+        > /etc/apt/preferences.d/intel-gpu-runtime; \
     apt-get update; \
     apt-get install -y --no-install-recommends $ov_opencl_runtime_deps $python_runtime_deps; \
-    if [ "${ENABLE_INTEL_GPU_RUNTIME}" = "1" ]; then \
-        apt-get install -y --no-install-recommends -t sid intel-opencl-icd libze-intel-gpu1; \
-    fi; \
+    apt-get install -y --no-install-recommends -t sid $intel_gpu_runtime_deps; \
     pip install --no-cache-dir --prefer-binary -r /tmp/requirements.txt; \
     rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime; \
     rm -rf /var/lib/apt/lists/* /tmp/requirements.txt

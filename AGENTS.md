@@ -290,15 +290,15 @@
 
 - 当前 Docker 基线镜像为 `python:3.12-slim-trixie`（Debian 13）。
 - APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`。
-- `sources.list` 仅保留 `trixie`、`trixie-updates`、`trixie-security`，不默认启用 `trixie-backports`。
+- `sources.list` 基线仅保留 `trixie`、`trixie-updates`、`trixie-security`；构建阶段允许临时增加 `sid` 源，仅用于安装 Intel GPU runtime 后立即清理。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
 - 当前 `requirements.txt` 在 Python 3.12 / manylinux 下可直接使用 wheel 安装，不再默认保留 InsightFace 专用构建依赖。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
-- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
+- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 服务上传读图链已经切换为 OpenCV 原生解码，镜像默认不再包含 `ffmpeg/ffprobe`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
-- Debian 13 stable 官方仓库默认不提供 `intel-opencl-icd` / `libze-intel-gpu1`；如需启用 sid 或其他额外源补齐 Intel compute runtime，必须明确评估跨发行版核心库升级风险，不能默认混装。
+- Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - 启动阶段必须增加 `/dev/dri` 自检：请求 GPU 推理时，`/dev/dri` 不可用则直接报错并终止启动。
@@ -311,6 +311,7 @@
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=CPU/GPU/AUTO`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
+- 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
 - 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。
 
 ### 13.3 `/dev/dri` Intel iGPU 上线验收
@@ -327,9 +328,9 @@ services:
       - "${RENDER_GID:-109}"
     environment:
       - API_AUTH_KEY=mt_photos_ai_extra
-      - INFERENCE_DEVICE=GPU
-      - CLIP_INFERENCE_DEVICE=GPU
-      - RAPIDOCR_DEVICE=GPU
+      - INFERENCE_DEVICE=AUTO
+      - CLIP_INFERENCE_DEVICE=AUTO
+      - RAPIDOCR_DEVICE=AUTO
       - INSIGHTFACE_OV_DEVICE=GPU_FP16
       - OPENCV_OPENCL_DEVICE=Intel:GPU:0
       - OV_CACHE_DIR=/models/cache/openvino
@@ -340,7 +341,7 @@ services:
 ```
 
 说明：
-- 若需要自动设备选择，可将 `CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE` 改为 `AUTO`；但验收时仍要求 GPU 实际可用。
+- `INFERENCE_DEVICE/CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE` 推荐使用 `AUTO`；但验收时仍要求 GPU 实际可用。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
 
 #### B. 启动与设备可见性判定

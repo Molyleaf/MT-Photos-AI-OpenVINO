@@ -116,27 +116,13 @@ apt-get update && apt-get install -y --no-install-recommends \
 
 说明：
 
-- 当前 Debian 13 stable 官方仓库可直接安装的 OpenVINO/OpenCL 基线是 `libze1 + ocl-icd-libopencl1 + mesa-opencl-icd`；镜像默认保持这一 stable-only 组合。
-- 参考附件里的 `firmware-intel-graphics`、`intel-opencl-icd`、`libze-intel-gpu1` 属于宿主机固件或 sid/额外仓库补包范畴；当前运行时镜像不打包固件，也不默认混装 sid。
+- 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
+- 当前镜像构建阶段会临时启用 sid 源，仅安装 `intel-opencl-icd` 与 `libze-intel-gpu1`，随后清理 sid 源和 pin 文件。
 - 服务上传读图链已统一改为 OpenCV 原生解码，镜像不再包含 `ffmpeg/ffprobe`、VAAPI/oneVPL/QSV 媒体栈，也不预装 `clinfo` 这类诊断工具。
-- `intel-opencl-icd` 与 `libze-intel-gpu1` 属于 sid 侧 Intel compute runtime，不在当前镜像里默认启用；直接混装 sid 包会连带升级核心系统库，需单独评估。
 - 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
-
-若必须在容器内启用 Intel GPU runtime（用于 OpenVINO GPU/Remote Context），可在构建时显式开启：
-
-```bash
-docker build \
-  --build-arg APP_UID=$(id -u) \
-  --build-arg APP_GID=$(id -g) \
-  --build-arg PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
-  --build-arg ENABLE_INTEL_GPU_RUNTIME=1 \
-  -t mt-photos-ai-openvino:gpu .
-```
-
-说明：
-
-- `ENABLE_INTEL_GPU_RUNTIME=1` 会临时启用 sid 源，仅安装 `intel-opencl-icd` 与 `libze-intel-gpu1`，构建后会清理 sid 源与 pin 文件。
-- 启用后建议先验证 `ov.Core().available_devices` 包含 `GPU`，再以 `INFERENCE_DEVICE/CLIP_INFERENCE_DEVICE/RAPIDOCR_DEVICE=AUTO` 启动服务。
+- 参考文档：
+  - OpenVINO GPU 设备配置与依赖：<https://docs.openvino.ai/2025/openvino-workflow/running-inference/inference-devices-and-modes/gpu-device.html>
+  - Intel Linux GPU Driver（OpenCL/Level Zero 运行时包）：<https://dgpu-docs.intel.com/driver/installation.html>
 
 ### 方式一：docker compose
 
@@ -151,7 +137,7 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，保持 `INFERENCE_DEVICE=GPU`、`CLIP_INFERENCE_DEVICE=GPU`、`RAPIDOCR_DEVICE=GPU`
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`（若 GPU 不可用会按规则硬失败）
 - 如需挂载自定义模型、RapidOCR 配置或缓存目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 
 4. 启动服务：
@@ -174,8 +160,6 @@ docker build \
   --build-arg APP_UID=$(id -u) \
   --build-arg APP_GID=$(id -g) \
   --build-arg PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
-  # 可选：在镜像内补齐 Intel GPU runtime（sid 包）
-  # --build-arg ENABLE_INTEL_GPU_RUNTIME=1 \
   -t mt-photos-ai-openvino .
 docker run -d \
   --name mt-photos-ai-openvino \
@@ -185,7 +169,9 @@ docker run -d \
   --group-add $(getent group video | cut -d: -f3) \
   --group-add $(getent group render | cut -d: -f3) \
   -e API_AUTH_KEY=mt_photos_ai_extra \
-  -e INFERENCE_DEVICE=GPU \
+  -e INFERENCE_DEVICE=AUTO \
+  -e CLIP_INFERENCE_DEVICE=AUTO \
+  -e RAPIDOCR_DEVICE=AUTO \
   -e WEB_CONCURRENCY=2 \
   -e OV_CACHE_DIR=/models/cache/openvino \
   mt-photos-ai-openvino

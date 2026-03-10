@@ -16,8 +16,8 @@ services:
     environment:
       # 未列出的变量要么是兼容/内部项，要么已由镜像固定，通常不需要覆盖。
       API_AUTH_KEY: "mt_photos_ai_extra"
-      INFERENCE_DEVICE: "GPU"
-      CLIP_INFERENCE_DEVICE: "GPU"
+      INFERENCE_DEVICE: "AUTO"
+      CLIP_INFERENCE_DEVICE: "AUTO"
       MODEL_PATH: "/models"
       WEB_CONCURRENCY: "2"
       INFERENCE_QUEUE_MAX_SIZE: "64"
@@ -29,7 +29,7 @@ services:
       RAPIDOCR_OPENVINO_CONFIG_PATH: "/app/config/cfg_openvino_cpu.yaml"
       RAPIDOCR_MODEL_DIR: "/models/rapidocr"
       RAPIDOCR_FONT_PATH: ""
-      RAPIDOCR_DEVICE: "GPU"
+      RAPIDOCR_DEVICE: "AUTO"
       RAPIDOCR_INFERENCE_NUM_THREADS: "-1"
       RAPIDOCR_PERFORMANCE_HINT: "LATENCY"
       RAPIDOCR_PERFORMANCE_NUM_REQUESTS: "-1"
