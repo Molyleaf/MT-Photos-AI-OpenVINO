@@ -102,6 +102,8 @@ uvicorn server:app --host 0.0.0.0 --port 8060 --workers 2
 ```bash
 apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
+  firmware-misc-nonfree \
+  intel-media-va-driver-non-free \
   libdrm2 \
   libgl1 \
   libglib2.0-0 \
@@ -110,6 +112,7 @@ apt-get update && apt-get install -y --no-install-recommends \
   libxext6 \
   libxrender1 \
   libze1 \
+  mesa-vulkan-drivers \
   ocl-icd-libopencl1 \
   mesa-opencl-icd
 ```
@@ -117,7 +120,9 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
+- Intel iGPU 相关运行库建议包含：`mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、`firmware-misc-nonfree`（部分环境包名可能写作 `firmware-misc-non-free`）。
 - 当前镜像构建阶段会临时启用 sid 源，仅安装 `intel-opencl-icd` 与 `libze-intel-gpu1`，随后清理 sid 源和 pin 文件。
+- 容器内不安装 `xserver-xorg-video-intel`（该包用于 Xorg 显示栈，不是本服务的无头推理运行前提）。
 - 服务上传读图链已统一改为 OpenCV 原生解码，镜像不再包含 `ffmpeg/ffprobe`、VAAPI/oneVPL/QSV 媒体栈，也不预装 `clinfo` 这类诊断工具。
 - 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
 - 参考文档：

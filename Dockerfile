@@ -4,7 +4,7 @@ WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APP_UID=1024
-ARG APP_GID=100
+ARG APP_GID=1000
 ARG PIP_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,14 +24,18 @@ COPY sources.list /etc/apt/sources.list
 COPY requirements.txt /tmp/requirements.txt
 
 RUN set -eux; \
+    mkdir -p /etc/apt/sources.list.d /etc/apt/preferences.d; \
     ov_opencl_runtime_deps="\
         libdrm2 \
         libze1 \
         ocl-icd-libopencl1 \
         mesa-opencl-icd"; \
-    intel_gpu_runtime_deps="\
+    intel_compute_runtime_deps="\
         intel-opencl-icd \
         libze-intel-gpu1"; \
+    intel_media_runtime_deps="\
+        mesa-vulkan-drivers \
+        intel-media-va-driver-non-free"; \
     python_runtime_deps="\
         ca-certificates \
         libgl1 \
@@ -54,7 +58,10 @@ RUN set -eux; \
         > /etc/apt/preferences.d/intel-gpu-runtime; \
     apt-get update; \
     apt-get install -y --no-install-recommends $ov_opencl_runtime_deps $python_runtime_deps; \
-    apt-get install -y --no-install-recommends -t sid $intel_gpu_runtime_deps; \
+    firmware_pkg="firmware-misc-nonfree"; \
+    if apt-cache show firmware-misc-non-free >/dev/null 2>&1; then firmware_pkg="firmware-misc-non-free"; fi; \
+    apt-get install -y --no-install-recommends -t sid $intel_compute_runtime_deps; \
+    apt-get install -y --no-install-recommends $intel_media_runtime_deps "${firmware_pkg}"; \
     pip install --no-cache-dir --prefer-binary -r /tmp/requirements.txt; \
     rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime; \
     rm -rf /var/lib/apt/lists/* /tmp/requirements.txt

@@ -296,8 +296,9 @@
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
-- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
+- 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，并补齐 Intel iGPU 运行库：`mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、`firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`）；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 服务上传读图链已经切换为 OpenCV 原生解码，镜像默认不再包含 `ffmpeg/ffprobe`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
+- 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
