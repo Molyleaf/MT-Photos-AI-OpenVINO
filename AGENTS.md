@@ -77,8 +77,8 @@
 - 当 RapidOCR 设备显式包含 `GPU`（如 `MULTI:GPU,CPU`、`MULTI:GPU.0,CPU`）时，若 OpenVINO 无 GPU 设备必须直接报错，禁止 silent fallback 到纯 CPU。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
-- 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=6`（可按场景增至 8）。
-- OpenVINO 参数基线：`device_name=MULTI:GPU,CPU`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
+- 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
+- OpenVINO 参数基线：`device_name=MULTI:GPU,CPU`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
@@ -94,9 +94,11 @@
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
 - InsightFace OpenVINO EP 的 `device_type` 基线必须使用 `MULTI` 表达式（默认 `MULTI:GPU,CPU`）；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
+- InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
 - 必须兼容 `insightface` 旧版 `FaceAnalysis.__init__` 不支持 `providers/allowed_modules` 的情况；此时必须在会话级显式设置 `OpenVINOExecutionProvider` 并校验 provider 顺序。
 - 对 `insightface` 旧版模型路由不兼容时，允许运行时构造仅含检测+识别必需 ONNX 的模型目录用于初始化，但不得改变 `/represent` 接口语义与返回字段。
 - 对齐阶段必须使用 OpenCV + Intel OpenCL（`warpAffine` OpenCL 路径）；OpenCL 不可用或设备非 Intel 时必须直接报错，禁止静默回退 CPU。
+- InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 
 ---
@@ -115,7 +117,7 @@
 - 生命周期：
 - 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
   - 关闭时释放全部模型
-- 当前实现不再基于空闲计时自动释放模型；模型释放仅由 `/restart`、`/restart_v2` 或进程关闭触发。
+- Text-CLIP 常驻内存；非文本模型（Vision-CLIP / OCR / InsightFace）默认基于空闲计时自动释放，当前基线 `NON_TEXT_IDLE_UNLOAD_SECONDS=300`，设为 `0` 时可禁用。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
@@ -183,7 +185,8 @@
 4. `/clip/img` 必须在单 worker 内做“相邻同尺寸请求”的受控微批；若尺寸不一致或队列被其他任务打断，必须立即退回单请求执行。
 5. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖排队、切族、模型加载与执行，导致冷启动结构性误杀。
 6. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
-7. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+7. `POST /restart` 仅释放当前非文本模型族并清空空闲释放计时；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+8. 非文本模型默认在最后一次请求完成后进入空闲释放计时；倒计时期间若有新请求到达，必须续期而不是立即卸载。
 
 ---
 
@@ -318,8 +321,11 @@
 - 修复 InsightFace OpenCL 对齐补丁兼容性：`norm_crop` 现在兼容 `UMat/ndarray` 输入，并对 `estimate_norm` 返回值执行显式矩阵校验，避免 `warpAffine` 参数类型错误。
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为单 worker 内相邻同尺寸微批，维持 PPP 预处理与接口语义不变，同时提升 GPU 利用率。
-- 收敛 OCR 冷启动：Text-CLIP owner worker 会在启动后后台预热一次 RapidOCR，并把默认 `cfg_openvino_cpu.yaml` 的 `performance_hint` 收敛为 `LATENCY`，降低首个 OCR 请求超时风险。
-- 修复非文本模型族空闲自动卸载回归：worker 不再因队列短暂空闲而释放 OCR / Vision-CLIP / InsightFace，模型仅由 `/restart`、`/restart_v2` 或进程关闭触发释放。
+- 收敛 OCR 冷启动：Text-CLIP owner worker 会在启动后后台预热一次 RapidOCR，并通过 OpenVINO cache 把编译成本前移。
+- 修复 InsightFace 五点对齐弃用 API warning：本地重写相似变换矩阵估计，保持 OpenCL `warpAffine` 路径与输出语义不变。
+- 修复 RapidOCR 方向分类批次越界：对 OpenVINO 返回结果按当前批次长度裁剪，并移除 crop 深拷贝以降低 OCR CPU 开销。
+- 恢复非文本模型族空闲自动卸载：OCR / Vision-CLIP / InsightFace 默认在 `NON_TEXT_IDLE_UNLOAD_SECONDS=300` 到期后释放，文本 CLIP 仍常驻。
+- 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
 - 收敛 OpenVINO 同步推理调用：InsightFace PPP runner、RapidOCR OpenVINO patch 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。

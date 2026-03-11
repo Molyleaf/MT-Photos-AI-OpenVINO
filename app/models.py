@@ -206,7 +206,8 @@ def _patch_rapidocr_classifier_batch_bounds() -> None:
         if isinstance(img_list, np.ndarray):
             img_list = [img_list]
 
-        img_list = rapidocr_cls_main.copy.deepcopy(img_list)
+        # Keep the outer list mutable for rotation, but avoid deep-copying every crop buffer.
+        img_list = list(img_list)
 
         width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
         indices = np.argsort(np.array(width_list))
@@ -217,6 +218,7 @@ def _patch_rapidocr_classifier_batch_bounds() -> None:
 
         for beg_img_no in range(0, img_num, batch_num):
             end_img_no = min(img_num, beg_img_no + batch_num)
+            effective_batch = end_img_no - beg_img_no
 
             norm_img_batch = []
             for ino in range(beg_img_no, end_img_no):
@@ -225,8 +227,19 @@ def _patch_rapidocr_classifier_batch_bounds() -> None:
             norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
 
             prob_out = self.session(norm_img_batch)
+            if (
+                isinstance(prob_out, np.ndarray)
+                and prob_out.ndim >= 1
+                and prob_out.shape[0] > effective_batch
+            ):
+                LOG.warning(
+                    "RapidOCR cls backend returned batch=%d for requested=%d; "
+                    "truncating stale tail rows to keep indices aligned.",
+                    int(prob_out.shape[0]),
+                    effective_batch,
+                )
+                prob_out = prob_out[:effective_batch]
             cls_result = list(self.postprocess_op(prob_out))
-            effective_batch = end_img_no - beg_img_no
             if len(cls_result) > effective_batch:
                 LOG.warning(
                     "RapidOCR cls returned %d results for a batch of %d crops; "
@@ -425,6 +438,92 @@ def _as_contiguous_bgr_uint8(image: Any, context: str) -> np.ndarray:
     if image.flags.c_contiguous:
         return image
     return np.ascontiguousarray(image)
+
+
+def _estimate_similarity_transform_matrix(src: Any, dst: Any) -> np.ndarray:
+    src_points = np.asarray(src, dtype=np.float64)
+    dst_points = np.asarray(dst, dtype=np.float64)
+    if src_points.shape != dst_points.shape or src_points.ndim != 2 or src_points.shape[1] != 2:
+        raise ValueError(
+            "InsightFace alignment expects matching 2D landmarks, "
+            f"got src={src_points.shape}, dst={dst_points.shape}"
+        )
+
+    point_count = src_points.shape[0]
+    if point_count < 2:
+        raise ValueError(
+            "InsightFace alignment requires at least 2 points, "
+            f"got {point_count}"
+        )
+
+    src_mean = src_points.mean(axis=0)
+    dst_mean = dst_points.mean(axis=0)
+    src_demean = src_points - src_mean
+    dst_demean = dst_points - dst_mean
+
+    covariance = dst_demean.T @ src_demean / float(point_count)
+    diagonal = np.ones((2,), dtype=np.float64)
+    if np.linalg.det(covariance) < 0:
+        diagonal[1] = -1.0
+
+    u_mat, singular_values, vh_mat = np.linalg.svd(covariance)
+    rank = int(np.linalg.matrix_rank(covariance))
+    if rank == 0:
+        raise RuntimeError("InsightFace alignment landmarks are ill-conditioned.")
+
+    if rank == 1:
+        if np.linalg.det(u_mat) * np.linalg.det(vh_mat) > 0:
+            rotation = u_mat @ vh_mat
+        else:
+            last_value = diagonal[1]
+            diagonal[1] = -1.0
+            rotation = u_mat @ np.diag(diagonal) @ vh_mat
+            diagonal[1] = last_value
+    else:
+        rotation = u_mat @ np.diag(diagonal) @ vh_mat
+
+    src_variance = float(src_demean.var(axis=0).sum())
+    if src_variance <= 0.0:
+        raise RuntimeError("InsightFace alignment source landmarks have zero variance.")
+    scale = float(singular_values @ diagonal) / src_variance
+
+    transform = np.eye(3, dtype=np.float64)
+    transform[:2, :2] = rotation
+    transform[:2, 2] = dst_mean - scale * (rotation @ src_mean.T)
+    transform[:2, :2] *= scale
+
+    if np.isnan(transform).any():
+        raise RuntimeError("InsightFace alignment similarity transform contains NaN.")
+    return transform[:2, :].astype(np.float32, copy=False)
+
+
+def _estimate_insightface_norm_matrix(
+    landmark: Any,
+    image_size: int,
+    arcface_dst: Any,
+) -> np.ndarray:
+    landmark_array = np.asarray(landmark, dtype=np.float32)
+    if landmark_array.shape != (5, 2):
+        raise ValueError(
+            "InsightFace alignment expects 5 facial landmarks, "
+            f"got {landmark_array.shape}"
+        )
+
+    if image_size % 112 == 0:
+        ratio = float(image_size) / 112.0
+        diff_x = 0.0
+    elif image_size % 128 == 0:
+        ratio = float(image_size) / 128.0
+        diff_x = 8.0 * ratio
+    else:
+        raise ValueError(
+            "InsightFace alignment image_size must be divisible by 112 or 128, "
+            f"got {image_size}"
+        )
+
+    destination = np.array(arcface_dst, dtype=np.float32, copy=True) * ratio
+    destination[:, 0] += diff_x
+    return _estimate_similarity_transform_matrix(landmark_array, destination)
 
 
 def _to_channel_triplet(value: Any) -> List[float]:
@@ -657,6 +756,10 @@ class AIModels:
         self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
         self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
         self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
+        self._idle_unload_seconds = max(
+            0.0, _as_float(os.environ.get("NON_TEXT_IDLE_UNLOAD_SECONDS"), 300.0)
+        )
+        self._idle_unload_deadline: Optional[float] = None
         self._release_requested = False
         self._stopping = False
 
@@ -671,13 +774,14 @@ class AIModels:
         self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s queue_timeout=%ss exec_timeout=%ss idle_unload=%ss clip_batch=%s/%sms text_service=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
             self._queue_capacity,
             self._queue_timeout_seconds,
             self._execution_timeout_seconds,
+            int(self._idle_unload_seconds),
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
@@ -734,6 +838,24 @@ class AIModels:
                 self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
             self._active_family = "ocr"
             self._warmup_rapidocr_locked()
+        self._arm_idle_unload_deadline()
+
+    def _arm_idle_unload_deadline(self) -> None:
+        if self._idle_unload_seconds <= 0.0:
+            return
+        with self._model_lock:
+            if self._active_family is None:
+                self._clear_idle_unload_deadline()
+                return
+        with self._condition:
+            if self._stopping:
+                return
+            self._idle_unload_deadline = time.monotonic() + self._idle_unload_seconds
+            self._condition.notify()
+
+    def _clear_idle_unload_deadline(self) -> None:
+        with self._condition:
+            self._idle_unload_deadline = None
 
     def _init_clip_remote_context(self) -> Optional[Any]:
         clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
@@ -1136,26 +1258,43 @@ class AIModels:
         while True:
             normal_task: Optional[_InferenceTask] = None
             release_active_family = False
+            release_reason = "manual"
 
             with self._condition:
                 while True:
                     if self._stopping or self._normal_queue or self._release_requested:
                         break
-                    self._condition.wait()
+                    idle_deadline = self._idle_unload_deadline
+                    if idle_deadline is None:
+                        self._condition.wait()
+                        continue
+                    remaining = idle_deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        self._idle_unload_deadline = None
+                        release_active_family = True
+                        release_reason = "idle"
+                        break
+                    self._condition.wait(timeout=remaining)
 
                 if self._stopping:
                     break
 
-                if self._release_requested and not self._normal_queue:
+                if not release_active_family and self._release_requested and not self._normal_queue:
                     self._release_requested = False
                     release_active_family = True
-                elif self._normal_queue:
+                    release_reason = "manual"
+                elif not release_active_family and self._normal_queue:
                     normal_task = self._normal_queue.popleft()
                     normal_task.started_at = time.monotonic()
                     normal_task.started_event.set()
 
             if release_active_family:
                 try:
+                    if release_reason == "idle":
+                        LOG.info(
+                            "Releasing active non-text model family after %.1fs of inactivity.",
+                            self._idle_unload_seconds,
+                        )
                     self._unload_active_family()
                 except Exception as exc:
                     LOG.error("Failed to release active model family: %s", exc, exc_info=True)
@@ -1184,6 +1323,8 @@ class AIModels:
         except Exception as exc:
             LOG.error("Task %s failed: %s", task.kind, exc, exc_info=True)
             self._safe_set_exception(task.future, exc)
+        finally:
+            self._arm_idle_unload_deadline()
 
     def _collect_clip_image_batch(self, first_task: _InferenceTask) -> List[_InferenceTask]:
         batch = [first_task]
@@ -1228,6 +1369,8 @@ class AIModels:
             LOG.error("Task clip_img failed: %s", exc, exc_info=True)
             for task in tasks:
                 self._safe_set_exception(task.future, exc)
+        finally:
+            self._arm_idle_unload_deadline()
 
     def _unload_active_family(self) -> None:
         with self._model_lock:
@@ -1290,6 +1433,7 @@ class AIModels:
         self._face_det_ppp = None
         self._face_rec_ppp = None
         self._active_family = None
+        self._idle_unload_deadline = None
         gc.collect()
 
     def _compile_clip_model(
@@ -1489,12 +1633,12 @@ class AIModels:
                 os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)
             ),
             "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
-            "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "LATENCY"),
+            "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "THROUGHPUT"),
             "performance_num_requests": _as_int(
-                os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), -1
+                os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2
             ),
             "enable_cpu_pinning": _as_bool(os.environ.get("RAPIDOCR_ENABLE_CPU_PINNING"), True),
-            "num_streams": _as_int(os.environ.get("RAPIDOCR_NUM_STREAMS"), -1),
+            "num_streams": _as_int(os.environ.get("RAPIDOCR_NUM_STREAMS"), 2),
             "enable_hyper_threading": _as_bool(
                 os.environ.get("RAPIDOCR_ENABLE_HYPER_THREADING"), True
             ),
@@ -1505,8 +1649,8 @@ class AIModels:
             "det_limit_type": _normalize_rapidocr_limit_type(
                 os.environ.get("RAPIDOCR_DET_LIMIT_TYPE", "max")
             ),
-            "rec_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_REC_BATCH_NUM"), 6)),
-            "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 6)),
+            "rec_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_REC_BATCH_NUM"), 8)),
+            "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 8)),
         }
 
         config_path = self._require_rapidocr_config_path()
@@ -1752,7 +1896,30 @@ class AIModels:
                 ),
             ),
         )
-        warmup_image = np.zeros((warmup_side, warmup_side, 3), dtype=np.uint8)
+        warmup_image = np.full((warmup_side, warmup_side, 3), 255, dtype=np.uint8)
+        font_scale = max(1.2, warmup_side / 512.0)
+        thickness = max(2, warmup_side // 320)
+        baseline_y = max(48, warmup_side // 3)
+        cv2.putText(
+            warmup_image,
+            "rapidocr warmup",
+            (max(12, warmup_side // 16), baseline_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            thickness,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            warmup_image,
+            "12345",
+            (max(12, warmup_side // 8), min(warmup_side - 24, baseline_y * 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (32, 32, 32),
+            thickness,
+            cv2.LINE_AA,
+        )
         self._infer_ocr(warmup_image)
 
     def _load_rapidocr_locked(self) -> None:
@@ -1860,16 +2027,25 @@ class AIModels:
         if getattr(face_align, "_mt_opencl_norm_crop_patch", False):
             return
 
+        def _estimate_norm_no_warning(
+            landmark: np.ndarray,
+            image_size: int = 112,
+            mode: str = "arcface",
+        ) -> np.ndarray:
+            _ = mode
+            return _estimate_insightface_norm_matrix(
+                landmark=landmark,
+                image_size=int(image_size),
+                arcface_dst=face_align.arcface_dst,
+            )
+
         def _norm_crop_opencl(
             img: np.ndarray,
             landmark: np.ndarray,
             image_size: int = 112,
             mode: str = "arcface",
         ) -> np.ndarray:
-            estimated = face_align.estimate_norm(landmark, image_size, mode)
-            if isinstance(estimated, tuple):
-                estimated = estimated[0]
-            matrix = np.asarray(estimated, dtype=np.float32)
+            matrix = _estimate_norm_no_warning(landmark, image_size, mode)
             if matrix.shape != (2, 3):
                 raise RuntimeError(
                     "InsightFace estimate_norm returned invalid affine matrix shape: "
@@ -1902,6 +2078,7 @@ class AIModels:
                 context="InsightFace alignment",
             )
 
+        face_align.estimate_norm = _estimate_norm_no_warning
         face_align.norm_crop = _norm_crop_opencl
         face_align._mt_opencl_norm_crop_patch = True
 
@@ -2055,8 +2232,25 @@ class AIModels:
             f"{self.insightface_model_root / MODEL_NAME}, {self.insightface_root / MODEL_NAME}"
         )
 
+    def _build_insightface_provider_options(self, provider_device: str) -> Dict[str, str]:
+        provider_options: Dict[str, str] = {
+            "device_type": provider_device,
+            "enable_opencl_throttling": str(
+                _as_bool(os.environ.get("INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING"), False)
+            ).lower(),
+        }
+        if self.ov_cache_dir is not None:
+            provider_options["cache_dir"] = str(self.ov_cache_dir)
+        num_threads = _as_int(os.environ.get("INSIGHTFACE_OV_NUM_THREADS"), -1)
+        if num_threads > 0:
+            provider_options["num_of_threads"] = str(num_threads)
+        return provider_options
+
     @staticmethod
-    def _enforce_insightface_openvino_provider(face_app: FaceAnalysis, provider_device: str) -> None:
+    def _enforce_insightface_openvino_provider(
+        face_app: FaceAnalysis,
+        provider_options: Dict[str, str],
+    ) -> None:
         models_map = getattr(face_app, "models", {})
         configured_sessions = 0
         for task_name, model in models_map.items():
@@ -2066,11 +2260,11 @@ class AIModels:
             try:
                 session.set_providers(
                     ["OpenVINOExecutionProvider"],
-                    [{"device_type": provider_device}],
+                    [provider_options],
                 )
             except TypeError:
                 session.set_providers(
-                    [("OpenVINOExecutionProvider", {"device_type": provider_device})]
+                    [("OpenVINOExecutionProvider", provider_options)]
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -2129,8 +2323,9 @@ class AIModels:
         provider_device = _normalize_non_text_openvino_device(
             os.environ.get("INSIGHTFACE_OV_DEVICE", INFERENCE_DEVICE)
         )
+        provider_options = self._build_insightface_provider_options(provider_device)
         providers: List[Any] = [
-            ("OpenVINOExecutionProvider", {"device_type": provider_device}),
+            ("OpenVINOExecutionProvider", provider_options),
         ]
         try:
             root_for_runtime = self._resolve_insightface_root()
@@ -2149,9 +2344,9 @@ class AIModels:
 
             face_app = FaceAnalysis(**face_analysis_kwargs)
             # InsightFace<=0.2.1 ignores providers in __init__; enforce OpenVINO EP explicitly.
-            self._enforce_insightface_openvino_provider(face_app, provider_device)
+            self._enforce_insightface_openvino_provider(face_app, provider_options)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
-            self._enforce_insightface_openvino_provider(face_app, provider_device)
+            self._enforce_insightface_openvino_provider(face_app, provider_options)
             self._validate_insightface_openvino_provider(face_app)
             self._attach_insightface_preprocess(face_app, device_name=provider_device)
             self._face_engine = face_app

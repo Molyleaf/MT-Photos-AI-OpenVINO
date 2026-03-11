@@ -16,10 +16,10 @@ EngineConfig:
   openvino:
     device_name: "MULTI:GPU,CPU"
     inference_num_threads: -1
-    performance_hint: "LATENCY"
-    performance_num_requests: -1
+    performance_hint: "THROUGHPUT"
+    performance_num_requests: 2
     enable_cpu_pinning: true
-    num_streams: -1
+    num_streams: 2
     enable_hyper_threading: true
     scheduling_core_type: "ANY_CORE"
 
@@ -51,7 +51,7 @@ Cls:
   model_path: null
   model_dir: null
   cls_image_shape: [3, 48, 192]
-  cls_batch_num: 6
+  cls_batch_num: 8
   cls_thresh: 0.9
   label_list: ["0", "180"]
 
@@ -65,4 +65,4 @@ Rec:
   model_dir: null
   rec_keys_path: null
   rec_img_shape: [3, 48, 320]
-  rec_batch_num: 6
+  rec_batch_num: 8
