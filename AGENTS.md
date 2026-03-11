@@ -77,7 +77,7 @@
 - 当 RapidOCR 设备显式包含 `GPU`（如 `MULTI:GPU,CPU`、`MULTI:GPU.0,CPU`）时，若 OpenVINO 无 GPU 设备必须直接报错，禁止 silent fallback 到纯 CPU。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
-- 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Rec.rec_batch_num=6`（可按场景增至 8）。
+- 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=6`（可按场景增至 8）。
 - OpenVINO 参数基线：`device_name=MULTI:GPU,CPU`、`performance_hint=LATENCY`、`inference_num_threads=-1`、`num_streams=-1`。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
@@ -313,7 +313,8 @@
 - 修复 RapidOCR 后端锁定问题：服务会直接把 `RAPIDOCR_OPENVINO_CONFIG_PATH` 作为 `config_path` 传给 `RapidOCR`，并在初始化后校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=MULTI:GPU,CPU`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
 - 收敛 OpenVINO cache 配置：默认启用仓库内 `cache/openvino` 编译缓存目录，显式设置 `OV_CACHE_DIR` 时覆盖默认值，避免多 Worker 反复冷编译。
-- 修复 InsightFace PPP 预处理输出取值失败：改为 `set_input_tensor + infer + get_output_tensor(0)` 直取输出，并在构建时执行 shape/dtype 自检，避免匿名 `Result` 端口映射异常。
+- 修复 InsightFace PPP 预处理输出取值失败：改为显式 `infer({compiled_model.input(0): ...})` + `compiled_model.output(0)` 取输出，并在构建时执行 shape/dtype 自检，兼容匿名 `Result` 端口映射。
+- 收敛 RapidOCR 检测缩放策略：默认 `Det.limit_type=max`，避免把小图放大到 `limit_side_len` 触发结构性慢路径。
 - 修复 InsightFace OpenCL 对齐补丁兼容性：`norm_crop` 现在兼容 `UMat/ndarray` 输入，并对 `estimate_norm` 返回值执行显式矩阵校验，避免 `warpAffine` 参数类型错误。
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为单 worker 内相邻同尺寸微批，维持 PPP 预处理与接口语义不变，同时提升 GPU 利用率。

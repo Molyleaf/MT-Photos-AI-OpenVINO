@@ -41,6 +41,7 @@
 | `RAPIDOCR_USE_CLS`                  | 是否启用方向分类器                                                 | `true`                             |
 | `RAPIDOCR_MAX_SIDE_LEN`             | OCR 全图最大边限制                                               | `960`                              |
 | `RAPIDOCR_DET_LIMIT_SIDE_LEN`       | 检测模型输入边长限制                                                | `960`                              |
+| `RAPIDOCR_DET_LIMIT_TYPE`           | 检测缩放策略；默认 `max`，避免把小图放大到阈值导致时延异常                | `max`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `6`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `6`                                |
 | `OCR_PREWARM_ENABLED`               | 是否在启动后由后台 owner worker 预热 RapidOCR 并填充编译缓存                     | `true`                              |
@@ -59,6 +60,7 @@
 - `WEB_CONCURRENCY` 只影响 FastAPI worker 数；默认基线为 `1`。若手动放大 worker，Text-CLIP 仍保持单例服务，非文本模型仍建议结合日志观察显存/冷启动时延后再放大。
 - 非文本超时已拆分为“排队超时”和“执行超时”：默认仍保持 `INFERENCE_TASK_TIMEOUT=10` 的排队上限，但执行阶段默认至少给到 `30` 秒，避免模型切族、冷编译或首轮预热直接吃掉排队时间。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
+- RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认会由 Text-CLIP owner worker 在启动后后台预热一次 RapidOCR，尽量把冷编译成本前移，减少多 worker 首次 OCR 请求命中冷加载超时。
 - RapidOCR、InsightFace 以及 InsightFace 的 OpenVINO PPP 预处理会把 `AUTO/GPU/GPU_FP16` 等输入归一化为 `MULTI:*` 设备字符串；默认基线为 `MULTI:GPU,CPU`。

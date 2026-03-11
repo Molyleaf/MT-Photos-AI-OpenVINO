@@ -317,6 +317,14 @@ def _normalize_non_text_openvino_device(device_expr: str) -> str:
 
     return f"MULTI:{','.join(normalized_tokens)}"
 
+
+def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"max", "min"}:
+        return normalized
+    return default
+
+
 def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -> np.ndarray:
     if context_length < 2:
         raise ValueError("context_length must be >= 2")
@@ -441,12 +449,20 @@ class _OpenVinoPreprocessRunner:
     runner_name: str
     input_height: int
     input_width: int
+    input_port: Any
+    output_port: Any
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
-        prepared = np.ascontiguousarray(tensor)
-        self.request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
-        self.request.infer()
-        return np.asarray(self.request.get_output_tensor(0).data)
+        prepared = np.ascontiguousarray(tensor, dtype=np.uint8)
+        outputs = self.request.infer(
+            {self.input_port: prepared},
+            share_inputs=True,
+            share_outputs=True,
+        )
+        try:
+            return np.asarray(outputs[self.output_port])
+        except Exception:
+            return np.asarray(next(iter(outputs.values())))
 
     def validate(self) -> None:
         sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)
@@ -1412,6 +1428,9 @@ class AIModels:
             "use_cls": _as_bool(os.environ.get("RAPIDOCR_USE_CLS"), True),
             "max_side_len": _as_int(os.environ.get("RAPIDOCR_MAX_SIDE_LEN"), 960),
             "det_limit_side_len": _as_int(os.environ.get("RAPIDOCR_DET_LIMIT_SIDE_LEN"), 960),
+            "det_limit_type": _normalize_rapidocr_limit_type(
+                os.environ.get("RAPIDOCR_DET_LIMIT_TYPE", "max")
+            ),
             "rec_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_REC_BATCH_NUM"), 6)),
             "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 6)),
         }
@@ -1436,6 +1455,11 @@ class AIModels:
             if "limit_side_len" in det_cfg:
                 config["det_limit_side_len"] = _as_int(
                     det_cfg.get("limit_side_len"), config["det_limit_side_len"]
+                )
+            if "limit_type" in det_cfg:
+                config["det_limit_type"] = _normalize_rapidocr_limit_type(
+                    det_cfg.get("limit_type"),
+                    config["det_limit_type"],
                 )
 
             rec_cfg = loaded.get("Rec", {})
@@ -1500,6 +1524,10 @@ class AIModels:
             "RAPIDOCR_DET_LIMIT_SIDE_LEN": (
                 "det_limit_side_len",
                 lambda value, default: _as_int(value, default),
+            ),
+            "RAPIDOCR_DET_LIMIT_TYPE": (
+                "det_limit_type",
+                lambda value, default: _normalize_rapidocr_limit_type(value, default),
             ),
             "RAPIDOCR_REC_BATCH_NUM": (
                 "rec_batch_num",
@@ -1580,6 +1608,7 @@ class AIModels:
             "Global.use_cls": _as_bool(cfg.get("use_cls"), True),
             "Global.max_side_len": _as_int(cfg.get("max_side_len"), 960),
             "Det.limit_side_len": _as_int(cfg.get("det_limit_side_len"), 960),
+            "Det.limit_type": _normalize_rapidocr_limit_type(cfg.get("det_limit_type"), "max"),
             "Rec.rec_batch_num": max(1, _as_int(cfg.get("rec_batch_num"), 6)),
             "Cls.cls_batch_num": max(1, _as_int(cfg.get("cls_batch_num"), 6)),
         }
@@ -1657,13 +1686,19 @@ class AIModels:
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
         self._rapidocr_runtime_cfg = dict(config)
+        if config.get("det_limit_type") == "min":
+            LOG.warning(
+                "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
+            )
         LOG.info(
-            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s rec_batch_num=%s",
+            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s det_limit=%s/%s rec_batch_num=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
             config.get("performance_hint"),
             config.get("use_cls"),
             config.get("max_side_len"),
+            config.get("det_limit_type"),
+            config.get("det_limit_side_len"),
             config.get("rec_batch_num"),
         )
 
@@ -1710,6 +1745,8 @@ class AIModels:
             runner_name=runner_name,
             input_height=int(output_height),
             input_width=int(output_width),
+            input_port=compiled.input(0),
+            output_port=compiled.output(0),
         )
         runner.validate()
         return runner
@@ -2116,16 +2153,20 @@ class AIModels:
         if any(image.shape[:2] != (first_height, first_width) for image in prepared[1:]):
             return [self._infer_clip_image(image, filename) for image, filename in items]
 
-        batch = np.stack(prepared, axis=0)
         host_input = self._get_clip_vision_host_input(len(prepared), first_height, first_width)
 
         if host_input is not None:
             input_tensor, input_view = host_input
-            np.copyto(input_view, batch, casting="no")
+            for index, image_bgr in enumerate(prepared):
+                np.copyto(input_view[index], image_bgr, casting="no")
             self._clip_vision_request.set_input_tensor(0, input_tensor)
             self._clip_vision_request.infer()
             embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
         else:
+            if len(prepared) == 1:
+                batch = prepared[0][np.newaxis, ...]
+            else:
+                batch = np.stack(prepared, axis=0)
             if not self._clip_vision_input_name:
                 raise RuntimeError("CLIP vision input metadata is not initialized.")
             outputs = self._clip_vision_request.infer(
