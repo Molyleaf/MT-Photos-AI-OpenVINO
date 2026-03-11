@@ -190,8 +190,74 @@ def _patch_rapidocr_openvino_device_selection() -> None:
     OpenVINOInferSession._mt_device_patch = True  # type: ignore[attr-defined]
 
 
+def _patch_rapidocr_classifier_batch_bounds() -> None:
+    try:
+        import rapidocr.ch_ppocr_cls.main as rapidocr_cls_main
+    except Exception:
+        return
+
+    text_classifier = rapidocr_cls_main.TextClassifier
+    if getattr(text_classifier, "_mt_batch_bounds_patch", False):
+        return
+
+    def _patched_call(self: Any, img_list: Any) -> Any:
+        start_time = rapidocr_cls_main.time.perf_counter()
+
+        if isinstance(img_list, np.ndarray):
+            img_list = [img_list]
+
+        img_list = rapidocr_cls_main.copy.deepcopy(img_list)
+
+        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
+        indices = np.argsort(np.array(width_list))
+
+        img_num = len(img_list)
+        cls_res = [("", 0.0)] * img_num
+        batch_num = self.cls_batch_num
+
+        for beg_img_no in range(0, img_num, batch_num):
+            end_img_no = min(img_num, beg_img_no + batch_num)
+
+            norm_img_batch = []
+            for ino in range(beg_img_no, end_img_no):
+                norm_img = self.resize_norm_img(img_list[int(indices[ino])])
+                norm_img_batch.append(norm_img[np.newaxis, :])
+            norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
+
+            prob_out = self.session(norm_img_batch)
+            cls_result = list(self.postprocess_op(prob_out))
+            effective_batch = end_img_no - beg_img_no
+            if len(cls_result) > effective_batch:
+                LOG.warning(
+                    "RapidOCR cls returned %d results for a batch of %d crops; "
+                    "truncating extra outputs to keep indices aligned.",
+                    len(cls_result),
+                    effective_batch,
+                )
+                cls_result = cls_result[:effective_batch]
+
+            for rno, (label, score) in enumerate(cls_result):
+                target_idx = int(indices[beg_img_no + rno])
+                cls_res[target_idx] = (label, score)
+                if "180" in label and score > self.cls_thresh:
+                    img_list[target_idx] = rapidocr_cls_main.cv2.rotate(
+                        img_list[target_idx], 1
+                    )
+
+        elapse = rapidocr_cls_main.time.perf_counter() - start_time
+        return rapidocr_cls_main.TextClsOutput(
+            img_list=img_list,
+            cls_res=cls_res,
+            elapse=elapse,
+        )
+
+    text_classifier.__call__ = _patched_call  # type: ignore[assignment]
+    text_classifier._mt_batch_bounds_patch = True  # type: ignore[attr-defined]
+
+
 _patch_rapidocr_openvino_multi_output()
 _patch_rapidocr_openvino_device_selection()
+_patch_rapidocr_classifier_batch_bounds()
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -453,15 +519,19 @@ class _InterProcessFileLock:
 class _OpenVinoPreprocessRunner:
     compiled_model: ov.CompiledModel
     request: ov.InferRequest
+    input_port: Any
+    output_port: Any
     runner_name: str
     input_height: int
     input_width: int
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
         prepared = np.ascontiguousarray(tensor, dtype=np.uint8)
-        self.request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
-        self.request.infer()
-        return np.asarray(self.request.get_output_tensor(0).data)
+        self.request.set_tensor(self.input_port, ov.Tensor(prepared, shared_memory=True))
+        # Avoid InferRequest.infer() OVDict wrapping for anonymous Result ports on some OV runtimes.
+        self.request.start_async()
+        self.request.wait()
+        return np.asarray(self.request.get_tensor(self.output_port).data)
 
     def validate(self) -> None:
         sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)
@@ -1720,8 +1790,10 @@ class AIModels:
             ov.Type.f32,
             name=f"{runner_name}_input",
         )
+        result = ov.opset13.result(parameter)
+        result.set_friendly_name(f"{runner_name}_output")
         preprocess_model = ov.Model(
-            [ov.opset13.result(parameter)],
+            [result],
             [parameter],
             f"{runner_name}_ppp",
         )
@@ -1746,6 +1818,8 @@ class AIModels:
         runner = _OpenVinoPreprocessRunner(
             compiled_model=compiled,
             request=compiled.create_infer_request(),
+            input_port=compiled.input(0),
+            output_port=compiled.output(0),
             runner_name=runner_name,
             input_height=int(output_height),
             input_width=int(output_width),
