@@ -49,6 +49,16 @@ CLIP_IMAGE_RESOLUTION = 224
 
 _CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
 _CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
+_INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
+    [
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041],
+    ],
+    dtype=np.float32,
+)
 
 _TOKENIZER = FullTokenizer()
 _PAD_TOKEN_ID = int(_TOKENIZER.vocab["[PAD]"])
@@ -101,15 +111,29 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
         return
 
-    # RapidOCR OpenVINO session may expose multi-output det heads; normalize __call__ behavior.
+    # Reused infer requests may expose stale tail rows for undersized batches.
+    # Normalize the returned tensor shape before RapidOCR postprocess consumes it.
     def _patched_call(self: Any, input_content: np.ndarray) -> Any:
         try:
             prepared = np.ascontiguousarray(input_content)
+            expected_batch = int(prepared.shape[0]) if prepared.ndim >= 1 else 1
             self.session.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
             self.session.infer()
-            if int(getattr(self, "_mt_output_count", 1)) > 1:
-                return self.session.get_output_tensor(0).data
-            return self.session.get_output_tensor(0).data
+            output = np.asarray(self.session.get_output_tensor(0).data)
+            if output.ndim >= 1 and output.shape[0] < expected_batch:
+                raise RuntimeError(
+                    "RapidOCR OpenVINO returned fewer batch rows than requested: "
+                    f"requested={expected_batch}, got={int(output.shape[0])}"
+                )
+            if output.ndim >= 1 and output.shape[0] > expected_batch:
+                LOG.warning(
+                    "RapidOCR OpenVINO returned stale tail rows: requested=%d, got=%d. "
+                    "Truncating output batch to keep OCR indices aligned.",
+                    expected_batch,
+                    int(output.shape[0]),
+                )
+                output = output[:expected_batch]
+            return output
         except Exception as exc:
             error_info = traceback.format_exc()
             raise OpenVINOError(error_info) from exc
@@ -182,7 +206,6 @@ def _patch_rapidocr_openvino_device_selection() -> None:
 
         self._mt_core = core
         self._mt_compiled_model = compiled_model
-        self._mt_output_count = len(compiled_model.outputs)
         self.session = compiled_model.create_infer_request()
         self._mt_device_name = selected_device
 
@@ -190,87 +213,8 @@ def _patch_rapidocr_openvino_device_selection() -> None:
     OpenVINOInferSession._mt_device_patch = True  # type: ignore[attr-defined]
 
 
-def _patch_rapidocr_classifier_batch_bounds() -> None:
-    try:
-        import rapidocr.ch_ppocr_cls.main as rapidocr_cls_main
-    except Exception:
-        return
-
-    text_classifier = rapidocr_cls_main.TextClassifier
-    if getattr(text_classifier, "_mt_batch_bounds_patch", False):
-        return
-
-    def _patched_call(self: Any, img_list: Any) -> Any:
-        start_time = rapidocr_cls_main.time.perf_counter()
-
-        if isinstance(img_list, np.ndarray):
-            img_list = [img_list]
-
-        # Keep the outer list mutable for rotation, but avoid deep-copying every crop buffer.
-        img_list = list(img_list)
-
-        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
-        indices = np.argsort(np.array(width_list))
-
-        img_num = len(img_list)
-        cls_res = [("", 0.0)] * img_num
-        batch_num = self.cls_batch_num
-
-        for beg_img_no in range(0, img_num, batch_num):
-            end_img_no = min(img_num, beg_img_no + batch_num)
-            effective_batch = end_img_no - beg_img_no
-
-            norm_img_batch = []
-            for ino in range(beg_img_no, end_img_no):
-                norm_img = self.resize_norm_img(img_list[int(indices[ino])])
-                norm_img_batch.append(norm_img[np.newaxis, :])
-            norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
-
-            prob_out = self.session(norm_img_batch)
-            if (
-                isinstance(prob_out, np.ndarray)
-                and prob_out.ndim >= 1
-                and prob_out.shape[0] > effective_batch
-            ):
-                LOG.warning(
-                    "RapidOCR cls backend returned batch=%d for requested=%d; "
-                    "truncating stale tail rows to keep indices aligned.",
-                    int(prob_out.shape[0]),
-                    effective_batch,
-                )
-                prob_out = prob_out[:effective_batch]
-            cls_result = list(self.postprocess_op(prob_out))
-            if len(cls_result) > effective_batch:
-                LOG.warning(
-                    "RapidOCR cls returned %d results for a batch of %d crops; "
-                    "truncating extra outputs to keep indices aligned.",
-                    len(cls_result),
-                    effective_batch,
-                )
-                cls_result = cls_result[:effective_batch]
-
-            for rno, (label, score) in enumerate(cls_result):
-                target_idx = int(indices[beg_img_no + rno])
-                cls_res[target_idx] = (label, score)
-                if "180" in label and score > self.cls_thresh:
-                    img_list[target_idx] = rapidocr_cls_main.cv2.rotate(
-                        img_list[target_idx], 1
-                    )
-
-        elapse = rapidocr_cls_main.time.perf_counter() - start_time
-        return rapidocr_cls_main.TextClsOutput(
-            img_list=img_list,
-            cls_res=cls_res,
-            elapse=elapse,
-        )
-
-    text_classifier.__call__ = _patched_call  # type: ignore[assignment]
-    text_classifier._mt_batch_bounds_patch = True  # type: ignore[attr-defined]
-
-
 _patch_rapidocr_openvino_multi_output()
 _patch_rapidocr_openvino_device_selection()
-_patch_rapidocr_classifier_batch_bounds()
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -500,7 +444,6 @@ def _estimate_similarity_transform_matrix(src: Any, dst: Any) -> np.ndarray:
 def _estimate_insightface_norm_matrix(
     landmark: Any,
     image_size: int,
-    arcface_dst: Any,
 ) -> np.ndarray:
     landmark_array = np.asarray(landmark, dtype=np.float32)
     if landmark_array.shape != (5, 2):
@@ -521,7 +464,7 @@ def _estimate_insightface_norm_matrix(
             f"got {image_size}"
         )
 
-    destination = np.array(arcface_dst, dtype=np.float32, copy=True) * ratio
+    destination = _INSIGHTFACE_ARCFACE_TEMPLATE.copy() * ratio
     destination[:, 0] += diff_x
     return _estimate_similarity_transform_matrix(landmark_array, destination)
 
@@ -2036,7 +1979,6 @@ class AIModels:
             return _estimate_insightface_norm_matrix(
                 landmark=landmark,
                 image_size=int(image_size),
-                arcface_dst=face_align.arcface_dst,
             )
 
         def _norm_crop_opencl(
