@@ -48,6 +48,7 @@
 - OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
+- `/clip/img` 必须支持 **worker 内同尺寸微批**，以提高 Intel Xe GPU 利用率；微批只能发生在相邻任务且不得改变单请求输入输出语义。
 - 当前服务上传读图链不再依赖 `ffmpeg/QSV`；Debian/Linux 容器部署与验收仍以 `/dev/dri` GPU 节点和 OpenVINO/OpenCL 可见性为准，不能把仅有 `/dev/dxg` 视作当前镜像的等价前提。
 - `/clip/img` 视觉链路必须直接消费 `numpy BGR`，禁止 `BGR -> RGB -> PIL` 的多余拷贝链。
 - CLIP 视觉预处理（`resize + 通道转换 + 归一化 + layout`）必须走 OpenVINO PrePostProcessing (PPP) API，禁止回退到手工 `numpy` 链。
@@ -81,9 +82,11 @@
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
+- 默认缓存目录应收敛到仓库内可写路径（当前基线 `<PROJECT_ROOT>/cache/openvino`）；仅在显式设置 `OV_CACHE_DIR` 时覆盖默认值。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
+- 默认应在启动后由单一 owner worker 做一次后台 RapidOCR 预热，把编译/冷加载成本前移，避免多 Worker 首个 OCR 请求直接命中冷启动超时。
 
 ### 3.4 InsightFace
 
@@ -177,8 +180,9 @@
 1. Text-CLIP 作为独立单例服务常驻内存，不参与 OCR / 图像 CLIP / 人脸模型的装卸切换。
 2. `/clip/txt` 不再进入非文本推理队列，也不再依赖“文本优先级/回切窗口”状态机；文本请求始终走独立常驻实例。
 3. 非文本模型（Vision-CLIP / OCR / InsightFace）仍采用队列化串行调度，并在单 worker 内保持“同一时刻一个主模型族”。
-4. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
-5. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+4. `/clip/img` 必须在单 worker 内做“相邻同尺寸请求”的受控微批；若尺寸不一致或队列被其他任务打断，必须立即退回单请求执行。
+5. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
+6. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
 
 ---
 
@@ -307,9 +311,12 @@
 - 收敛上传读图链：`read_image_from_upload` 改为 OpenCV 原生解码，GIF 首帧优先走 `cv2.imdecodeanimation`，并移除 `ffmpeg/ffprobe` 与 `PIL` 运行时依赖。
 - 修复 RapidOCR 后端锁定问题：服务会直接把 `RAPIDOCR_OPENVINO_CONFIG_PATH` 作为 `config_path` 传给 `RapidOCR`，并在初始化后校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=MULTI:GPU,CPU`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
-- 收敛 OpenVINO cache 配置：默认不再显式覆盖 `CACHE_DIR`，仅在显式设置 `OV_CACHE_DIR` 时透传自定义目录，消除 `Non default env value for CACHE_DIR` 噪声日志。
+- 收敛 OpenVINO cache 配置：默认启用仓库内 `cache/openvino` 编译缓存目录，显式设置 `OV_CACHE_DIR` 时覆盖默认值，避免多 Worker 反复冷编译。
 - 修复 InsightFace PPP 预处理输出取值失败：改为 `set_input_tensor + infer + get_output_tensor(0)` 直取输出，并在构建时执行 shape/dtype 自检，避免匿名 `Result` 端口映射异常。
+- 修复 InsightFace OpenCL 对齐补丁兼容性：`norm_crop` 现在兼容 `UMat/ndarray` 输入，并对 `estimate_norm` 返回值执行显式矩阵校验，避免 `warpAffine` 参数类型错误。
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
+- 收敛 `/clip/img` 吞吐路径：视觉请求改为单 worker 内相邻同尺寸微批，维持 PPP 预处理与接口语义不变，同时提升 GPU 利用率。
+- 收敛 OCR 冷启动：Text-CLIP owner worker 会在启动后后台预热一次 RapidOCR，并把默认 `cfg_openvino_cpu.yaml` 的 `performance_hint` 收敛为 `LATENCY`，降低首个 OCR 请求超时风险。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。

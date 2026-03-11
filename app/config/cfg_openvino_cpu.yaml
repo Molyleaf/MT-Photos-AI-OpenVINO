@@ -16,7 +16,7 @@ EngineConfig:
   openvino:
     device_name: "MULTI:GPU,CPU"
     inference_num_threads: -1
-    performance_hint: "THROUGHPUT"
+    performance_hint: "LATENCY"
     performance_num_requests: -1
     enable_cpu_pinning: true
     num_streams: -1

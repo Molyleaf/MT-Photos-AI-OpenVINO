@@ -201,6 +201,13 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_openvino_devices(devices: Any) -> List[str]:
     normalized: List[str] = []
     for item in devices or []:
@@ -321,7 +328,9 @@ def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -
     return result
 
 
-def _as_contiguous_bgr_uint8(image: np.ndarray, context: str) -> np.ndarray:
+def _as_contiguous_bgr_uint8(image: Any, context: str) -> np.ndarray:
+    if isinstance(image, cv2.UMat):
+        image = image.get()
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"{context} expects BGR image with shape (H, W, 3), got {image.shape}")
     if image.dtype != np.uint8:
@@ -468,7 +477,9 @@ class AIModels:
     """
     Heavy models are serialized through a bounded queue inside each worker.
     Text-CLIP stays resident as an independent singleton RPC service and does
-    not participate in heavy-model switching or priority queues.
+    not participate in heavy-model switching or priority queues. CLIP image
+    requests may be micro-batched inside the worker when adjacent uploads
+    share the same spatial shape.
     """
 
     def __init__(self) -> None:
@@ -480,10 +491,11 @@ class AIModels:
         self.qa_clip_path = self.model_base_path / "qa-clip" / "openvino"
 
         cache_dir_raw = str(os.environ.get("OV_CACHE_DIR", "")).strip()
-        self.ov_cache_dir: Optional[Path] = None
         if cache_dir_raw:
             self.ov_cache_dir = Path(cache_dir_raw).expanduser().resolve()
-            self.ov_cache_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.ov_cache_dir = (_PROJECT_ROOT / "cache" / "openvino").resolve()
+        self.ov_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.rapidocr_config_path = Path(
             os.environ.get(
@@ -528,10 +540,16 @@ class AIModels:
         self._clip_vision_request: Optional[ov.InferRequest] = None
         self._clip_vision_input_name: Optional[str] = None
         self._clip_vision_host_input_cache: Dict[
-            Tuple[int, int], Tuple[ov.Tensor, np.ndarray]
+            Tuple[int, int, int], Tuple[ov.Tensor, np.ndarray]
         ] = {}
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
+        self._clip_image_batch_size = max(1, _as_int(os.environ.get("CLIP_IMAGE_BATCH_SIZE"), 4))
+        self._clip_image_batch_wait_seconds = max(
+            0.0,
+            _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
+        )
         self._rapidocr_engine: Optional[RapidOCR] = None
+        self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
         self._face_engine: Optional[FaceAnalysis] = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
@@ -555,13 +573,17 @@ class AIModels:
         )
         self._worker.start()
         self._ensure_text_service_ready(preload=True)
+        self._background_prewarm_thread: Optional[threading.Thread] = None
+        self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s text_service=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s clip_batch=%s/%sms text_service=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
             self._queue_capacity,
+            self._clip_image_batch_size,
+            int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
         )
 
@@ -572,6 +594,47 @@ class AIModels:
             self.core.set_property({"CACHE_DIR": str(self.ov_cache_dir)})
         except Exception as exc:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
+
+    def _start_background_prewarm(self) -> None:
+        if not self._text_service_owner:
+            return
+        if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), True):
+            return
+        self._background_prewarm_thread = threading.Thread(
+            target=self._background_prewarm_loop,
+            name="ai-ocr-prewarm",
+            daemon=True,
+        )
+        self._background_prewarm_thread.start()
+
+    def _background_prewarm_loop(self) -> None:
+        delay_seconds = max(0.0, _as_float(os.environ.get("OCR_PREWARM_DELAY_SECONDS"), 1.0))
+        if delay_seconds > 0.0:
+            time.sleep(delay_seconds)
+        if self._stopping:
+            return
+        with self._condition:
+            if self._normal_queue or self._release_requested:
+                LOG.info("Skip OCR prewarm because inference work is already queued.")
+                return
+        try:
+            started_at = time.monotonic()
+            self._prewarm_ocr_family()
+            LOG.info("RapidOCR background prewarm completed in %.2fs.", time.monotonic() - started_at)
+        except Exception as exc:
+            LOG.warning("RapidOCR background prewarm failed: %s", exc, exc_info=True)
+
+    def _prewarm_ocr_family(self) -> None:
+        with self._model_lock:
+            if self._stopping:
+                return
+            if self._active_family not in (None, "ocr"):
+                self._unload_active_family_locked()
+            if self._rapidocr_engine is None:
+                self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
+            self._active_family = "ocr"
+            self._warmup_rapidocr_locked()
+            self._unload_active_family_locked()
 
     def _init_clip_remote_context(self) -> Optional[Any]:
         clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
@@ -957,6 +1020,9 @@ class AIModels:
                     normal_task = self._normal_queue.popleft()
 
             if normal_task is not None:
+                if normal_task.kind == "clip_img":
+                    self._handle_clip_image_tasks(self._collect_clip_image_batch(normal_task))
+                    continue
                 self._handle_single_task(normal_task)
                 continue
 
@@ -967,13 +1033,6 @@ class AIModels:
 
     def _handle_single_task(self, task: _InferenceTask) -> None:
         try:
-            if task.kind == "clip_img":
-                image, filename = task.payload
-                self._switch_family("vision")
-                result = self._infer_clip_image(image, filename=filename)
-                self._safe_set_result(task.future, result)
-                return
-
             if task.kind == "ocr":
                 self._switch_family("ocr")
                 self._safe_set_result(task.future, self._infer_ocr(task.payload))
@@ -988,6 +1047,47 @@ class AIModels:
         except Exception as exc:
             LOG.error("Task %s failed: %s", task.kind, exc, exc_info=True)
             self._safe_set_exception(task.future, exc)
+
+    def _collect_clip_image_batch(self, first_task: _InferenceTask) -> List[_InferenceTask]:
+        batch = [first_task]
+        if self._clip_image_batch_size <= 1:
+            return batch
+
+        first_image, _ = first_task.payload
+        batch_shape = tuple(np.asarray(first_image).shape[:2])
+        deadline = time.monotonic() + self._clip_image_batch_wait_seconds
+
+        while len(batch) < self._clip_image_batch_size:
+            with self._condition:
+                if not self._normal_queue:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return batch
+                    self._condition.wait(timeout=remaining)
+                    continue
+
+                next_task = self._normal_queue[0]
+                if next_task.kind != "clip_img":
+                    return batch
+                next_image, _ = next_task.payload
+                if tuple(np.asarray(next_image).shape[:2]) != batch_shape:
+                    return batch
+                batch.append(self._normal_queue.popleft())
+        return batch
+
+    def _handle_clip_image_tasks(self, tasks: List[_InferenceTask]) -> None:
+        if not tasks:
+            return
+        try:
+            self._switch_family("vision")
+            payloads = [task.payload for task in tasks]
+            results = self._infer_clip_image_batch(payloads)
+            for task, result in zip(tasks, results):
+                self._safe_set_result(task.future, result)
+        except Exception as exc:
+            LOG.error("Task clip_img failed: %s", exc, exc_info=True)
+            for task in tasks:
+                self._safe_set_exception(task.future, exc)
 
     def _unload_active_family(self) -> None:
         with self._model_lock:
@@ -1021,6 +1121,7 @@ class AIModels:
             self._clip_vision_host_input_cache.clear()
         elif self._active_family == "ocr":
             self._rapidocr_engine = None
+            self._rapidocr_runtime_cfg = None
         elif self._active_family == "face":
             self._face_engine = None
             self._face_det_ppp = None
@@ -1044,6 +1145,7 @@ class AIModels:
         self._clip_vision_input_name = None
         self._clip_vision_host_input_cache.clear()
         self._rapidocr_engine = None
+        self._rapidocr_runtime_cfg = None
         self._face_engine = None
         self._face_det_ppp = None
         self._face_rec_ppp = None
@@ -1093,7 +1195,7 @@ class AIModels:
             )
 
         ppp = ov.preprocess.PrePostProcessor(model)
-        ppp.input().tensor().set_shape([1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
+        ppp.input().tensor().set_shape([-1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
             ov.Layout("NHWC")
         ).set_color_format(ov.preprocess.ColorFormat.BGR)
         # openvino_image_fp16 may have dynamic NCHW input; explicit target size avoids PPP static-shape errors.
@@ -1111,7 +1213,7 @@ class AIModels:
         return ppp.build()
 
     def _get_clip_vision_host_input(
-        self, image_height: int, image_width: int
+        self, batch_size: int, image_height: int, image_width: int
     ) -> Optional[Tuple[ov.Tensor, np.ndarray]]:
         if (
             not self._clip_vision_host_tensor_enabled
@@ -1120,14 +1222,14 @@ class AIModels:
         ):
             return None
 
-        cache_key = (int(image_height), int(image_width))
+        cache_key = (int(batch_size), int(image_height), int(image_width))
         cached = self._clip_vision_host_input_cache.get(cache_key)
         if cached is not None:
             return cached
 
         try:
             input_port = self._clip_vision_model.inputs[0]
-            input_shape = ov.Shape([1, int(image_height), int(image_width), 3])
+            input_shape = ov.Shape([int(batch_size), int(image_height), int(image_width), 3])
             input_tensor = self._clip_remote_context.create_host_tensor(
                 input_port.get_element_type(), input_shape
             )
@@ -1483,14 +1585,33 @@ class AIModels:
         self._validate_rapidocr_backend(engine)
         return engine
 
+    def _warmup_rapidocr_locked(self) -> None:
+        if self._rapidocr_engine is None:
+            raise RuntimeError("RapidOCR model is not loaded.")
+        runtime_cfg = self._rapidocr_runtime_cfg or {}
+        warmup_side = max(
+            64,
+            min(
+                1280,
+                max(
+                    _as_int(runtime_cfg.get("max_side_len"), 960),
+                    _as_int(runtime_cfg.get("det_limit_side_len"), 960),
+                ),
+            ),
+        )
+        warmup_image = np.zeros((warmup_side, warmup_side, 3), dtype=np.uint8)
+        self._infer_ocr(warmup_image)
+
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
+        self._rapidocr_runtime_cfg = dict(config)
         LOG.info(
-            "RapidOCR ready: config=%s device=%s use_cls=%s max_side_len=%s rec_batch_num=%s",
+            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s rec_batch_num=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
+            config.get("performance_hint"),
             config.get("use_cls"),
             config.get("max_side_len"),
             config.get("rec_batch_num"),
@@ -1582,8 +1703,16 @@ class AIModels:
             image_size: int = 112,
             mode: str = "arcface",
         ) -> np.ndarray:
-            matrix = face_align.estimate_norm(landmark, image_size, mode)
-            source = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace alignment")
+            estimated = face_align.estimate_norm(landmark, image_size, mode)
+            if isinstance(estimated, tuple):
+                estimated = estimated[0]
+            matrix = np.asarray(estimated, dtype=np.float32)
+            if matrix.shape != (2, 3):
+                raise RuntimeError(
+                    "InsightFace estimate_norm returned invalid affine matrix shape: "
+                    f"{matrix.shape}"
+                )
+            source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
 
             if not cv2.ocl.useOpenCL():
                 raise RuntimeError(
@@ -1604,8 +1733,11 @@ class AIModels:
                 ) from exc
 
             if isinstance(warped_umat, cv2.UMat):
-                return warped_umat.get()
-            return np.asarray(warped_umat)
+                return _as_contiguous_bgr_uint8(warped_umat.get(), context="InsightFace alignment")
+            return _as_contiguous_bgr_uint8(
+                np.asarray(warped_umat),
+                context="InsightFace alignment",
+            )
 
         face_align.norm_crop = _norm_crop_opencl
         face_align._mt_opencl_norm_crop_patch = True
@@ -1912,34 +2044,57 @@ class AIModels:
         return embeddings.astype(np.float32, copy=False).tolist()
 
     def _infer_clip_image(self, image: np.ndarray, filename: str) -> List[float]:
+        return self._infer_clip_image_batch([(image, filename)])[0]
+
+    def _infer_clip_image_batch(
+        self,
+        items: List[Tuple[np.ndarray, str]],
+    ) -> List[List[float]]:
         if not self._clip_vision_model or not self._clip_vision_request:
             raise RuntimeError("CLIP vision model is not loaded.")
+        if not items:
+            return []
 
-        image_bgr = _as_contiguous_bgr_uint8(image, context="CLIP vision")
-        height, width = image_bgr.shape[:2]
-        host_input = self._get_clip_vision_host_input(height, width)
+        prepared: List[np.ndarray] = []
+        filenames: List[str] = []
+        for image, filename in items:
+            image_bgr = _as_contiguous_bgr_uint8(image, context="CLIP vision")
+            prepared.append(image_bgr)
+            filenames.append(filename)
+
+        first_height, first_width = prepared[0].shape[:2]
+        if any(image.shape[:2] != (first_height, first_width) for image in prepared[1:]):
+            return [self._infer_clip_image(image, filename) for image, filename in items]
+
+        batch = np.stack(prepared, axis=0)
+        host_input = self._get_clip_vision_host_input(len(prepared), first_height, first_width)
 
         if host_input is not None:
             input_tensor, input_view = host_input
-            np.copyto(input_view[0], image_bgr, casting="no")
+            np.copyto(input_view, batch, casting="no")
             self._clip_vision_request.set_input_tensor(0, input_tensor)
             self._clip_vision_request.infer()
-            embedding = np.asarray(self._clip_vision_request.get_output_tensor(0).data).reshape(-1)
+            embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
         else:
             if not self._clip_vision_input_name:
                 raise RuntimeError("CLIP vision input metadata is not initialized.")
             outputs = self._clip_vision_request.infer(
-                {self._clip_vision_input_name: image_bgr[np.newaxis, ...]},
+                {self._clip_vision_input_name: batch},
                 share_inputs=True,
                 share_outputs=True,
             )
-            embedding = np.asarray(outputs[self._clip_vision_model.outputs[0]]).reshape(-1)
-        if embedding.shape[0] != CLIP_EMBEDDING_DIMS:
+            embeddings = np.asarray(outputs[self._clip_vision_model.outputs[0]])
+        if embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+        if embeddings.shape != (len(items), CLIP_EMBEDDING_DIMS):
             raise RuntimeError(
-                f"Invalid image embedding dims for {filename}: "
-                f"expected={CLIP_EMBEDDING_DIMS}, got={embedding.shape[0]}"
+                "Invalid image embedding dims for CLIP vision batch: "
+                f"expected={(len(items), CLIP_EMBEDDING_DIMS)}, got={tuple(embeddings.shape)}"
             )
-        return embedding.astype(np.float32, copy=False).tolist()
+        return [
+            embeddings[index].astype(np.float32, copy=False).tolist()
+            for index, _ in enumerate(filenames)
+        ]
 
     def _infer_ocr(self, image: np.ndarray) -> OCRResult:
         if self._rapidocr_engine is None:
@@ -2053,6 +2208,9 @@ class AIModels:
             self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
 
         self._worker.join()
+        if self._background_prewarm_thread is not None:
+            self._background_prewarm_thread.join(timeout=2.0)
+            self._background_prewarm_thread = None
 
         self._shutdown_text_service()
         with self._model_lock:
