@@ -249,6 +249,7 @@
 
 ## 10. 开发/自检命令（至少执行到可验证）
 
+- 开发机本地验证时，所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。
 - `python -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`

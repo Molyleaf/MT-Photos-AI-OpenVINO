@@ -54,6 +54,7 @@
 
 补充说明：
 
+- 开发机本地验证时，建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。这样可以避免把开发机是否具备 Intel GPU/OpenCL/ORT OpenVINO EP 依赖混进功能验证结果。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
@@ -86,11 +87,11 @@ python -m venv .venv
 
 ```powershell
 $env:API_AUTH_KEY="your_secret_key"
-$env:INFERENCE_DEVICE="AUTO"
-$env:CLIP_INFERENCE_DEVICE="AUTO"
+$env:INFERENCE_DEVICE="CPU"
+$env:CLIP_INFERENCE_DEVICE="CPU"
 $env:CLIP_IMAGE_BATCH="8"
-$env:RAPIDOCR_DEVICE="AUTO"
-$env:INSIGHTFACE_OV_DEVICE="AUTO"
+$env:RAPIDOCR_DEVICE="CPU"
+$env:INSIGHTFACE_OV_DEVICE="CPU"
 ```
 
 4. 启动服务：

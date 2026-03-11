@@ -76,9 +76,6 @@ RUN set -eux; \
     test -f /models/qa-clip/openvino/openvino_image_fp16.bin; \
     test -f /models/qa-clip/openvino/openvino_text_fp16.xml; \
     test -f /models/qa-clip/openvino/openvino_text_fp16.bin; \
-    test -f /models/insightface/models/antelopev2/1k3d68.onnx; \
-    test -f /models/insightface/models/antelopev2/2d106det.onnx; \
-    test -f /models/insightface/models/antelopev2/genderage.onnx; \
     test -f /models/insightface/models/antelopev2/glintr100.onnx; \
     test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx; \
     test -f /models/rapidocr/ch_PP-OCRv5_mobile_det.onnx; \
