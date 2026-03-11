@@ -56,6 +56,7 @@
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 已改为常驻独立实例：不再参与非文本模型的卸载/恢复与插队调度，`/clip/txt` 会通过单例本地 RPC 服务直接复用同一份文本模型。
+- 非文本模型族在首次加载后会保持热态常驻，直到显式调用 `/restart`、`/restart_v2` 或进程关闭；服务不再基于空闲计时自动卸载 OCR / `/clip/img` / InsightFace 模型。
 - `/clip/img` 会在单 worker 内对相邻、同尺寸的图像请求做微批处理，以提高 Intel GPU 吞吐；接口输入输出语义保持不变。
 - `WEB_CONCURRENCY` 只影响 FastAPI worker 数；默认基线为 `1`。若手动放大 worker，Text-CLIP 仍保持单例服务，非文本模型仍建议结合日志观察显存/冷启动时延后再放大。
 - 非文本超时已拆分为“排队超时”和“执行超时”：默认仍保持 `INFERENCE_TASK_TIMEOUT=10` 的排队上限，但执行阶段默认至少给到 `30` 秒，避免模型切族、冷编译或首轮预热直接吃掉排队时间。
@@ -63,6 +64,7 @@
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认会由 Text-CLIP owner worker 在启动后后台预热一次 RapidOCR，尽量把冷编译成本前移，减少多 worker 首次 OCR 请求命中冷加载超时。
+- 后台 RapidOCR 预热完成后，owner worker 会保留已预热的 OCR 模型，直到后续确有其他非文本模型族切换需求，以减少首个真实 OCR 请求再次冷加载。
 - RapidOCR、InsightFace 以及 InsightFace 的 OpenVINO PPP 预处理会把 `AUTO/GPU/GPU_FP16` 等输入归一化为 `MULTI:*` 设备字符串；默认基线为 `MULTI:GPU,CPU`。
 
 ## Windows 本机部署

@@ -319,6 +319,8 @@
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为单 worker 内相邻同尺寸微批，维持 PPP 预处理与接口语义不变，同时提升 GPU 利用率。
 - 收敛 OCR 冷启动：Text-CLIP owner worker 会在启动后后台预热一次 RapidOCR，并把默认 `cfg_openvino_cpu.yaml` 的 `performance_hint` 收敛为 `LATENCY`，降低首个 OCR 请求超时风险。
+- 修复非文本模型族空闲自动卸载回归：worker 不再因队列短暂空闲而释放 OCR / Vision-CLIP / InsightFace，模型仅由 `/restart`、`/restart_v2` 或进程关闭触发释放。
+- 收敛 OpenVINO 同步推理调用：InsightFace PPP runner、RapidOCR OpenVINO patch 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。

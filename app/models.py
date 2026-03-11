@@ -104,11 +104,12 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     # RapidOCR OpenVINO session may expose multi-output det heads; normalize __call__ behavior.
     def _patched_call(self: Any, input_content: np.ndarray) -> Any:
         try:
-            self.session.infer(inputs=[input_content])
-            outputs = getattr(self.session, "model_outputs", [])
-            if len(outputs) > 1:
+            prepared = np.ascontiguousarray(input_content)
+            self.session.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
+            self.session.infer()
+            if int(getattr(self, "_mt_output_count", 1)) > 1:
                 return self.session.get_output_tensor(0).data
-            return self.session.get_output_tensor().data
+            return self.session.get_output_tensor(0).data
         except Exception as exc:
             error_info = traceback.format_exc()
             raise OpenVINOError(error_info) from exc
@@ -119,7 +120,7 @@ def _patch_rapidocr_openvino_multi_output() -> None:
 
 def _patch_rapidocr_openvino_device_selection() -> None:
     try:
-        from rapidocr.inference_engine.openvino.main import Core, OpenVINOInferSession
+        from rapidocr.inference_engine.openvino.main import CPUConfig, Core, OpenVINOInferSession
     except Exception:
         return
 
@@ -144,6 +145,9 @@ def _patch_rapidocr_openvino_device_selection() -> None:
                 f"RapidOCR OpenVINO device={selected_device} requires GPU, "
                 f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
             )
+
+        cpu_config = CPUConfig(engine_cfg)
+        core.set_property("CPU", cpu_config.get_config())
 
         cache_dir = engine_cfg.get("cache_dir")
         if cache_dir not in (None, ""):
@@ -176,6 +180,9 @@ def _patch_rapidocr_openvino_device_selection() -> None:
                 "No silent fallback is allowed."
             ) from exc
 
+        self._mt_core = core
+        self._mt_compiled_model = compiled_model
+        self._mt_output_count = len(compiled_model.outputs)
         self.session = compiled_model.create_infer_request()
         self._mt_device_name = selected_device
 
@@ -449,20 +456,12 @@ class _OpenVinoPreprocessRunner:
     runner_name: str
     input_height: int
     input_width: int
-    input_port: Any
-    output_port: Any
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
         prepared = np.ascontiguousarray(tensor, dtype=np.uint8)
-        outputs = self.request.infer(
-            {self.input_port: prepared},
-            share_inputs=True,
-            share_outputs=True,
-        )
-        try:
-            return np.asarray(outputs[self.output_port])
-        except Exception:
-            return np.asarray(next(iter(outputs.values())))
+        self.request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
+        self.request.infer()
+        return np.asarray(self.request.get_output_tensor(0).data)
 
     def validate(self) -> None:
         sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)
@@ -656,12 +655,15 @@ class AIModels:
             if self._stopping:
                 return
             if self._active_family not in (None, "ocr"):
-                self._unload_active_family_locked()
+                LOG.info(
+                    "Skip OCR prewarm because non-text family %s is already active.",
+                    self._active_family,
+                )
+                return
             if self._rapidocr_engine is None:
                 self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
             self._active_family = "ocr"
             self._warmup_rapidocr_locked()
-            self._unload_active_family_locked()
 
     def _init_clip_remote_context(self) -> Optional[Any]:
         clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
@@ -1063,24 +1065,31 @@ class AIModels:
     def _worker_loop(self) -> None:
         while True:
             normal_task: Optional[_InferenceTask] = None
+            release_active_family = False
 
             with self._condition:
                 while True:
-                    if self._stopping:
+                    if self._stopping or self._normal_queue or self._release_requested:
                         break
-                    if self._normal_queue or self._release_requested:
-                        break
-                    self._condition.wait(timeout=0.25)
+                    self._condition.wait()
 
                 if self._stopping:
                     break
 
                 if self._release_requested and not self._normal_queue:
                     self._release_requested = False
+                    release_active_family = True
                 elif self._normal_queue:
                     normal_task = self._normal_queue.popleft()
                     normal_task.started_at = time.monotonic()
                     normal_task.started_event.set()
+
+            if release_active_family:
+                try:
+                    self._unload_active_family()
+                except Exception as exc:
+                    LOG.error("Failed to release active model family: %s", exc, exc_info=True)
+                continue
 
             if normal_task is not None:
                 if normal_task.kind == "clip_img":
@@ -1088,11 +1097,6 @@ class AIModels:
                     continue
                 self._handle_single_task(normal_task)
                 continue
-
-            try:
-                self._unload_active_family()
-            except Exception as exc:
-                LOG.error("Failed to release active model family: %s", exc, exc_info=True)
 
     def _handle_single_task(self, task: _InferenceTask) -> None:
         try:
@@ -1745,8 +1749,6 @@ class AIModels:
             runner_name=runner_name,
             input_height=int(output_height),
             input_width=int(output_width),
-            input_port=compiled.input(0),
-            output_port=compiled.output(0),
         )
         runner.validate()
         return runner
@@ -2101,7 +2103,6 @@ class AIModels:
 
         input_ids = _tokenize_for_clip(texts, context_length=CONTEXT_LENGTH)
         attention_mask = np.array(input_ids != _PAD_TOKEN_ID, dtype=np.int64)
-        input_name_0, input_name_1 = self._clip_text_input_names
 
         host_tensors = self._get_text_host_tensors(batch_size=input_ids.shape[0])
         if host_tensors is not None:
@@ -2113,15 +2114,16 @@ class AIModels:
             self._clip_text_request.infer()
             embeddings = np.asarray(self._clip_text_request.get_output_tensor(0).data)
         else:
-            outputs = self._clip_text_request.infer(
-                {
-                    input_name_0: input_ids,
-                    input_name_1: attention_mask,
-                },
-                share_inputs=True,
-                share_outputs=True,
+            self._clip_text_request.set_input_tensor(
+                0,
+                ov.Tensor(np.ascontiguousarray(input_ids), shared_memory=True),
             )
-            embeddings = np.asarray(outputs[self._clip_text_model.outputs[0]])
+            self._clip_text_request.set_input_tensor(
+                1,
+                ov.Tensor(np.ascontiguousarray(attention_mask), shared_memory=True),
+            )
+            self._clip_text_request.infer()
+            embeddings = np.asarray(self._clip_text_request.get_output_tensor(0).data)
         if embeddings.ndim == 1:
             embeddings = embeddings.reshape(1, -1)
         if embeddings.shape[-1] != CLIP_EMBEDDING_DIMS:
@@ -2164,17 +2166,15 @@ class AIModels:
             embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
         else:
             if len(prepared) == 1:
-                batch = prepared[0][np.newaxis, ...]
+                batch = np.ascontiguousarray(prepared[0][np.newaxis, ...], dtype=np.uint8)
             else:
-                batch = np.stack(prepared, axis=0)
-            if not self._clip_vision_input_name:
-                raise RuntimeError("CLIP vision input metadata is not initialized.")
-            outputs = self._clip_vision_request.infer(
-                {self._clip_vision_input_name: batch},
-                share_inputs=True,
-                share_outputs=True,
+                batch = np.ascontiguousarray(np.stack(prepared, axis=0), dtype=np.uint8)
+            self._clip_vision_request.set_input_tensor(
+                0,
+                ov.Tensor(batch, shared_memory=True),
             )
-            embeddings = np.asarray(outputs[self._clip_vision_model.outputs[0]])
+            self._clip_vision_request.infer()
+            embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
         if embeddings.ndim == 1:
             embeddings = embeddings.reshape(1, -1)
         if embeddings.shape != (len(items), CLIP_EMBEDDING_DIMS):
