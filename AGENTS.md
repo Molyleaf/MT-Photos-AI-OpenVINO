@@ -110,7 +110,7 @@
   - 鉴权失败：HTTP 401，`detail="Invalid API key"`
   - 鉴权范围：除 `GET /` 外的所有业务端点
 - 生命周期：
-  - 启动时初始化 `AIModels` 并预热加载 Text-CLIP
+- 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
   - 关闭时释放全部模型
 - 当前实现不再基于空闲计时自动释放模型；模型释放仅由 `/restart`、`/restart_v2` 或进程关闭触发。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
@@ -174,16 +174,11 @@
 
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
-1. 待机状态下，Text-CLIP 常驻内存（优化文本请求时延）。
-2. 在收到 `POST /restart` 之后立即释放当前模型；若在统一恢复窗口 `TEXT_MODEL_RESTORE_DELAY_MS`（默认 2000ms）内没收到其它类型请求，才加载 Text-CLIP。防止收到 `POST /restart` 之后立刻加载 Text-CLIP，又收到其它请求导致混乱。
-3. 处理 OCR/图像 CLIP/人脸任务时，卸载 Text-CLIP，加载目标模型。
-4. 同一时刻内存/显存中仅允许一个主模型族常驻（Text-CLIP / Vision-CLIP / OCR / Insightface 互斥）。
-5. 请求并发控制必须采用队列化（或等价可证明正确的串行化调度）。
-6. `/clip/txt` 具备低优先级：
-  - 若当前正在处理其他任务，不抢断当前正在执行的推理；
-  - 当前任务结束后，优先处理排队中的文本 CLIP 请求，再继续后续队列；
-  - 必须正确处理模型切换与资源回收。
-7. 非文本任务结束且队列瞬时为空时，不应立即回切 Text-CLIP；必须等待 `TEXT_MODEL_RESTORE_DELAY_MS` 窗口后再恢复，避免连续单次 `/clip/img` 触发模型频繁重载。
+1. Text-CLIP 作为独立单例服务常驻内存，不参与 OCR / 图像 CLIP / 人脸模型的装卸切换。
+2. `/clip/txt` 不再进入非文本推理队列，也不再依赖“文本优先级/回切窗口”状态机；文本请求始终走独立常驻实例。
+3. 非文本模型（Vision-CLIP / OCR / InsightFace）仍采用队列化串行调度，并在单 worker 内保持“同一时刻一个主模型族”。
+4. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
+5. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
 
 ---
 
@@ -265,7 +260,7 @@
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
 - [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO(MULTI) + PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
-- [ ] 是否遵守“待机常驻 Text-CLIP + 单模型族互斥加载 + 文本请求优先”策略
+- [ ] 是否遵守“Text-CLIP 独立常驻单例 + 非文本单模型族串行切换”策略
 - [ ] 是否采用多进程 Worker + 有界队列 + Worker 内批处理，并规避线程过度订阅
 - [ ] 是否同步更新 `README.md` 与 `requirements.txt`
 
@@ -312,7 +307,9 @@
 - 收敛上传读图链：`read_image_from_upload` 改为 OpenCV 原生解码，GIF 首帧优先走 `cv2.imdecodeanimation`，并移除 `ffmpeg/ffprobe` 与 `PIL` 运行时依赖。
 - 修复 RapidOCR 后端锁定问题：服务会直接把 `RAPIDOCR_OPENVINO_CONFIG_PATH` 作为 `config_path` 传给 `RapidOCR`，并在初始化后校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - 修复 RapidOCR 设备覆盖优先级：显式环境变量（如 `RAPIDOCR_DEVICE=MULTI:GPU,CPU`）优先级高于 `cfg_openvino_cpu.yaml`，避免 YAML 旧值覆盖运行时设置。
-- 收敛 OpenVINO cache 配置：缓存目录只做全局 Core 级设置，不再对每次 `compile_model` 重复传 `CACHE_DIR`，减少运行时重复噪声日志。
+- 收敛 OpenVINO cache 配置：默认不再显式覆盖 `CACHE_DIR`，仅在显式设置 `OV_CACHE_DIR` 时透传自定义目录，消除 `Non default env value for CACHE_DIR` 噪声日志。
+- 修复 InsightFace PPP 预处理输出取值失败：改为 `set_input_tensor + infer + get_output_tensor(0)` 直取输出，并在构建时执行 shape/dtype 自检，避免匿名 `Result` 端口映射异常。
+- 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
@@ -337,11 +334,9 @@ services:
       - RAPIDOCR_DEVICE=MULTI:GPU,CPU
       - INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU
       - OPENCV_OPENCL_DEVICE=Intel:GPU:0
-      - OV_CACHE_DIR=/models/cache/openvino
-      - WEB_CONCURRENCY=2
+      - WEB_CONCURRENCY=1
       - INFERENCE_QUEUE_MAX_SIZE=64
-      - TEXT_CLIP_BATCH_SIZE=8
-      - TEXT_MODEL_RESTORE_DELAY_MS=2000
+      - INFERENCE_TASK_TIMEOUT=10
 ```
 
 说明：

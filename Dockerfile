@@ -14,7 +14,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     INFERENCE_DEVICE=AUTO \
     WEB_CONCURRENCY=1 \
-    OV_CACHE_DIR=/models/cache/openvino \
     RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
     RAPIDOCR_MODEL_DIR=/models/rapidocr
 
@@ -93,4 +92,4 @@ EXPOSE 8060
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8060/', timeout=3)" || exit 1
 
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port 8060 --workers ${WEB_CONCURRENCY:-2}"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port 8060 --workers ${WEB_CONCURRENCY:-1}"]

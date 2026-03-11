@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
@@ -72,7 +73,6 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
             detail="Invalid API key",
         )
 
-TEXT_MODEL_RESTORE_DELAY_MS = ai_models.TEXT_MODEL_RESTORE_DELAY_MS
 models_instance: Optional[ai_models.AIModels] = None
 MAX_IMAGE_SIDE = 10000
 
@@ -162,7 +162,7 @@ def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Opti
 async def lifespan(app: FastAPI):
     global models_instance
     _startup_self_check_dri()
-    logging.info("应用启动：初始化 AIModels 实例并预热加载 Text CLIP 模型。")
+    logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务。")
     models_instance = ai_models.AIModels()
     try:
         await models_instance.ensure_clip_text_model_loaded_async()
@@ -262,10 +262,7 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
-    logging.info(
-        "收到 /restart 请求，正在释放模型。Text-CLIP 将在无其它任务 %sms 后恢复。",
-        TEXT_MODEL_RESTORE_DELAY_MS,
-    )
+    logging.info("收到 /restart 请求，正在释放当前非文本模型。常驻 Text-CLIP 保持可用。")
     if models_instance:
         if (
             hasattr(models_instance, "release_models_for_restart")
@@ -368,7 +365,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
     log_level = os.environ.get("LOG_LEVEL", "warning").lower()
-    workers = int(os.environ.get("WEB_CONCURRENCY", 2))
+    workers = int(os.environ.get("WEB_CONCURRENCY", 1))
 
     uvicorn.run(
         "server:app",

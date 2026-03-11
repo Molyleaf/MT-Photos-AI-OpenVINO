@@ -1,9 +1,12 @@
 import asyncio
 import gc
 import inspect
+import json
 import logging
 import os
 import shutil
+import socket
+import socketserver
 import sys
 import threading
 import time
@@ -13,7 +16,7 @@ from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -53,8 +56,7 @@ _CLS_TOKEN_ID = int(_TOKENIZER.vocab["[CLS]"])
 _SEP_TOKEN_ID = int(_TOKENIZER.vocab["[SEP]"])
 
 QUEUE_MAX_SIZE = int(os.environ.get("INFERENCE_QUEUE_MAX_SIZE", "64"))
-TEXT_BATCH_SIZE = int(os.environ.get("TEXT_CLIP_BATCH_SIZE", "8"))
-TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "120"))
+TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "10"))
 RAPIDOCR_V5_MOBILE_DET_FILE = "ch_PP-OCRv5_mobile_det.onnx"
 RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
 RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
@@ -62,6 +64,18 @@ RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
 LOG = logging.getLogger(__name__)
 _DEFAULT_NON_TEXT_OV_DEVICE = "MULTI:GPU,CPU"
+_PROCESS_LOCK_POLL_SECONDS = 0.05
+_TEXT_RPC_HOST = "127.0.0.1"
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt  # type: ignore[attr-defined]
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 _CONFIGURED_MODEL_NAME = os.environ.get("MODEL_NAME")
 if _CONFIGURED_MODEL_NAME and _CONFIGURED_MODEL_NAME != MODEL_NAME:
@@ -290,18 +304,6 @@ def _normalize_non_text_openvino_device(device_expr: str) -> str:
 
     return f"MULTI:{','.join(normalized_tokens)}"
 
-
-TEXT_MODEL_RESTORE_DELAY_MS = max(
-    0,
-    _as_int(
-        os.environ.get(
-            "TEXT_MODEL_RESTORE_DELAY_MS",
-            os.environ.get("RESTART_TEXT_RESTORE_DELAY_MS", "2000"),
-        ),
-        2000,
-    ),
-)
-
 def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -> np.ndarray:
     if context_length < 2:
         raise ValueError("context_length must be >= 2")
@@ -341,23 +343,117 @@ def _to_channel_triplet(value: Any) -> List[float]:
     return [scalar, scalar, scalar]
 
 
+def _is_lock_contention_error(exc: OSError) -> bool:
+    if isinstance(exc, (BlockingIOError, PermissionError)):
+        return True
+    if getattr(exc, "errno", None) in {11, 13}:
+        return True
+    if getattr(exc, "winerror", None) in {33, 36}:
+        return True
+    return False
+
+
+class _InterProcessFileLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: Optional[Any] = None
+
+    def acquire(self, timeout: Optional[float], blocking: bool = True) -> bool:
+        if self._handle is not None:
+            return True
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        if handle.tell() == 0 and self.path.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                self._try_lock(handle)
+                self._handle = handle
+                return True
+            except OSError as exc:
+                if not _is_lock_contention_error(exc):
+                    handle.close()
+                    raise
+                if not blocking:
+                    handle.close()
+                    return False
+                if deadline is not None and time.monotonic() >= deadline:
+                    handle.close()
+                    return False
+                time.sleep(_PROCESS_LOCK_POLL_SECONDS)
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+
+        try:
+            if os.name == "nt":
+                if msvcrt is None:
+                    raise RuntimeError("msvcrt is required for Windows file locking.")
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                if fcntl is None:
+                    raise RuntimeError("fcntl is required for POSIX file locking.")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._handle = None
+
+    @staticmethod
+    def _try_lock(handle: Any) -> None:
+        if os.name == "nt":
+            if msvcrt is None:
+                raise RuntimeError("msvcrt is required for Windows file locking.")
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+
+        if fcntl is None:
+            raise RuntimeError("fcntl is required for POSIX file locking.")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 @dataclass(slots=True)
 class _OpenVinoPreprocessRunner:
     compiled_model: ov.CompiledModel
     request: ov.InferRequest
-    input_name: str
-    output_port: Any
+    runner_name: str
+    input_height: int
+    input_width: int
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
-        outputs = self.request.infer(
-            {self.input_name: tensor},
-            share_inputs=True,
-            share_outputs=True,
-        )
-        return np.asarray(outputs[self.output_port])
+        prepared = np.ascontiguousarray(tensor)
+        self.request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
+        self.request.infer()
+        return np.asarray(self.request.get_output_tensor(0).data)
+
+    def validate(self) -> None:
+        sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)
+        output = self.run(sample)
+        expected_shape = (1, 3, self.input_height, self.input_width)
+        if tuple(output.shape) != expected_shape:
+            raise RuntimeError(
+                f"{self.runner_name} PPP output shape mismatch: "
+                f"expected={expected_shape} got={tuple(output.shape)}"
+            )
+        if output.dtype != np.float32:
+            raise RuntimeError(
+                f"{self.runner_name} PPP output dtype mismatch: expected=float32 got={output.dtype}"
+            )
 
 
-TaskType = Literal["clip_txt", "clip_img", "ocr", "face", "warmup_text"]
+class _TextClipRpcServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+TaskType = Literal["clip_img", "ocr", "face"]
 
 
 @dataclass(slots=True)
@@ -370,10 +466,9 @@ class _InferenceTask:
 
 class AIModels:
     """
-    Single-worker scheduler with bounded queues.
-    - Text CLIP queue has higher priority.
-    - Text CLIP tasks are micro-batched inside each worker.
-    - Exactly one model family remains resident at a time.
+    Heavy models are serialized through a bounded queue inside each worker.
+    Text-CLIP stays resident as an independent singleton RPC service and does
+    not participate in heavy-model switching or priority queues.
     """
 
     def __init__(self) -> None:
@@ -384,10 +479,11 @@ class AIModels:
         self.insightface_model_root = self.insightface_root / "models"
         self.qa_clip_path = self.model_base_path / "qa-clip" / "openvino"
 
-        self.ov_cache_dir = Path(
-            os.environ.get("OV_CACHE_DIR", str(_PROJECT_ROOT / "cache" / "openvino"))
-        )
-        self.ov_cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir_raw = str(os.environ.get("OV_CACHE_DIR", "")).strip()
+        self.ov_cache_dir: Optional[Path] = None
+        if cache_dir_raw:
+            self.ov_cache_dir = Path(cache_dir_raw).expanduser().resolve()
+            self.ov_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.rapidocr_config_path = Path(
             os.environ.get(
@@ -417,6 +513,17 @@ class AIModels:
             int, Tuple[ov.Tensor, np.ndarray, ov.Tensor, np.ndarray]
         ] = {}
         self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
+        self._clip_text_lock = threading.Lock()
+        self._runtime_state_dir = (_PROJECT_ROOT / "cache" / "runtime").resolve()
+        self._runtime_state_dir.mkdir(parents=True, exist_ok=True)
+        self._text_service_meta_path = self._runtime_state_dir / "text-clip-service.json"
+        self._text_service_lock = _InterProcessFileLock(
+            self._runtime_state_dir / "text-clip-service.lock"
+        )
+        self._text_service_owner = False
+        self._text_service_server: Optional[_TextClipRpcServer] = None
+        self._text_service_thread: Optional[threading.Thread] = None
+        self._text_service_port: Optional[int] = None
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
         self._clip_vision_input_name: Optional[str] = None
@@ -428,16 +535,17 @@ class AIModels:
         self._face_engine: Optional[FaceAnalysis] = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        self._family_load_locks = {
+            family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
+            for family in ("vision", "ocr", "face")
+        }
 
         self._condition = threading.Condition()
-        self._text_queue: Deque[_InferenceTask] = deque()
         self._normal_queue: Deque[_InferenceTask] = deque()
         self._queue_capacity = max(1, QUEUE_MAX_SIZE)
-        self._text_batch_size = max(1, TEXT_BATCH_SIZE)
         self._task_timeout_seconds = max(1, TASK_TIMEOUT_SECONDS)
-        self._text_restore_delay_seconds = TEXT_MODEL_RESTORE_DELAY_MS / 1000.0
+        self._load_lock_timeout_seconds = max(30.0, float(self._task_timeout_seconds))
         self._release_requested = False
-        self._deferred_text_restore_deadline: Optional[float] = None
         self._stopping = False
 
         self._worker = threading.Thread(
@@ -446,18 +554,20 @@ class AIModels:
             daemon=True,
         )
         self._worker.start()
+        self._ensure_text_service_ready(preload=True)
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s text_batch=%s text_restore_delay_ms=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s text_service=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
-            self.ov_cache_dir,
+            self.ov_cache_dir or "default",
             self._queue_capacity,
-            self._text_batch_size,
-            TEXT_MODEL_RESTORE_DELAY_MS,
+            "owner" if self._text_service_owner else "client",
         )
 
     def _configure_openvino_cache(self) -> None:
+        if self.ov_cache_dir is None:
+            return
         try:
             self.core.set_property({"CACHE_DIR": str(self.ov_cache_dir)})
         except Exception as exc:
@@ -548,9 +658,9 @@ class AIModels:
         ) from last_exc
 
     def _queue_size_locked(self) -> int:
-        return len(self._text_queue) + len(self._normal_queue)
+        return len(self._normal_queue)
 
-    def _submit_task(self, kind: TaskType, payload: Any, text_priority: bool) -> Future:
+    def _submit_task(self, kind: TaskType, payload: Any) -> Future:
         future: Future = Future()
         task = _InferenceTask(kind=kind, payload=payload, future=future, created_at=time.time())
         with self._condition:
@@ -562,18 +672,7 @@ class AIModels:
                     RuntimeError(f"推理队列已满（上限 {self._queue_capacity}），请稍后重试")
                 )
                 return future
-            if (
-                kind in {"clip_img", "ocr", "face"}
-                and self._deferred_text_restore_deadline is not None
-            ):
-                self._deferred_text_restore_deadline = None
-                LOG.debug(
-                    "Deferred text restore was cancelled by incoming %s task.", kind
-                )
-            if text_priority:
-                self._text_queue.append(task)
-            else:
-                self._normal_queue.append(task)
+            self._normal_queue.append(task)
             self._condition.notify()
         return future
 
@@ -604,138 +703,267 @@ class AIModels:
         if not future.done():
             future.set_exception(exc)
 
+    def _load_family_with_process_lock(
+        self, family: Literal["vision", "ocr", "face"], loader: Callable[[], None]
+    ) -> None:
+        lock = self._family_load_locks[family]
+        started_at = time.monotonic()
+        acquired = lock.acquire(timeout=self._load_lock_timeout_seconds, blocking=True)
+        if not acquired:
+            raise RuntimeError(
+                f"{family} 模型加载等待跨进程锁超时（>{self._load_lock_timeout_seconds:.0f}s）"
+            )
+        try:
+            waited = time.monotonic() - started_at
+            if waited >= 0.25:
+                LOG.info(
+                    "Waited %.2fs for %s model load lock in pid=%s.",
+                    waited,
+                    family,
+                    os.getpid(),
+                )
+            loader()
+        finally:
+            lock.release()
+
+    def _read_text_service_meta(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = json.loads(self._text_service_meta_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            LOG.warning("Failed to read Text-CLIP service metadata: %s", exc)
+            return None
+        if not isinstance(raw, dict):
+            return None
+        return raw
+
+    def _write_text_service_meta(self, port: int) -> None:
+        payload = {"port": int(port), "pid": os.getpid()}
+        self._text_service_meta_path.write_text(
+            json.dumps(payload, ensure_ascii=True),
+            encoding="utf-8",
+        )
+
+    def _probe_text_service(self, port: int, timeout_seconds: float = 0.5) -> bool:
+        try:
+            with socket.create_connection((_TEXT_RPC_HOST, int(port)), timeout=timeout_seconds) as conn:
+                request = {"op": "ping"}
+                conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
+                conn.shutdown(socket.SHUT_WR)
+                response_line = b""
+                while not response_line.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    response_line += chunk
+        except OSError:
+            return False
+
+        if not response_line:
+            return False
+        try:
+            response = json.loads(response_line.decode("utf-8"))
+        except Exception:
+            return False
+        return response.get("ok") is True
+
+    def _load_text_model_once_locked(self) -> None:
+        if self._clip_text_model is not None and self._clip_text_request is not None:
+            return
+        self._load_clip_text_locked()
+
+    def _load_text_model_once(self) -> None:
+        with self._clip_text_lock:
+            self._load_text_model_once_locked()
+
+    def _start_text_service_locked(self) -> None:
+        if self._text_service_server is not None and self._text_service_thread is not None:
+            return
+
+        self._load_text_model_once_locked()
+        parent = self
+
+        class _TextClipRequestHandler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                try:
+                    request_line = self.rfile.readline()
+                    if not request_line:
+                        return
+                    request = json.loads(request_line.decode("utf-8"))
+                    op = str(request.get("op", "")).strip().lower()
+                    if op == "ping":
+                        response = {"ok": True}
+                    elif op == "embed":
+                        text = str(request.get("text", ""))
+                        response = {"result": parent._infer_text_locally(text)}
+                    else:
+                        response = {"error": f"Unsupported op: {op or 'missing'}"}
+                except Exception as exc:
+                    response = {"error": str(exc)}
+                self.wfile.write((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
+
+        server = _TextClipRpcServer((_TEXT_RPC_HOST, 0), _TextClipRequestHandler)
+        self._text_service_server = server
+        self._text_service_port = int(server.server_address[1])
+        self._write_text_service_meta(self._text_service_port)
+        self._text_service_thread = threading.Thread(
+            target=server.serve_forever,
+            name="text-clip-rpc",
+            daemon=True,
+        )
+        self._text_service_thread.start()
+        LOG.info(
+            "Text-CLIP RPC service started on %s:%s in pid=%s.",
+            _TEXT_RPC_HOST,
+            self._text_service_port,
+            os.getpid(),
+        )
+
+    def _ensure_text_service_ready(self, preload: bool) -> None:
+        if self._text_service_owner and self._text_service_port is not None:
+            if preload:
+                self._load_text_model_once()
+            return
+
+        metadata = self._read_text_service_meta()
+        if metadata is not None:
+            candidate_port = int(metadata.get("port", 0) or 0)
+            if candidate_port > 0 and self._probe_text_service(candidate_port):
+                self._text_service_port = candidate_port
+                return
+
+        acquired = self._text_service_lock.acquire(timeout=0.0, blocking=False)
+        if not acquired:
+            deadline = time.monotonic() + max(3.0, float(self._task_timeout_seconds))
+            while time.monotonic() < deadline:
+                metadata = self._read_text_service_meta()
+                if metadata is not None:
+                    candidate_port = int(metadata.get("port", 0) or 0)
+                    if candidate_port > 0 and self._probe_text_service(candidate_port):
+                        self._text_service_port = candidate_port
+                        return
+                time.sleep(_PROCESS_LOCK_POLL_SECONDS)
+            raise RuntimeError("Text-CLIP RPC service is unavailable.")
+
+        self._text_service_owner = True
+        try:
+            metadata = self._read_text_service_meta()
+            if metadata is not None:
+                candidate_port = int(metadata.get("port", 0) or 0)
+                if candidate_port > 0 and self._probe_text_service(candidate_port):
+                    self._text_service_port = candidate_port
+                    return
+            self._start_text_service_locked()
+        except Exception:
+            self._text_service_owner = False
+            self._text_service_lock.release()
+            raise
+
+    def _infer_text_locally(self, text: str) -> List[float]:
+        with self._clip_text_lock:
+            self._load_text_model_once_locked()
+            return self._infer_clip_text_batch([text])[0]
+
+    def _request_text_embedding_remote(self, text: str) -> List[float]:
+        self._ensure_text_service_ready(preload=False)
+        if self._text_service_owner:
+            return self._infer_text_locally(text)
+        if self._text_service_port is None:
+            raise RuntimeError("Text-CLIP RPC service port is unavailable.")
+
+        response_line = b""
+        try:
+            with socket.create_connection(
+                (_TEXT_RPC_HOST, self._text_service_port),
+                timeout=max(1.0, float(self._task_timeout_seconds)),
+            ) as conn:
+                request = {"op": "embed", "text": text}
+                conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
+                conn.shutdown(socket.SHUT_WR)
+                while not response_line.endswith(b"\n"):
+                    chunk = conn.recv(16384)
+                    if not chunk:
+                        break
+                    response_line += chunk
+        except OSError:
+            self._text_service_port = None
+            self._ensure_text_service_ready(preload=False)
+            if self._text_service_owner:
+                return self._infer_text_locally(text)
+            if self._text_service_port is None:
+                raise RuntimeError("Text-CLIP RPC service port is unavailable.")
+            response_line = b""
+            with socket.create_connection(
+                (_TEXT_RPC_HOST, self._text_service_port),
+                timeout=max(1.0, float(self._task_timeout_seconds)),
+            ) as conn:
+                request = {"op": "embed", "text": text}
+                conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
+                conn.shutdown(socket.SHUT_WR)
+                while not response_line.endswith(b"\n"):
+                    chunk = conn.recv(16384)
+                    if not chunk:
+                        break
+                    response_line += chunk
+
+        if not response_line:
+            raise RuntimeError("Text-CLIP RPC service returned empty response.")
+        response = json.loads(response_line.decode("utf-8"))
+        if "error" in response:
+            raise RuntimeError(str(response["error"]))
+        result = response.get("result")
+        if not isinstance(result, list):
+            raise RuntimeError("Text-CLIP RPC service returned invalid payload.")
+        return [float(item) for item in result]
+
+    def _shutdown_text_service(self) -> None:
+        if self._text_service_server is not None:
+            self._text_service_server.shutdown()
+            self._text_service_server.server_close()
+            self._text_service_server = None
+        if self._text_service_thread is not None:
+            self._text_service_thread.join(timeout=2.0)
+            self._text_service_thread = None
+        if self._text_service_owner:
+            self._text_service_lock.release()
+            self._text_service_owner = False
+        if self._text_service_meta_path.exists():
+            metadata = self._read_text_service_meta()
+            if metadata is not None and int(metadata.get("pid", -1)) == os.getpid():
+                try:
+                    self._text_service_meta_path.unlink()
+                except OSError:
+                    pass
+
     def _worker_loop(self) -> None:
         while True:
-            maintenance_action: Optional[str] = None
-            text_batch: List[_InferenceTask] = []
             normal_task: Optional[_InferenceTask] = None
 
             with self._condition:
                 while True:
                     if self._stopping:
                         break
-
-                    has_pending_tasks = bool(self._text_queue or self._normal_queue)
-                    if has_pending_tasks or self._release_requested:
+                    if self._normal_queue or self._release_requested:
                         break
-
-                    if self._deferred_text_restore_deadline is None:
-                        self._condition.wait(timeout=0.25)
-                        continue
-
-                    remaining = self._deferred_text_restore_deadline - time.time()
-                    if remaining <= 0:
-                        break
-                    self._condition.wait(timeout=min(0.25, remaining))
+                    self._condition.wait(timeout=0.25)
 
                 if self._stopping:
                     break
 
-                now = time.time()
-                if (
-                    self._release_requested
-                    and not self._text_queue
-                    and not self._normal_queue
-                ):
+                if self._release_requested and not self._normal_queue:
                     self._release_requested = False
-                    maintenance_action = "release_only"
-                    if (
-                        self._deferred_text_restore_deadline is not None
-                        and self._deferred_text_restore_deadline <= now
-                    ):
-                        self._deferred_text_restore_deadline = None
-                        maintenance_action = "release_and_restore_text"
-                elif (
-                    not self._text_queue
-                    and not self._normal_queue
-                    and self._deferred_text_restore_deadline is not None
-                    and self._deferred_text_restore_deadline <= now
-                ):
-                    self._deferred_text_restore_deadline = None
-                    maintenance_action = "restore_text"
-                elif self._text_queue:
-                    text_batch.append(self._text_queue.popleft())
-                    while self._text_queue and len(text_batch) < self._text_batch_size:
-                        text_batch.append(self._text_queue.popleft())
                 elif self._normal_queue:
                     normal_task = self._normal_queue.popleft()
 
-            if maintenance_action == "release_only":
-                try:
-                    self._unload_active_family()
-                except Exception as exc:
-                    LOG.error("Failed to release active model family: %s", exc, exc_info=True)
-                continue
-
-            if maintenance_action == "release_and_restore_text":
-                try:
-                    self._unload_active_family()
-                    self._switch_family("text")
-                except Exception as exc:
-                    LOG.error("Failed to complete idle release maintenance: %s", exc, exc_info=True)
-                continue
-
-            if maintenance_action == "restore_text":
-                try:
-                    self._switch_family("text")
-                except Exception as exc:
-                    LOG.error("Failed to restore text model after defer window: %s", exc, exc_info=True)
-                continue
-
-            if text_batch:
-                self._handle_text_batch(text_batch)
-                self._return_to_text_if_idle()
-                continue
-
             if normal_task is not None:
                 self._handle_single_task(normal_task)
-                self._return_to_text_if_idle()
+                continue
 
-    def _return_to_text_if_idle(self) -> None:
-        restore_immediately = False
-        with self._condition:
-            if self._stopping or self._release_requested:
-                return
-            if self._text_queue or self._normal_queue:
-                return
-            if self._active_family == "text":
-                self._deferred_text_restore_deadline = None
-                return
-            if self._deferred_text_restore_deadline is not None:
-                return
-            if self._text_restore_delay_seconds <= 0:
-                restore_immediately = True
-            else:
-                self._deferred_text_restore_deadline = (
-                    time.time() + self._text_restore_delay_seconds
-                )
-                self._condition.notify()
-
-        if restore_immediately:
             try:
-                self._switch_family("text")
+                self._unload_active_family()
             except Exception as exc:
-                LOG.error("Failed to restore text model while idle: %s", exc, exc_info=True)
-
-    def _handle_text_batch(self, tasks: List[_InferenceTask]) -> None:
-        try:
-            texts: List[str] = []
-            for task in tasks:
-                if task.kind != "clip_txt":
-                    raise RuntimeError(f"Invalid text batch task kind: {task.kind}")
-                texts.append(str(task.payload))
-            self._switch_family("text")
-            embeddings = self._infer_clip_text_batch(texts)
-            if len(embeddings) != len(tasks):
-                raise RuntimeError(
-                    f"Text batch output mismatch: expected={len(tasks)} got={len(embeddings)}"
-                )
-            for index, task in enumerate(tasks):
-                self._safe_set_result(task.future, embeddings[index])
-        except Exception as exc:
-            LOG.error("Text batch inference failed: %s", exc, exc_info=True)
-            for task in tasks:
-                self._safe_set_exception(task.future, exc)
+                LOG.error("Failed to release active model family: %s", exc, exc_info=True)
 
     def _handle_single_task(self, task: _InferenceTask) -> None:
         try:
@@ -756,11 +984,6 @@ class AIModels:
                 self._safe_set_result(task.future, self._infer_face(task.payload))
                 return
 
-            if task.kind == "warmup_text":
-                self._switch_family("text")
-                self._safe_set_result(task.future, True)
-                return
-
             raise RuntimeError(f"Unsupported task kind: {task.kind}")
         except Exception as exc:
             LOG.error("Task %s failed: %s", task.kind, exc, exc_info=True)
@@ -779,26 +1002,19 @@ class AIModels:
 
             self._unload_active_family_locked()
 
-            if target_family == "text":
-                self._load_clip_text_locked()
-            elif target_family == "vision":
-                self._load_clip_vision_locked()
+            if target_family == "vision":
+                self._load_family_with_process_lock("vision", self._load_clip_vision_locked)
             elif target_family == "ocr":
-                self._load_rapidocr_locked()
+                self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
             elif target_family == "face":
-                self._load_face_locked()
+                self._load_family_with_process_lock("face", self._load_face_locked)
             else:
                 raise RuntimeError(f"Unsupported model family: {target_family}")
 
             self._active_family = target_family
 
     def _unload_active_family_locked(self) -> None:
-        if self._active_family == "text":
-            self._clip_text_request = None
-            self._clip_text_model = None
-            self._clip_text_input_names = None
-            self._clip_text_host_input_cache.clear()
-        elif self._active_family == "vision":
+        if self._active_family == "vision":
             self._clip_vision_request = None
             self._clip_vision_model = None
             self._clip_vision_input_name = None
@@ -813,11 +1029,16 @@ class AIModels:
         self._active_family = None
         gc.collect()
 
-    def _unload_everything_locked(self) -> None:
+    def _unload_text_model_locked(self) -> None:
         self._clip_text_request = None
         self._clip_text_model = None
         self._clip_text_input_names = None
         self._clip_text_host_input_cache.clear()
+        self._text_service_port = None
+        gc.collect()
+
+    def _unload_everything_locked(self) -> None:
+        self._unload_text_model_locked()
         self._clip_vision_request = None
         self._clip_vision_model = None
         self._clip_vision_input_name = None
@@ -1146,7 +1367,8 @@ class AIModels:
         config["device_name"] = _normalize_non_text_openvino_device(
             config.get("device_name", _DEFAULT_NON_TEXT_OV_DEVICE)
         )
-        config["cache_dir"] = str(self.ov_cache_dir)
+        if self.ov_cache_dir is not None:
+            config["cache_dir"] = str(self.ov_cache_dir)
 
         available_devices = [str(item).upper() for item in self.core.available_devices]
         requires_gpu = "GPU" in str(config["device_name"]).upper()
@@ -1203,13 +1425,15 @@ class AIModels:
             "EngineConfig.openvino.scheduling_core_type": str(
                 cfg.get("scheduling_core_type", "ANY_CORE")
             ),
-            "EngineConfig.openvino.cache_dir": str(cfg.get("cache_dir", self.ov_cache_dir)),
             "Global.use_cls": _as_bool(cfg.get("use_cls"), True),
             "Global.max_side_len": _as_int(cfg.get("max_side_len"), 960),
             "Det.limit_side_len": _as_int(cfg.get("det_limit_side_len"), 960),
             "Rec.rec_batch_num": max(1, _as_int(cfg.get("rec_batch_num"), 6)),
             "Cls.cls_batch_num": max(1, _as_int(cfg.get("cls_batch_num"), 6)),
         }
+        cache_dir = cfg.get("cache_dir")
+        if cache_dir not in (None, ""):
+            params["EngineConfig.openvino.cache_dir"] = str(cache_dir)
         if cfg.get("performance_hint") not in (None, ""):
             params["EngineConfig.openvino.performance_hint"] = str(
                 cfg.get("performance_hint", "LATENCY")
@@ -1309,12 +1533,15 @@ class AIModels:
                 "PERFORMANCE_HINT": "LATENCY",
             },
         )
-        return _OpenVinoPreprocessRunner(
+        runner = _OpenVinoPreprocessRunner(
             compiled_model=compiled,
             request=compiled.create_infer_request(),
-            input_name=compiled.inputs[0].any_name,
-            output_port=compiled.outputs[0],
+            runner_name=runner_name,
+            input_height=int(output_height),
+            input_width=int(output_width),
         )
+        runner.validate()
+        return runner
 
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:
@@ -1639,6 +1866,9 @@ class AIModels:
                 root_for_runtime,
             )
         except Exception as exc:
+            self._face_engine = None
+            self._face_det_ppp = None
+            self._face_rec_ppp = None
             raise RuntimeError(
                 "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL alignment. "
                 "No silent fallback is allowed."
@@ -1791,31 +2021,23 @@ class AIModels:
         return results
 
     def ensure_clip_text_model_loaded(self) -> None:
-        future = self._submit_task(kind="warmup_text", payload=None, text_priority=False)
-        self._wait_future(future)
+        self._ensure_text_service_ready(preload=True)
 
     async def ensure_clip_text_model_loaded_async(self) -> None:
-        future = self._submit_task(kind="warmup_text", payload=None, text_priority=False)
-        await self._await_future(future)
+        await asyncio.to_thread(self.ensure_clip_text_model_loaded)
 
     def release_models(self) -> None:
-        self._schedule_release(text_restore_delay_seconds=0.0)
+        self._schedule_release()
 
     def release_models_for_restart(self, text_restore_delay_seconds: Optional[float] = None) -> None:
-        restore_delay_seconds = (
-            self._text_restore_delay_seconds
-            if text_restore_delay_seconds is None
-            else max(0.0, float(text_restore_delay_seconds))
-        )
-        self._schedule_release(text_restore_delay_seconds=restore_delay_seconds)
+        _ = text_restore_delay_seconds
+        self._schedule_release()
 
-    def _schedule_release(self, text_restore_delay_seconds: float) -> None:
-        delay_seconds = max(0.0, float(text_restore_delay_seconds))
+    def _schedule_release(self) -> None:
         with self._condition:
             if self._stopping:
                 return
             self._release_requested = True
-            self._deferred_text_restore_deadline = time.time() + delay_seconds
             self._condition.notify()
 
     def release_all_models(self) -> None:
@@ -1823,8 +2045,7 @@ class AIModels:
             if self._stopping:
                 return
             self._stopping = True
-            pending_tasks = list(self._text_queue) + list(self._normal_queue)
-            self._text_queue.clear()
+            pending_tasks = list(self._normal_queue)
             self._normal_queue.clear()
             self._condition.notify_all()
 
@@ -1833,42 +2054,41 @@ class AIModels:
 
         self._worker.join()
 
+        self._shutdown_text_service()
         with self._model_lock:
             self._unload_everything_locked()
         LOG.info("All models released.")
 
     def get_text_embedding(self, text: str) -> List[float]:
-        future = self._submit_task(kind="clip_txt", payload=text, text_priority=True)
-        return self._wait_future(future)
+        return self._request_text_embedding_remote(text)
 
     async def get_text_embedding_async(self, text: str) -> List[float]:
-        future = self._submit_task(kind="clip_txt", payload=text, text_priority=True)
-        return await self._await_future(future)
+        return await asyncio.to_thread(self.get_text_embedding, text)
 
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         payload = (image, filename)
-        future = self._submit_task(kind="clip_img", payload=payload, text_priority=False)
+        future = self._submit_task(kind="clip_img", payload=payload)
         return self._wait_future(future)
 
     async def get_image_embedding_async(
         self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
         payload = (image, filename)
-        future = self._submit_task(kind="clip_img", payload=payload, text_priority=False)
+        future = self._submit_task(kind="clip_img", payload=payload)
         return await self._await_future(future)
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        future = self._submit_task(kind="ocr", payload=image, text_priority=False)
+        future = self._submit_task(kind="ocr", payload=image)
         return self._wait_future(future)
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        future = self._submit_task(kind="ocr", payload=image, text_priority=False)
+        future = self._submit_task(kind="ocr", payload=image)
         return await self._await_future(future)
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        future = self._submit_task(kind="face", payload=image, text_priority=False)
+        future = self._submit_task(kind="face", payload=image)
         return self._wait_future(future)
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        future = self._submit_task(kind="face", payload=image, text_priority=False)
+        future = self._submit_task(kind="face", payload=image)
         return await self._await_future(future)
