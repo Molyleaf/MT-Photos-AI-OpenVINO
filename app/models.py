@@ -13,8 +13,10 @@ import time
 import traceback
 import types
 from collections import deque
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Tuple
 
@@ -24,6 +26,8 @@ import openvino as ov
 import yaml
 from insightface.app import FaceAnalysis
 from rapidocr import RapidOCR
+from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecInput, TextRecOutput
+from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
 
 _APP_DIR = Path(__file__).resolve().parent
@@ -79,7 +83,7 @@ RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
 RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
 LOG = logging.getLogger(__name__)
-_DEFAULT_NON_TEXT_OV_DEVICE = "MULTI:GPU,CPU"
+_DEFAULT_NON_TEXT_OV_DEVICE = "AUTO"
 _PROCESS_LOCK_POLL_SECONDS = 0.05
 _TEXT_RPC_HOST = "127.0.0.1"
 
@@ -111,29 +115,18 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
         return
 
-    # Reused infer requests may expose stale tail rows for undersized batches.
-    # Normalize the returned tensor shape before RapidOCR postprocess consumes it.
     def _patched_call(self: Any, input_content: np.ndarray) -> Any:
         try:
             prepared = np.ascontiguousarray(input_content)
-            expected_batch = int(prepared.shape[0]) if prepared.ndim >= 1 else 1
-            self.session.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
-            self.session.infer()
-            output = np.asarray(self.session.get_output_tensor(0).data)
-            if output.ndim >= 1 and output.shape[0] < expected_batch:
-                raise RuntimeError(
-                    "RapidOCR OpenVINO returned fewer batch rows than requested: "
-                    f"requested={expected_batch}, got={int(output.shape[0])}"
-                )
-            if output.ndim >= 1 and output.shape[0] > expected_batch:
-                LOG.warning(
-                    "RapidOCR OpenVINO returned stale tail rows: requested=%d, got=%d. "
-                    "Truncating output batch to keep OCR indices aligned.",
-                    expected_batch,
-                    int(output.shape[0]),
-                )
-                output = output[:expected_batch]
-            return output
+            compiled_model = getattr(self, "_mt_compiled_model", None)
+            if compiled_model is None:
+                self.session.infer(inputs=[prepared])
+                return np.asarray(self.session.get_output_tensor().data)
+
+            infer_request = compiled_model.create_infer_request()
+            infer_request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
+            infer_request.infer()
+            return np.asarray(infer_request.get_output_tensor(0).data)
         except Exception as exc:
             error_info = traceback.format_exc()
             raise OpenVINOError(error_info) from exc
@@ -161,7 +154,7 @@ def _patch_rapidocr_openvino_device_selection() -> None:
             str(engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)))
         )
 
-        requires_gpu = "GPU" in selected_device
+        requires_gpu = selected_device != "AUTO" and "GPU" in selected_device
         core = Core()
         available_devices = [str(item).upper() for item in core.available_devices]
         if requires_gpu and not _has_openvino_gpu_device(available_devices):
@@ -311,41 +304,39 @@ def _split_openvino_device_expr(device_expr: str) -> List[str]:
 
 
 def _normalize_non_text_openvino_device(device_expr: str) -> str:
-    tokens = _split_openvino_device_expr(device_expr)
-    normalized_tokens: List[str] = []
+    normalized = str(device_expr or "").strip().upper()
+    if not normalized:
+        return _DEFAULT_NON_TEXT_OV_DEVICE
 
-    for token in tokens:
-        if token == "AUTO":
-            normalized_tokens.extend(["GPU", "CPU"])
-            continue
-        if token in {"GPU_FP16", "GPU_FP32"}:
-            normalized_tokens.append("GPU")
-            continue
-        if token in {"CPU_FP16", "CPU_FP32"}:
-            normalized_tokens.append("CPU")
-            continue
-        if token.startswith("GPU."):
-            normalized_tokens.append(token)
-            continue
-        if token.startswith("GPU"):
-            normalized_tokens.append("GPU")
-            continue
-        if token.startswith("CPU"):
-            normalized_tokens.append("CPU")
-            continue
-        if token.startswith("NPU"):
-            normalized_tokens.append("NPU")
-            continue
-        normalized_tokens.append(token)
+    if normalized.startswith("AUTO:"):
+        return "AUTO"
 
-    normalized_tokens = _dedupe_preserve_order(normalized_tokens)
-    if not normalized_tokens:
-        normalized_tokens = ["GPU", "CPU"]
+    if normalized.startswith("MULTI:"):
+        tokens = _split_openvino_device_expr(normalized)
+        if tokens in (["GPU", "CPU"], ["CPU", "GPU"]):
+            return "AUTO"
+        return normalized
 
-    if any(token.startswith(("GPU", "NPU")) for token in normalized_tokens) and "CPU" not in normalized_tokens:
-        normalized_tokens.append("CPU")
+    if normalized in {"AUTO", "GPU", "CPU", "NPU"}:
+        return normalized
 
-    return f"MULTI:{','.join(normalized_tokens)}"
+    alias_map = {
+        "GPU_FP16": "GPU",
+        "GPU_FP32": "GPU",
+        "CPU_FP16": "CPU",
+        "CPU_FP32": "CPU",
+    }
+    if normalized in alias_map:
+        return alias_map[normalized]
+
+    if normalized.startswith(("GPU.", "CPU.", "NPU.")):
+        return normalized
+
+    tokens = _split_openvino_device_expr(normalized)
+    if tokens and set(tokens) == {"GPU", "CPU"}:
+        return "AUTO"
+
+    return normalized
 
 
 def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
@@ -590,9 +581,8 @@ class _OpenVinoPreprocessRunner:
             )
 
 
-class _TextClipRpcServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class _TextClipRpcServer(socketserver.TCPServer):
     allow_reuse_address = True
-    daemon_threads = True
 
 
 TaskType = Literal["clip_img", "ocr", "face"]
@@ -610,11 +600,10 @@ class _InferenceTask:
 
 class AIModels:
     """
-    Heavy models are serialized through a bounded queue inside each worker.
-    Text-CLIP stays resident as an independent singleton RPC service and does
-    not participate in heavy-model switching or priority queues. CLIP image
-    requests may be micro-batched inside the worker when adjacent uploads
-    share the same spatial shape.
+    Text-CLIP stays resident as a single-threaded singleton service.
+    Image-CLIP uses a dedicated batch queue after standardized preprocessing.
+    RapidOCR and InsightFace run through independent async paths instead of a
+    shared non-text worker.
     """
 
     def __init__(self) -> None:
@@ -651,7 +640,9 @@ class AIModels:
         self._clip_remote_context = self._init_clip_remote_context()
 
         self._model_lock = threading.Lock()
-        self._active_family: Optional[str] = None
+        self._clip_vision_load_lock = threading.Lock()
+        self._rapidocr_load_lock = threading.Lock()
+        self._face_load_lock = threading.Lock()
 
         self._clip_text_model: Optional[ov.CompiledModel] = None
         self._clip_text_request: Optional[ov.InferRequest] = None
@@ -672,13 +663,20 @@ class AIModels:
         self._text_service_thread: Optional[threading.Thread] = None
         self._text_service_port: Optional[int] = None
         self._clip_vision_model: Optional[ov.CompiledModel] = None
+        self._clip_vision_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
         self._clip_vision_input_name: Optional[str] = None
         self._clip_vision_host_input_cache: Dict[
             Tuple[int, int, int], Tuple[ov.Tensor, np.ndarray]
         ] = {}
         self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
-        self._clip_image_batch_size = max(1, _as_int(os.environ.get("CLIP_IMAGE_BATCH_SIZE"), 4))
+        self._clip_image_batch_size = max(
+            1,
+            _as_int(
+                os.environ.get("CLIP_IMAGE_BATCH", os.environ.get("CLIP_IMAGE_BATCH_SIZE")),
+                8,
+            ),
+        )
         self._clip_image_batch_wait_seconds = max(
             0.0,
             _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
@@ -688,6 +686,14 @@ class AIModels:
         self._face_engine: Optional[FaceAnalysis] = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        self._shared_cpu_executor = ThreadPoolExecutor(
+            max_workers=max(2, min(8, os.cpu_count() or 4)),
+            thread_name_prefix="ai-cpu",
+        )
+        self._ocr_det_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-det")
+        self._ocr_cls_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-cls")
+        self._ocr_rec_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-rec")
+        self._face_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-ov")
         self._family_load_locks = {
             family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
             for family in ("vision", "ocr", "face")
@@ -699,10 +705,6 @@ class AIModels:
         self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
         self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
         self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
-        self._idle_unload_seconds = max(
-            0.0, _as_float(os.environ.get("NON_TEXT_IDLE_UNLOAD_SECONDS"), 300.0)
-        )
-        self._idle_unload_deadline: Optional[float] = None
         self._release_requested = False
         self._stopping = False
 
@@ -717,14 +719,13 @@ class AIModels:
         self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s queue_timeout=%ss exec_timeout=%ss idle_unload=%ss clip_batch=%s/%sms text_service=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
             self._queue_capacity,
             self._queue_timeout_seconds,
             self._execution_timeout_seconds,
-            int(self._idle_unload_seconds),
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
@@ -739,8 +740,6 @@ class AIModels:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
     def _start_background_prewarm(self) -> None:
-        if not self._text_service_owner:
-            return
         if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), True):
             return
         self._background_prewarm_thread = threading.Thread(
@@ -756,10 +755,6 @@ class AIModels:
             time.sleep(delay_seconds)
         if self._stopping:
             return
-        with self._condition:
-            if self._normal_queue or self._release_requested:
-                LOG.info("Skip OCR prewarm because inference work is already queued.")
-                return
         try:
             started_at = time.monotonic()
             self._prewarm_ocr_family()
@@ -768,37 +763,11 @@ class AIModels:
             LOG.warning("RapidOCR background prewarm failed: %s", exc, exc_info=True)
 
     def _prewarm_ocr_family(self) -> None:
-        with self._model_lock:
-            if self._stopping:
-                return
-            if self._active_family not in (None, "ocr"):
-                LOG.info(
-                    "Skip OCR prewarm because non-text family %s is already active.",
-                    self._active_family,
-                )
-                return
-            if self._rapidocr_engine is None:
-                self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
-            self._active_family = "ocr"
-            self._warmup_rapidocr_locked()
-        self._arm_idle_unload_deadline()
-
-    def _arm_idle_unload_deadline(self) -> None:
-        if self._idle_unload_seconds <= 0.0:
+        if self._stopping:
             return
-        with self._model_lock:
-            if self._active_family is None:
-                self._clear_idle_unload_deadline()
-                return
-        with self._condition:
-            if self._stopping:
-                return
-            self._idle_unload_deadline = time.monotonic() + self._idle_unload_seconds
-            self._condition.notify()
-
-    def _clear_idle_unload_deadline(self) -> None:
-        with self._condition:
-            self._idle_unload_deadline = None
+        self._ensure_rapidocr_loaded()
+        with self._rapidocr_load_lock:
+            self._warmup_rapidocr_locked()
 
     def _init_clip_remote_context(self) -> Optional[Any]:
         clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
@@ -1200,82 +1169,33 @@ class AIModels:
     def _worker_loop(self) -> None:
         while True:
             normal_task: Optional[_InferenceTask] = None
-            release_active_family = False
-            release_reason = "manual"
 
             with self._condition:
                 while True:
                     if self._stopping or self._normal_queue or self._release_requested:
                         break
-                    idle_deadline = self._idle_unload_deadline
-                    if idle_deadline is None:
-                        self._condition.wait()
-                        continue
-                    remaining = idle_deadline - time.monotonic()
-                    if remaining <= 0.0:
-                        self._idle_unload_deadline = None
-                        release_active_family = True
-                        release_reason = "idle"
-                        break
-                    self._condition.wait(timeout=remaining)
+                    self._condition.wait()
 
                 if self._stopping:
                     break
 
-                if not release_active_family and self._release_requested and not self._normal_queue:
+                if self._release_requested and not self._normal_queue:
                     self._release_requested = False
-                    release_active_family = True
-                    release_reason = "manual"
-                elif not release_active_family and self._normal_queue:
+                    self._unload_clip_vision_model()
+                    continue
+                if self._normal_queue:
                     normal_task = self._normal_queue.popleft()
                     normal_task.started_at = time.monotonic()
                     normal_task.started_event.set()
 
-            if release_active_family:
-                try:
-                    if release_reason == "idle":
-                        LOG.info(
-                            "Releasing active non-text model family after %.1fs of inactivity.",
-                            self._idle_unload_seconds,
-                        )
-                    self._unload_active_family()
-                except Exception as exc:
-                    LOG.error("Failed to release active model family: %s", exc, exc_info=True)
-                continue
-
             if normal_task is not None:
-                if normal_task.kind == "clip_img":
-                    self._handle_clip_image_tasks(self._collect_clip_image_batch(normal_task))
-                    continue
-                self._handle_single_task(normal_task)
-                continue
-
-    def _handle_single_task(self, task: _InferenceTask) -> None:
-        try:
-            if task.kind == "ocr":
-                self._switch_family("ocr")
-                self._safe_set_result(task.future, self._infer_ocr(task.payload))
-                return
-
-            if task.kind == "face":
-                self._switch_family("face")
-                self._safe_set_result(task.future, self._infer_face(task.payload))
-                return
-
-            raise RuntimeError(f"Unsupported task kind: {task.kind}")
-        except Exception as exc:
-            LOG.error("Task %s failed: %s", task.kind, exc, exc_info=True)
-            self._safe_set_exception(task.future, exc)
-        finally:
-            self._arm_idle_unload_deadline()
+                self._handle_clip_image_tasks(self._collect_clip_image_batch(normal_task))
 
     def _collect_clip_image_batch(self, first_task: _InferenceTask) -> List[_InferenceTask]:
         batch = [first_task]
         if self._clip_image_batch_size <= 1:
             return batch
 
-        first_image, _ = first_task.payload
-        batch_shape = tuple(np.asarray(first_image).shape[:2])
         deadline = time.monotonic() + self._clip_image_batch_wait_seconds
 
         while len(batch) < self._clip_image_batch_size:
@@ -1290,9 +1210,6 @@ class AIModels:
                 next_task = self._normal_queue[0]
                 if next_task.kind != "clip_img":
                     return batch
-                next_image, _ = next_task.payload
-                if tuple(np.asarray(next_image).shape[:2]) != batch_shape:
-                    return batch
                 popped = self._normal_queue.popleft()
                 popped.started_at = time.monotonic()
                 popped.started_event.set()
@@ -1303,58 +1220,15 @@ class AIModels:
         if not tasks:
             return
         try:
-            self._switch_family("vision")
-            payloads = [task.payload for task in tasks]
-            results = self._infer_clip_image_batch(payloads)
+            self._ensure_clip_vision_loaded()
+            payloads = [np.asarray(task.payload, dtype=np.float32) for task in tasks]
+            results = self._infer_clip_image_tensor_batch(payloads)
             for task, result in zip(tasks, results):
                 self._safe_set_result(task.future, result)
         except Exception as exc:
             LOG.error("Task clip_img failed: %s", exc, exc_info=True)
             for task in tasks:
                 self._safe_set_exception(task.future, exc)
-        finally:
-            self._arm_idle_unload_deadline()
-
-    def _unload_active_family(self) -> None:
-        with self._model_lock:
-            if self._active_family is None:
-                return
-            self._unload_active_family_locked()
-
-    def _switch_family(self, target_family: str) -> None:
-        with self._model_lock:
-            if self._active_family == target_family:
-                return
-
-            self._unload_active_family_locked()
-
-            if target_family == "vision":
-                self._load_family_with_process_lock("vision", self._load_clip_vision_locked)
-            elif target_family == "ocr":
-                self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
-            elif target_family == "face":
-                self._load_family_with_process_lock("face", self._load_face_locked)
-            else:
-                raise RuntimeError(f"Unsupported model family: {target_family}")
-
-            self._active_family = target_family
-
-    def _unload_active_family_locked(self) -> None:
-        if self._active_family == "vision":
-            self._clip_vision_request = None
-            self._clip_vision_model = None
-            self._clip_vision_input_name = None
-            self._clip_vision_host_input_cache.clear()
-        elif self._active_family == "ocr":
-            self._rapidocr_engine = None
-            self._rapidocr_runtime_cfg = None
-        elif self._active_family == "face":
-            self._face_engine = None
-            self._face_det_ppp = None
-            self._face_rec_ppp = None
-
-        self._active_family = None
-        gc.collect()
 
     def _unload_text_model_locked(self) -> None:
         self._clip_text_request = None
@@ -1366,18 +1240,56 @@ class AIModels:
 
     def _unload_everything_locked(self) -> None:
         self._unload_text_model_locked()
+        self._unload_clip_vision_model_locked()
+        self._unload_rapidocr_model_locked()
+        self._unload_face_model_locked()
+        gc.collect()
+
+    def _unload_clip_vision_model_locked(self) -> None:
         self._clip_vision_request = None
         self._clip_vision_model = None
+        self._clip_vision_ppp = None
         self._clip_vision_input_name = None
         self._clip_vision_host_input_cache.clear()
+
+    def _unload_clip_vision_model(self) -> None:
+        with self._clip_vision_load_lock:
+            self._unload_clip_vision_model_locked()
+
+    def _unload_rapidocr_model_locked(self) -> None:
         self._rapidocr_engine = None
         self._rapidocr_runtime_cfg = None
+
+    def _unload_rapidocr_model(self) -> None:
+        with self._rapidocr_load_lock:
+            self._unload_rapidocr_model_locked()
+
+    def _unload_face_model_locked(self) -> None:
         self._face_engine = None
         self._face_det_ppp = None
         self._face_rec_ppp = None
-        self._active_family = None
-        self._idle_unload_deadline = None
-        gc.collect()
+
+    def _unload_face_model(self) -> None:
+        with self._face_load_lock:
+            self._unload_face_model_locked()
+
+    def _ensure_clip_vision_loaded(self) -> None:
+        with self._clip_vision_load_lock:
+            if self._clip_vision_model is not None and self._clip_vision_request is not None:
+                return
+            self._load_family_with_process_lock("vision", self._load_clip_vision_locked)
+
+    def _ensure_rapidocr_loaded(self) -> None:
+        with self._rapidocr_load_lock:
+            if self._rapidocr_engine is not None:
+                return
+            self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
+
+    def _ensure_face_loaded(self) -> None:
+        with self._face_load_lock:
+            if self._face_engine is not None:
+                return
+            self._load_family_with_process_lock("face", self._load_face_locked)
 
     def _compile_clip_model(
         self,
@@ -1541,9 +1453,16 @@ class AIModels:
         if not vision_model_path.exists():
             raise FileNotFoundError(f"Missing vision model: {vision_model_path}")
 
-        ppp_model = self._build_clip_vision_ppp_model(vision_model_path)
+        model = self.core.read_model(str(vision_model_path))
+        model.reshape(
+            {
+                model.input(0): ov.PartialShape(
+                    [ov.Dimension.dynamic(), 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION]
+                )
+            }
+        )
         compiled_model = self._compile_clip_model(
-            model_or_path=ppp_model,
+            model_or_path=model,
             performance_hint="THROUGHPUT",
         )
         output_dim = compiled_model.outputs[0].get_partial_shape()[1].get_length()
@@ -1555,12 +1474,63 @@ class AIModels:
         self._clip_vision_model = compiled_model
         self._clip_vision_request = compiled_model.create_infer_request()
         self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
-        self._clip_vision_host_input_cache.clear()
-        self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
-        LOG.info(
-            "CLIP Vision model loaded on %s with OpenVINO PPP preprocessing.",
-            CLIP_INFERENCE_DEVICE,
+        self._clip_vision_ppp = self._build_openvino_preprocess_runner(
+            runner_name="clip_vision",
+            device_name=CLIP_INFERENCE_DEVICE,
+            output_height=CLIP_IMAGE_RESOLUTION,
+            output_width=CLIP_IMAGE_RESOLUTION,
+            mean_values=_CLIP_IMAGE_MEAN.tolist(),
+            std_values=_CLIP_IMAGE_STD.tolist(),
         )
+        self._clip_vision_host_input_cache.clear()
+        self._clip_vision_host_tensor_enabled = False
+        LOG.info(
+            "CLIP Vision model loaded on %s with post-preprocess batching (batch=%s).",
+            CLIP_INFERENCE_DEVICE,
+            self._clip_image_batch_size,
+        )
+
+    @staticmethod
+    def _resize_and_center_crop_clip_image(image: np.ndarray) -> np.ndarray:
+        image_bgr = _as_contiguous_bgr_uint8(image, context="CLIP vision")
+        height, width = image_bgr.shape[:2]
+        if height <= 0 or width <= 0:
+            raise ValueError(f"CLIP vision expects non-empty image, got shape={image_bgr.shape}")
+
+        scale = float(CLIP_IMAGE_RESOLUTION) / float(min(height, width))
+        resized_width = max(CLIP_IMAGE_RESOLUTION, int(round(width * scale)))
+        resized_height = max(CLIP_IMAGE_RESOLUTION, int(round(height * scale)))
+        resized = cv2.resize(
+            image_bgr,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        top = max(0, (resized_height - CLIP_IMAGE_RESOLUTION) // 2)
+        left = max(0, (resized_width - CLIP_IMAGE_RESOLUTION) // 2)
+        cropped = resized[
+            top : top + CLIP_IMAGE_RESOLUTION,
+            left : left + CLIP_IMAGE_RESOLUTION,
+        ]
+        if cropped.shape[:2] != (CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION):
+            cropped = cv2.resize(
+                cropped,
+                (CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        return np.ascontiguousarray(cropped, dtype=np.uint8)
+
+    def _preprocess_clip_image_tensor(self, image: np.ndarray) -> np.ndarray:
+        runner = self._clip_vision_ppp
+        if runner is None:
+            raise RuntimeError("CLIP vision preprocess runner is not loaded.")
+        cropped = self._resize_and_center_crop_clip_image(image)
+        normalized = runner.run(cropped[np.newaxis, ...])
+        if normalized.shape != (1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION):
+            raise RuntimeError(
+                "CLIP preprocess output shape mismatch: "
+                f"got={tuple(normalized.shape)}"
+            )
+        return np.ascontiguousarray(normalized[0], dtype=np.float32)
 
     def _require_rapidocr_config_path(self) -> Path:
         if not self.rapidocr_config_path.is_file():
@@ -2223,7 +2193,7 @@ class AIModels:
     def _prepare_legacy_insightface_runtime_root(self, source_root: Path) -> Path:
         source_model_dir = source_root / MODEL_NAME
         runtime_root = self.insightface_root / "_runtime_models"
-        runtime_model_dir = runtime_root / MODEL_NAME
+        runtime_model_dir = runtime_root / "models" / MODEL_NAME
         runtime_model_dir.mkdir(parents=True, exist_ok=True)
 
         # insightface<=0.2.1 model router cannot parse all antelopev2 heads.
@@ -2343,59 +2313,26 @@ class AIModels:
             )
         return embeddings.astype(np.float32, copy=False).tolist()
 
-    def _infer_clip_image(self, image: np.ndarray, filename: str) -> List[float]:
-        return self._infer_clip_image_batch([(image, filename)])[0]
-
-    def _infer_clip_image_batch(
-        self,
-        items: List[Tuple[np.ndarray, str]],
-    ) -> List[List[float]]:
+    def _infer_clip_image_tensor_batch(self, tensors: List[np.ndarray]) -> List[List[float]]:
         if not self._clip_vision_model or not self._clip_vision_request:
             raise RuntimeError("CLIP vision model is not loaded.")
-        if not items:
+        if not tensors:
             return []
 
-        prepared: List[np.ndarray] = []
-        filenames: List[str] = []
-        for image, filename in items:
-            image_bgr = _as_contiguous_bgr_uint8(image, context="CLIP vision")
-            prepared.append(image_bgr)
-            filenames.append(filename)
-
-        first_height, first_width = prepared[0].shape[:2]
-        if any(image.shape[:2] != (first_height, first_width) for image in prepared[1:]):
-            return [self._infer_clip_image(image, filename) for image, filename in items]
-
-        host_input = self._get_clip_vision_host_input(len(prepared), first_height, first_width)
-
-        if host_input is not None:
-            input_tensor, input_view = host_input
-            for index, image_bgr in enumerate(prepared):
-                np.copyto(input_view[index], image_bgr, casting="no")
-            self._clip_vision_request.set_input_tensor(0, input_tensor)
-            self._clip_vision_request.infer()
-            embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
-        else:
-            if len(prepared) == 1:
-                batch = np.ascontiguousarray(prepared[0][np.newaxis, ...], dtype=np.uint8)
-            else:
-                batch = np.ascontiguousarray(np.stack(prepared, axis=0), dtype=np.uint8)
-            self._clip_vision_request.set_input_tensor(
-                0,
-                ov.Tensor(batch, shared_memory=True),
-            )
-            self._clip_vision_request.infer()
-            embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
+        batch = np.ascontiguousarray(np.stack(tensors, axis=0), dtype=np.float32)
+        self._clip_vision_request.set_input_tensor(0, ov.Tensor(batch, shared_memory=True))
+        self._clip_vision_request.infer()
+        embeddings = np.asarray(self._clip_vision_request.get_output_tensor(0).data)
         if embeddings.ndim == 1:
             embeddings = embeddings.reshape(1, -1)
-        if embeddings.shape != (len(items), CLIP_EMBEDDING_DIMS):
+        if embeddings.shape != (len(tensors), CLIP_EMBEDDING_DIMS):
             raise RuntimeError(
                 "Invalid image embedding dims for CLIP vision batch: "
-                f"expected={(len(items), CLIP_EMBEDDING_DIMS)}, got={tuple(embeddings.shape)}"
+                f"expected={(len(tensors), CLIP_EMBEDDING_DIMS)}, got={tuple(embeddings.shape)}"
             )
         return [
             embeddings[index].astype(np.float32, copy=False).tolist()
-            for index, _ in enumerate(filenames)
+            for index in range(len(tensors))
         ]
 
     def _infer_ocr(self, image: np.ndarray) -> OCRResult:
@@ -2404,7 +2341,10 @@ class AIModels:
 
         # Zero-copy fast path: keep contiguous OpenCV BGR buffer when possible.
         ocr_input = _as_contiguous_bgr_uint8(image, context="OCR")
-        raw_result = self._rapidocr_engine(ocr_input)
+        return self._ocr_result_from_raw(self._rapidocr_engine(ocr_input))
+
+    @staticmethod
+    def _ocr_result_from_raw(raw_result: Any) -> OCRResult:
         ocr_items: Any
         if all(hasattr(raw_result, field) for field in ("boxes", "txts", "scores")):
             boxes_data = getattr(raw_result, "boxes", None)
@@ -2450,6 +2390,160 @@ class AIModels:
 
         return OCRResult(texts=texts, scores=scores, boxes=boxes)
 
+    @staticmethod
+    def _run_in_executor(
+        executor: ThreadPoolExecutor,
+        func: Callable[..., Any],
+        *args: Any,
+    ) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        return loop.run_in_executor(executor, partial(func, *args))
+
+    @staticmethod
+    def _rapidocr_detect_and_pad(
+        engine: RapidOCR,
+        image: np.ndarray,
+        op_record: Dict[str, Any],
+    ) -> Tuple[np.ndarray, Dict[str, Any], TextDetOutput]:
+        padded, updated_record = apply_vertical_padding(
+            image,
+            op_record,
+            engine.width_height_ratio,
+            engine.min_height,
+        )
+        return padded, updated_record, engine.text_det(padded)
+
+    def _rapidocr_crop_regions(self, image: np.ndarray, det_boxes: np.ndarray) -> List[np.ndarray]:
+        boxes = np.asarray(det_boxes, dtype=np.float32)
+        if boxes.size == 0:
+            return []
+        futures = [
+            self._shared_cpu_executor.submit(
+                get_rotate_crop_image,
+                image,
+                np.array(box, dtype=np.float32, copy=True),
+            )
+            for box in boxes
+        ]
+        return [future.result() for future in futures]
+
+    @staticmethod
+    def _rapidocr_cls_and_rotate(engine: RapidOCR, images: List[np.ndarray]) -> Tuple[List[np.ndarray], TextClsOutput]:
+        start_time = time.perf_counter()
+        classifier = engine.text_cls
+        img_list = list(images)
+        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
+        indices = np.argsort(np.array(width_list))
+
+        img_num = len(img_list)
+        cls_res = [("", 0.0)] * img_num
+        batch_num = classifier.cls_batch_num
+        for beg_img_no in range(0, img_num, batch_num):
+            end_img_no = min(img_num, beg_img_no + batch_num)
+            norm_img_batch = np.stack(
+                [
+                    classifier.resize_norm_img(img_list[int(indices[ino])])
+                    for ino in range(beg_img_no, end_img_no)
+                ],
+                axis=0,
+            ).astype(np.float32)
+            prob_out = classifier.session(norm_img_batch)
+            cls_result = classifier.postprocess_op(prob_out)
+            for rno, (label, score) in enumerate(cls_result):
+                original_index = int(indices[beg_img_no + rno])
+                cls_res[original_index] = (label, score)
+                if "180" in label and score > classifier.cls_thresh:
+                    img_list[original_index] = cv2.rotate(
+                        img_list[original_index],
+                        cv2.ROTATE_180,
+                    )
+        output = TextClsOutput(
+            img_list=img_list,
+            cls_res=cls_res,
+            elapse=time.perf_counter() - start_time,
+        )
+        if output.img_list is None:
+            raise RapidOCRError("The text classifier is empty")
+        return output.img_list, output
+
+    @staticmethod
+    def _rapidocr_recognize(engine: RapidOCR, images: List[np.ndarray]) -> TextRecOutput:
+        rec_res = engine.text_rec(TextRecInput(img=images, return_word_box=engine.return_word_box))
+        if rec_res.txts is None:
+            raise RapidOCRError("The text recognize result is empty")
+        return rec_res
+
+    async def _infer_ocr_async(self, image: np.ndarray) -> OCRResult:
+        await asyncio.to_thread(self._ensure_rapidocr_loaded)
+        if self._rapidocr_engine is None:
+            raise RuntimeError("RapidOCR model is not loaded.")
+
+        engine = self._rapidocr_engine
+        ori_img = _as_contiguous_bgr_uint8(image, context="OCR")
+        img, op_record = await self._run_in_executor(self._shared_cpu_executor, engine.preprocess_img, ori_img)
+        det_res, cls_res, rec_res = TextDetOutput(), TextClsOutput(), TextRecOutput()
+
+        if engine.use_det:
+            try:
+                img, op_record, det_res = await self._run_in_executor(
+                    self._ocr_det_executor,
+                    self._rapidocr_detect_and_pad,
+                    engine,
+                    img,
+                    op_record,
+                )
+            except RapidOCRError as exc:
+                LOG.warning(exc)
+                return OCRResult(texts=[], scores=[], boxes=[])
+            if det_res.boxes is None:
+                return OCRResult(texts=[], scores=[], boxes=[])
+            cropped_img_list = await self._run_in_executor(
+                self._shared_cpu_executor,
+                self._rapidocr_crop_regions,
+                img,
+                det_res.boxes,
+            )
+        else:
+            cropped_img_list = [img]
+
+        if engine.use_cls:
+            try:
+                cls_img_list, cls_res = await self._run_in_executor(
+                    self._ocr_cls_executor,
+                    self._rapidocr_cls_and_rotate,
+                    engine,
+                    cropped_img_list,
+                )
+            except RapidOCRError as exc:
+                LOG.warning(exc)
+                return OCRResult(texts=[], scores=[], boxes=[])
+        else:
+            cls_img_list = cropped_img_list
+
+        if engine.use_rec:
+            try:
+                rec_res = await self._run_in_executor(
+                    self._ocr_rec_executor,
+                    self._rapidocr_recognize,
+                    engine,
+                    cls_img_list,
+                )
+            except RapidOCRError as exc:
+                LOG.warning(exc)
+                return OCRResult(texts=[], scores=[], boxes=[])
+
+        raw_result = await self._run_in_executor(
+            self._shared_cpu_executor,
+            engine.build_final_output,
+            ori_img,
+            det_res,
+            cls_res,
+            rec_res,
+            cropped_img_list,
+            op_record,
+        )
+        return self._ocr_result_from_raw(raw_result)
+
     def _infer_face(self, image: np.ndarray) -> List[RepresentResult]:
         if self._face_engine is None:
             raise RuntimeError("Face model is not loaded.")
@@ -2491,6 +2585,8 @@ class AIModels:
         self._schedule_release()
 
     def _schedule_release(self) -> None:
+        self._unload_rapidocr_model()
+        self._unload_face_model()
         with self._condition:
             if self._stopping:
                 return
@@ -2514,6 +2610,15 @@ class AIModels:
             self._background_prewarm_thread.join(timeout=2.0)
             self._background_prewarm_thread = None
 
+        for executor in (
+            self._shared_cpu_executor,
+            self._ocr_det_executor,
+            self._ocr_cls_executor,
+            self._ocr_rec_executor,
+            self._face_executor,
+        ):
+            executor.shutdown(wait=False, cancel_futures=True)
+
         self._shutdown_text_service()
         with self._model_lock:
             self._unload_everything_locked()
@@ -2526,29 +2631,42 @@ class AIModels:
         return await asyncio.to_thread(self.get_text_embedding, text)
 
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
-        payload = (image, filename)
+        _ = filename
+        self._ensure_clip_vision_loaded()
+        payload = self._preprocess_clip_image_tensor(image)
         task = self._submit_task(kind="clip_img", payload=payload)
         return self._wait_task(task)
 
     async def get_image_embedding_async(
         self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
-        payload = (image, filename)
+        _ = filename
+        await asyncio.to_thread(self._ensure_clip_vision_loaded)
+        payload = await self._run_in_executor(
+            self._shared_cpu_executor,
+            self._preprocess_clip_image_tensor,
+            image,
+        )
         task = self._submit_task(kind="clip_img", payload=payload)
         return await self._await_task(task)
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        task = self._submit_task(kind="ocr", payload=image)
-        return self._wait_task(task)
+        self._ensure_rapidocr_loaded()
+        return self._infer_ocr(image)
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        task = self._submit_task(kind="ocr", payload=image)
-        return await self._await_task(task)
+        return await asyncio.wait_for(
+            self._infer_ocr_async(image),
+            timeout=self._execution_timeout_seconds,
+        )
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        task = self._submit_task(kind="face", payload=image)
-        return self._wait_task(task)
+        self._ensure_face_loaded()
+        return self._infer_face(image)
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        task = self._submit_task(kind="face", payload=image)
-        return await self._await_task(task)
+        await asyncio.to_thread(self._ensure_face_loaded)
+        return await asyncio.wait_for(
+            self._run_in_executor(self._face_executor, self._infer_face, image),
+            timeout=self._execution_timeout_seconds,
+        )

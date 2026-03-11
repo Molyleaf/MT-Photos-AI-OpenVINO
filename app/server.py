@@ -365,7 +365,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8060))
     log_level = os.environ.get("LOG_LEVEL", "warning").lower()
-    workers = int(os.environ.get("WEB_CONCURRENCY", 1))
 
     uvicorn.run(
         "server:app",
@@ -373,6 +372,5 @@ if __name__ == "__main__":
         port=port,
         reload=False,
         log_level=log_level,
-        workers=workers,
         access_log=False
     )

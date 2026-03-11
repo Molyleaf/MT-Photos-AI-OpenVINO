@@ -14,7 +14,7 @@ Global:
 
 EngineConfig:
   openvino:
-    device_name: "MULTI:GPU,CPU"
+    device_name: "AUTO"
     inference_num_threads: -1
     performance_hint: "THROUGHPUT"
     performance_num_requests: 2

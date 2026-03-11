@@ -7,7 +7,7 @@
 - Python **3.12**
 - 已准备模型目录（至少包含）：
   - `models/qa-clip/openvino`
-  - `models/insightface/models`
+  - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 服务入口：`app/server.py`
 
@@ -16,22 +16,20 @@
 | 环境变量                                | 说明                                                        | 默认值                                |
 |-------------------------------------|-----------------------------------------------------------|------------------------------------|
 | `API_AUTH_KEY`                      | API Key；`no-key` 或空字符串表示关闭鉴权                              | `mt_photos_ai_extra`               |
-| `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO` / `MULTI:GPU,CPU` | `AUTO`                             |
+| `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO`                 | `AUTO`                             |
 | `CLIP_INFERENCE_DEVICE`             | 仅覆盖 QA-CLIP 设备；请求 `AUTO/GPU` 时需保证 GPU 可用，且会强制初始化 GPU Remote Context | 跟随 `INFERENCE_DEVICE`              |
 | `MODEL_PATH`                        | 模型根目录路径                                                   | `<repo>/models`                    |
-| `WEB_CONCURRENCY`                   | Uvicorn worker 数；默认建议保持单 worker，避免多实例重模型争用      | `1`                                |
 | `INFERENCE_QUEUE_MAX_SIZE`          | 推理队列长度                                                    | `64`                               |
 | `INFERENCE_TASK_TIMEOUT`            | 兼容旧配置的总超时基线；未显式设置新变量时用作排队超时默认值，并为执行超时提供下限 | `10`                               |
 | `INFERENCE_QUEUE_TIMEOUT`           | 非文本任务排队超时（秒）                                               | 跟随 `INFERENCE_TASK_TIMEOUT`       |
 | `INFERENCE_EXEC_TIMEOUT`            | 非文本任务执行超时（秒）；默认至少 `30` 秒                              | `max(30, INFERENCE_TASK_TIMEOUT)`  |
 | `OV_CACHE_DIR`                      | 可选：自定义 OpenVINO 编译缓存目录；未设置时默认使用 `<repo>/cache/openvino`     | `<repo>/cache/openvino`             |
-| `CLIP_IMAGE_BATCH_SIZE`             | `/clip/img` worker 内同尺寸微批上限                                      | `4`                                 |
+| `CLIP_IMAGE_BATCH`                  | `/clip/img` 在标准预处理完成后的批大小上限                                   | `8`                                 |
 | `CLIP_IMAGE_BATCH_WAIT_MS`          | `/clip/img` 微批等待窗口（毫秒）                                          | `5`                                 |
-| `NON_TEXT_IDLE_UNLOAD_SECONDS`      | OCR、`/clip/img`、InsightFace 空闲自动卸载秒数；`0` 表示禁用                   | `300`                               |
 | `RAPIDOCR_OPENVINO_CONFIG_PATH`     | RapidOCR YAML 配置文件路径；服务会将该文件直接作为 `config_path` 传给 `RapidOCR` | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR`                | RapidOCR 模型目录                                             | `<repo>/models/rapidocr`           |
 | `RAPIDOCR_FONT_PATH`                | RapidOCR 字体文件路径；空表示不指定                                    | 空                                  |
-| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串；运行时会归一化为 `MULTI:*`，默认解析为 `MULTI:GPU,CPU` | `MULTI:GPU,CPU`                    |
+| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串                                         | `AUTO`                             |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `THROUGHPUT`                       |
 | `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数                                                | `2`                                |
@@ -45,9 +43,9 @@
 | `RAPIDOCR_DET_LIMIT_TYPE`           | 检测缩放策略；默认 `max`，避免把小图放大到阈值导致时延异常                | `max`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `8`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `8`                                |
-| `OCR_PREWARM_ENABLED`               | 是否在启动后由后台 owner worker 预热 RapidOCR 并填充编译缓存                     | `true`                              |
+| `OCR_PREWARM_ENABLED`               | 是否在启动后后台预热 RapidOCR 并填充编译缓存                              | `true`                              |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 后台预热延迟（秒）                                         | `1.0`                               |
-| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；运行时统一使用 `MULTI:*` 设备表达式       | `MULTI:GPU,CPU`                    |
+| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`                                      | `AUTO`                             |
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
@@ -58,18 +56,16 @@
 
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
-- Text-CLIP 已改为常驻独立实例：不再参与非文本模型的卸载/恢复与插队调度，`/clip/txt` 会通过单例本地 RPC 服务直接复用同一份文本模型。
-- OCR、`/clip/img` 和 InsightFace 在最后一次请求完成后会进入空闲计时；默认空闲 `300` 秒自动卸载，下一次请求会按需重载。若不需要该行为，可设置 `NON_TEXT_IDLE_UNLOAD_SECONDS=0`。
-- `/clip/img` 会在单 worker 内对相邻、同尺寸的图像请求做微批处理，以提高 Intel GPU 吞吐；接口输入输出语义保持不变。
-- `WEB_CONCURRENCY` 只影响 FastAPI worker 数；默认基线为 `1`。若手动放大 worker，Text-CLIP 仍保持单例服务，非文本模型仍建议结合日志观察显存/冷启动时延后再放大。
-- 非文本超时已拆分为“排队超时”和“执行超时”：默认仍保持 `INFERENCE_TASK_TIMEOUT=10` 的排队上限，但执行阶段默认至少给到 `30` 秒，避免模型切族、冷编译或首轮预热直接吃掉排队时间。
+- Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
+- `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
+- RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，以便在单进程异步服务中形成流水线并行。
+- 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
-- RapidOCR 默认基线使用 `THROUGHPUT + MULTI:GPU,CPU + rec/cls batch=8`；若更关注单请求尾延迟，可显式改回 `RAPIDOCR_PERFORMANCE_HINT=LATENCY`。
+- RapidOCR 默认基线使用 `THROUGHPUT + AUTO + rec/cls batch=8`；若更关注单请求尾延迟，可显式改回 `RAPIDOCR_PERFORMANCE_HINT=LATENCY`。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
-- 默认会由 Text-CLIP owner worker 在启动后后台预热一次 RapidOCR，尽量把冷编译成本前移，减少多 worker 首次 OCR 请求命中冷加载超时。
-- 后台 RapidOCR 预热完成后，owner worker 会在空闲卸载计时到期前尽量保留已预热的 OCR 模型，以减少首个真实 OCR 请求再次冷加载。
-- RapidOCR、InsightFace 以及 InsightFace 的 OpenVINO PPP 预处理会把 `AUTO/GPU/GPU_FP16` 等输入归一化为 `MULTI:*` 设备字符串；默认基线为 `MULTI:GPU,CPU`。需要注意，`MULTI` 主要在“多个并发推理请求”场景下调度设备，不会把单个同步请求强拆到 CPU 和 GPU 上同时执行。
+- 默认会在启动后后台预热一次 RapidOCR，尽量把冷编译成本前移。
+- RapidOCR、InsightFace 和 InsightFace 的 OpenVINO PPP 预处理默认都走 `AUTO` 设备选择。
 
 ## Windows 本机部署
 
@@ -92,16 +88,16 @@ python -m venv .venv
 $env:API_AUTH_KEY="your_secret_key"
 $env:INFERENCE_DEVICE="AUTO"
 $env:CLIP_INFERENCE_DEVICE="AUTO"
-$env:RAPIDOCR_DEVICE="MULTI:GPU,CPU"
-$env:INSIGHTFACE_OV_DEVICE="MULTI:GPU,CPU"
-$env:WEB_CONCURRENCY="1"
+$env:CLIP_IMAGE_BATCH="8"
+$env:RAPIDOCR_DEVICE="AUTO"
+$env:INSIGHTFACE_OV_DEVICE="AUTO"
 ```
 
 4. 启动服务：
 
 ```powershell
 cd app
-uvicorn server:app --host 0.0.0.0 --port 8060 --workers 1
+uvicorn server:app --host 0.0.0.0 --port 8060
 ```
 
 ## Debian/Linux Docker 部署
@@ -152,9 +148,9 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=MULTI:GPU,CPU`、`INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU`（若 GPU 不可用会按规则硬失败）
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
-- 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH_SIZE`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
+- 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 
 4. 启动服务：
 
@@ -187,9 +183,9 @@ docker run -d \
   -e API_AUTH_KEY=mt_photos_ai_extra \
   -e INFERENCE_DEVICE=AUTO \
   -e CLIP_INFERENCE_DEVICE=AUTO \
-  -e RAPIDOCR_DEVICE=MULTI:GPU,CPU \
-  -e INSIGHTFACE_OV_DEVICE=MULTI:GPU,CPU \
-  -e WEB_CONCURRENCY=1 \
+  -e CLIP_IMAGE_BATCH=8 \
+  -e RAPIDOCR_DEVICE=AUTO \
+  -e INSIGHTFACE_OV_DEVICE=AUTO \
   mt-photos-ai-openvino
 ```
 
