@@ -22,6 +22,7 @@ services:
       WEB_CONCURRENCY: "1"
       INFERENCE_QUEUE_MAX_SIZE: "64"
       INFERENCE_TASK_TIMEOUT: "10"
+      INFERENCE_EXEC_TIMEOUT: "30"
       RAPIDOCR_OPENVINO_CONFIG_PATH: "/app/config/cfg_openvino_cpu.yaml"
       RAPIDOCR_MODEL_DIR: "/models/rapidocr"
       RAPIDOCR_FONT_PATH: ""

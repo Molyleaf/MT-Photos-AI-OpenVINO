@@ -21,7 +21,9 @@
 | `MODEL_PATH`                        | 模型根目录路径                                                   | `<repo>/models`                    |
 | `WEB_CONCURRENCY`                   | Uvicorn worker 数；默认建议保持单 worker，避免多实例重模型争用      | `1`                                |
 | `INFERENCE_QUEUE_MAX_SIZE`          | 推理队列长度                                                    | `64`                               |
-| `INFERENCE_TASK_TIMEOUT`            | 非文本任务队列/执行超时时间（秒）                                        | `10`                               |
+| `INFERENCE_TASK_TIMEOUT`            | 兼容旧配置的总超时基线；未显式设置新变量时用作排队超时默认值，并为执行超时提供下限 | `10`                               |
+| `INFERENCE_QUEUE_TIMEOUT`           | 非文本任务排队超时（秒）                                               | 跟随 `INFERENCE_TASK_TIMEOUT`       |
+| `INFERENCE_EXEC_TIMEOUT`            | 非文本任务执行超时（秒）；默认至少 `30` 秒                              | `max(30, INFERENCE_TASK_TIMEOUT)`  |
 | `OV_CACHE_DIR`                      | 可选：自定义 OpenVINO 编译缓存目录；未设置时默认使用 `<repo>/cache/openvino`     | `<repo>/cache/openvino`             |
 | `CLIP_IMAGE_BATCH_SIZE`             | `/clip/img` worker 内同尺寸微批上限                                      | `4`                                 |
 | `CLIP_IMAGE_BATCH_WAIT_MS`          | `/clip/img` 微批等待窗口（毫秒）                                          | `5`                                 |
@@ -55,6 +57,7 @@
 - Text-CLIP 已改为常驻独立实例：不再参与非文本模型的卸载/恢复与插队调度，`/clip/txt` 会通过单例本地 RPC 服务直接复用同一份文本模型。
 - `/clip/img` 会在单 worker 内对相邻、同尺寸的图像请求做微批处理，以提高 Intel GPU 吞吐；接口输入输出语义保持不变。
 - `WEB_CONCURRENCY` 只影响 FastAPI worker 数；默认基线为 `1`。若手动放大 worker，Text-CLIP 仍保持单例服务，非文本模型仍建议结合日志观察显存/冷启动时延后再放大。
+- 非文本超时已拆分为“排队超时”和“执行超时”：默认仍保持 `INFERENCE_TASK_TIMEOUT=10` 的排队上限，但执行阶段默认至少给到 `30` 秒，避免模型切族、冷编译或首轮预热直接吃掉排队时间。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认会由 Text-CLIP owner worker 在启动后后台预热一次 RapidOCR，尽量把冷编译成本前移，减少多 worker 首次 OCR 请求命中冷加载超时。

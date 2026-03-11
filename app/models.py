@@ -14,7 +14,7 @@ import traceback
 import types
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Tuple
 
@@ -57,6 +57,12 @@ _SEP_TOKEN_ID = int(_TOKENIZER.vocab["[SEP]"])
 
 QUEUE_MAX_SIZE = int(os.environ.get("INFERENCE_QUEUE_MAX_SIZE", "64"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "10"))
+QUEUE_TIMEOUT_SECONDS = int(
+    os.environ.get("INFERENCE_QUEUE_TIMEOUT", str(TASK_TIMEOUT_SECONDS))
+)
+EXEC_TIMEOUT_SECONDS = int(
+    os.environ.get("INFERENCE_EXEC_TIMEOUT", str(max(30, TASK_TIMEOUT_SECONDS)))
+)
 RAPIDOCR_V5_MOBILE_DET_FILE = "ch_PP-OCRv5_mobile_det.onnx"
 RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
 RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
@@ -471,6 +477,8 @@ class _InferenceTask:
     payload: Any
     future: Future
     created_at: float
+    started_at: Optional[float] = None
+    started_event: threading.Event = field(default_factory=threading.Event)
 
 
 class AIModels:
@@ -561,8 +569,9 @@ class AIModels:
         self._condition = threading.Condition()
         self._normal_queue: Deque[_InferenceTask] = deque()
         self._queue_capacity = max(1, QUEUE_MAX_SIZE)
-        self._task_timeout_seconds = max(1, TASK_TIMEOUT_SECONDS)
-        self._load_lock_timeout_seconds = max(30.0, float(self._task_timeout_seconds))
+        self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
+        self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
+        self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
         self._release_requested = False
         self._stopping = False
 
@@ -577,11 +586,13 @@ class AIModels:
         self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s clip_batch=%s/%sms text_service=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
             self._queue_capacity,
+            self._queue_timeout_seconds,
+            self._execution_timeout_seconds,
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
@@ -723,40 +734,74 @@ class AIModels:
     def _queue_size_locked(self) -> int:
         return len(self._normal_queue)
 
-    def _submit_task(self, kind: TaskType, payload: Any) -> Future:
+    def _submit_task(self, kind: TaskType, payload: Any) -> _InferenceTask:
         future: Future = Future()
         task = _InferenceTask(kind=kind, payload=payload, future=future, created_at=time.time())
         with self._condition:
             if self._stopping:
                 future.set_exception(RuntimeError("模型服务已关闭"))
-                return future
+                return task
             if self._queue_size_locked() >= self._queue_capacity:
                 future.set_exception(
                     RuntimeError(f"推理队列已满（上限 {self._queue_capacity}），请稍后重试")
                 )
-                return future
+                return task
             self._normal_queue.append(task)
             self._condition.notify()
-        return future
+        return task
 
-    def _wait_future(self, future: Future) -> Any:
+    def _cancel_task_if_queued(self, task: _InferenceTask, exc: Exception) -> bool:
+        with self._condition:
+            if task.started_event.is_set():
+                return False
+            try:
+                self._normal_queue.remove(task)
+            except ValueError:
+                return False
+        self._safe_set_exception(task.future, exc)
+        return True
+
+    def _wait_task(self, task: _InferenceTask) -> Any:
+        if task.future.done():
+            return task.future.result()
+
+        started = task.started_event.wait(timeout=self._queue_timeout_seconds)
+        if not started:
+            if task.future.done():
+                return task.future.result()
+            queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
+            if self._cancel_task_if_queued(task, queue_exc):
+                raise queue_exc
+            if not task.started_event.wait(timeout=0.05) and not task.future.done():
+                raise queue_exc
+
         try:
-            return future.result(timeout=self._task_timeout_seconds)
+            return task.future.result(timeout=self._execution_timeout_seconds)
         except FutureTimeoutError as exc:
-            raise RuntimeError(
-                f"推理任务超时（>{self._task_timeout_seconds}s）"
-            ) from exc
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
 
-    async def _await_future(self, future: Future) -> Any:
+    async def _await_task(self, task: _InferenceTask) -> Any:
+        if task.future.done():
+            return task.future.result()
+
+        started = await asyncio.to_thread(task.started_event.wait, self._queue_timeout_seconds)
+        if not started:
+            if task.future.done():
+                return task.future.result()
+            queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
+            if self._cancel_task_if_queued(task, queue_exc):
+                raise queue_exc
+            started = await asyncio.to_thread(task.started_event.wait, 0.05)
+            if not started and not task.future.done():
+                raise queue_exc
+
         try:
             return await asyncio.wait_for(
-                asyncio.wrap_future(future),
-                timeout=self._task_timeout_seconds,
+                asyncio.wrap_future(task.future),
+                timeout=self._execution_timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"推理任务超时（>{self._task_timeout_seconds}s）"
-            ) from exc
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
 
     def _safe_set_result(self, future: Future, value: Any) -> None:
         if not future.done():
@@ -898,7 +943,7 @@ class AIModels:
 
         acquired = self._text_service_lock.acquire(timeout=0.0, blocking=False)
         if not acquired:
-            deadline = time.monotonic() + max(3.0, float(self._task_timeout_seconds))
+            deadline = time.monotonic() + max(3.0, float(self._execution_timeout_seconds))
             while time.monotonic() < deadline:
                 metadata = self._read_text_service_meta()
                 if metadata is not None:
@@ -939,7 +984,7 @@ class AIModels:
         try:
             with socket.create_connection(
                 (_TEXT_RPC_HOST, self._text_service_port),
-                timeout=max(1.0, float(self._task_timeout_seconds)),
+                timeout=max(1.0, float(self._execution_timeout_seconds)),
             ) as conn:
                 request = {"op": "embed", "text": text}
                 conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
@@ -959,7 +1004,7 @@ class AIModels:
             response_line = b""
             with socket.create_connection(
                 (_TEXT_RPC_HOST, self._text_service_port),
-                timeout=max(1.0, float(self._task_timeout_seconds)),
+                timeout=max(1.0, float(self._execution_timeout_seconds)),
             ) as conn:
                 request = {"op": "embed", "text": text}
                 conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
@@ -1018,6 +1063,8 @@ class AIModels:
                     self._release_requested = False
                 elif self._normal_queue:
                     normal_task = self._normal_queue.popleft()
+                    normal_task.started_at = time.monotonic()
+                    normal_task.started_event.set()
 
             if normal_task is not None:
                 if normal_task.kind == "clip_img":
@@ -1072,7 +1119,10 @@ class AIModels:
                 next_image, _ = next_task.payload
                 if tuple(np.asarray(next_image).shape[:2]) != batch_shape:
                     return batch
-                batch.append(self._normal_queue.popleft())
+                popped = self._normal_queue.popleft()
+                popped.started_at = time.monotonic()
+                popped.started_event.set()
+                batch.append(popped)
         return batch
 
     def _handle_clip_image_tasks(self, tasks: List[_InferenceTask]) -> None:
@@ -2225,28 +2275,28 @@ class AIModels:
 
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         payload = (image, filename)
-        future = self._submit_task(kind="clip_img", payload=payload)
-        return self._wait_future(future)
+        task = self._submit_task(kind="clip_img", payload=payload)
+        return self._wait_task(task)
 
     async def get_image_embedding_async(
         self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
         payload = (image, filename)
-        future = self._submit_task(kind="clip_img", payload=payload)
-        return await self._await_future(future)
+        task = self._submit_task(kind="clip_img", payload=payload)
+        return await self._await_task(task)
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        future = self._submit_task(kind="ocr", payload=image)
-        return self._wait_future(future)
+        task = self._submit_task(kind="ocr", payload=image)
+        return self._wait_task(task)
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        future = self._submit_task(kind="ocr", payload=image)
-        return await self._await_future(future)
+        task = self._submit_task(kind="ocr", payload=image)
+        return await self._await_task(task)
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        future = self._submit_task(kind="face", payload=image)
-        return self._wait_future(future)
+        task = self._submit_task(kind="face", payload=image)
+        return self._wait_task(task)
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        future = self._submit_task(kind="face", payload=image)
-        return await self._await_future(future)
+        task = self._submit_task(kind="face", payload=image)
+        return await self._await_task(task)

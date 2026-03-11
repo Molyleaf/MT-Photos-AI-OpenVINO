@@ -181,8 +181,9 @@
 2. `/clip/txt` 不再进入非文本推理队列，也不再依赖“文本优先级/回切窗口”状态机；文本请求始终走独立常驻实例。
 3. 非文本模型（Vision-CLIP / OCR / InsightFace）仍采用队列化串行调度，并在单 worker 内保持“同一时刻一个主模型族”。
 4. `/clip/img` 必须在单 worker 内做“相邻同尺寸请求”的受控微批；若尺寸不一致或队列被其他任务打断，必须立即退回单请求执行。
-5. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
-6. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+5. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖排队、切族、模型加载与执行，导致冷启动结构性误杀。
+6. `WEB_CONCURRENCY` 不得放大 Text-CLIP 副本数；多 worker 下必须复用同一个后台 Text-CLIP 服务实例。
+7. `POST /restart` 仅释放当前非文本模型族；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
 
 ---
 
@@ -317,6 +318,7 @@
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，多 worker 下共享同一后台实例，不再参与非文本队列插队与回切。
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为单 worker 内相邻同尺寸微批，维持 PPP 预处理与接口语义不变，同时提升 GPU 利用率。
 - 收敛 OCR 冷启动：Text-CLIP owner worker 会在启动后后台预热一次 RapidOCR，并把默认 `cfg_openvino_cpu.yaml` 的 `performance_hint` 收敛为 `LATENCY`，降低首个 OCR 请求超时风险。
+- 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
@@ -344,6 +346,7 @@ services:
       - WEB_CONCURRENCY=1
       - INFERENCE_QUEUE_MAX_SIZE=64
       - INFERENCE_TASK_TIMEOUT=10
+      - INFERENCE_EXEC_TIMEOUT=30
 ```
 
 说明：
