@@ -62,7 +62,8 @@ RUN set -eux; \
 RUN set -eux; \
     groupadd --gid "${APP_GID}" appgroup; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
-    mkdir -p /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/rapidocr /models/cache/openvino; \
+    mkdir -p /cache /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/rapidocr /models/cache/openvino; \
+    chmod 777 /cache; \
     chown -R appuser:appgroup /app /models
 
 COPY --chown=appuser:appgroup app /app
