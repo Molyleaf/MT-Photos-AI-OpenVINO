@@ -26,7 +26,8 @@ import openvino as ov
 import yaml
 from insightface.app import FaceAnalysis
 from rapidocr import RapidOCR
-from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecInput, TextRecOutput
+from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecOutput
+from rapidocr.ch_ppocr_rec.main import LangRec, VisRes, reorder_bidi_for_display
 from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
 
@@ -164,8 +165,13 @@ def _patch_rapidocr_openvino_device_selection() -> None:
 
     def _patched_init(self: Any, cfg: Any) -> None:
         engine_cfg = cfg.get("engine_cfg", {}) or {}
+        stage_device = cfg.get("device_name", None)
         configured_device = _normalize_non_text_openvino_device(
-            str(engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)))
+            str(
+                stage_device
+                if stage_device not in (None, "")
+                else engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE))
+            )
         )
         core = Core()
         selected_device = _resolve_non_text_openvino_runtime_device(
@@ -267,7 +273,7 @@ def _as_float(value: Any, default: float) -> float:
 def _normalize_openvino_devices(devices: Any) -> List[str]:
     normalized: List[str] = []
     for item in devices or []:
-        device_name = str(item).strip().upper()
+        device_name = str(item).strip().upper().strip("()")
         if device_name:
             normalized.append(device_name)
     return normalized
@@ -463,6 +469,64 @@ def _openvino_device_expr_requests_gpu(device_expr: str) -> bool:
     if normalized.startswith("GPU"):
         return True
     return any(token.startswith("GPU") for token in _split_openvino_device_expr(normalized))
+
+
+def _openvino_device_expr_requests_cpu(device_expr: str) -> bool:
+    normalized = str(device_expr or "").strip().upper()
+    if not normalized:
+        return False
+    if normalized.startswith("CPU"):
+        return True
+    return any(token.startswith("CPU") for token in _split_openvino_device_expr(normalized))
+
+
+def _openvino_device_expr_requests_npu(device_expr: str) -> bool:
+    normalized = str(device_expr or "").strip().upper()
+    if not normalized:
+        return False
+    if normalized.startswith("NPU"):
+        return True
+    return any(token.startswith("NPU") for token in _split_openvino_device_expr(normalized))
+
+
+def _default_rapidocr_stage_device(base_device: str, stage_name: str) -> str:
+    normalized = _normalize_non_text_openvino_device(base_device)
+    stage = str(stage_name).strip().lower()
+    if stage == "cls":
+        if _openvino_device_expr_requests_npu(normalized) and not _openvino_device_expr_requests_cpu(
+            normalized
+        ):
+            return "CPU"
+        return "CPU"
+
+    if _openvino_device_expr_requests_cpu(normalized):
+        return "CPU"
+    if _openvino_device_expr_requests_npu(normalized):
+        return "NPU"
+    if _openvino_device_expr_requests_gpu(normalized) or normalized == "AUTO":
+        return "GPU"
+    return normalized
+
+
+def _ensure_intel_opencl_device(feature_name: str) -> Tuple[str, str]:
+    cv2.ocl.setUseOpenCL(True)
+    if not cv2.ocl.haveOpenCL() or not cv2.ocl.useOpenCL():
+        raise RuntimeError(
+            f"{feature_name} requires OpenCV OpenCL, but OpenCL is unavailable. "
+            "No silent fallback is allowed."
+        )
+
+    device = cv2.ocl.Device_getDefault()
+    vendor = str(device.vendorName())
+    name = str(device.name())
+    if "INTEL" not in vendor.upper():
+        raise RuntimeError(
+            f"{feature_name} requires Intel OpenCL device. "
+            f"Current OpenCL device: {name} ({vendor}). "
+            "Set OPENCV_OPENCL_DEVICE to Intel GPU and retry. "
+            "No silent fallback is allowed."
+        )
+    return name, vendor
 
 
 def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
@@ -823,6 +887,8 @@ class AIModels:
         )
         self._rapidocr_engine: Optional[RapidOCR] = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
+        self._ocr_opencl_device_name: Optional[str] = None
+        self._ocr_opencl_device_vendor: Optional[str] = None
         self._face_engine: Optional[FaceAnalysis] = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
@@ -1620,6 +1686,8 @@ class AIModels:
     def _unload_rapidocr_model_locked(self) -> None:
         self._rapidocr_engine = None
         self._rapidocr_runtime_cfg = None
+        self._ocr_opencl_device_name = None
+        self._ocr_opencl_device_vendor = None
 
     def _unload_rapidocr_model(self) -> None:
         with self._rapidocr_load_lock:
@@ -1902,10 +1970,14 @@ class AIModels:
         return self.rapidocr_config_path
 
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
+        base_device = _normalize_non_text_openvino_device(
+            os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)
+        )
         config: Dict[str, Any] = {
-            "device_name": _normalize_non_text_openvino_device(
-                os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)
-            ),
+            "device_name": base_device,
+            "det_device_name": None,
+            "cls_device_name": None,
+            "rec_device_name": None,
             "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
             "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "THROUGHPUT"),
             "performance_num_requests": _as_int(
@@ -1944,6 +2016,8 @@ class AIModels:
                 )
 
             det_cfg = loaded.get("Det", {})
+            if "device_name" in det_cfg:
+                config["det_device_name"] = det_cfg.get("device_name")
             if "limit_side_len" in det_cfg:
                 config["det_limit_side_len"] = _as_int(
                     det_cfg.get("limit_side_len"), config["det_limit_side_len"]
@@ -1955,12 +2029,16 @@ class AIModels:
                 )
 
             rec_cfg = loaded.get("Rec", {})
+            if "device_name" in rec_cfg:
+                config["rec_device_name"] = rec_cfg.get("device_name")
             if "rec_batch_num" in rec_cfg:
                 config["rec_batch_num"] = max(
                     1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
                 )
 
             cls_cfg = loaded.get("Cls", {})
+            if "device_name" in cls_cfg:
+                config["cls_device_name"] = cls_cfg.get("device_name")
             if "cls_batch_num" in cls_cfg:
                 config["cls_batch_num"] = max(
                     1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
@@ -1973,6 +2051,24 @@ class AIModels:
         env_override_map: Dict[str, Tuple[str, Any]] = {
             "RAPIDOCR_DEVICE": (
                 "device_name",
+                lambda value, default: _normalize_non_text_openvino_device(
+                    str(value).strip() or default
+                ),
+            ),
+            "RAPIDOCR_DET_DEVICE": (
+                "det_device_name",
+                lambda value, default: _normalize_non_text_openvino_device(
+                    str(value).strip() or default
+                ),
+            ),
+            "RAPIDOCR_CLS_DEVICE": (
+                "cls_device_name",
+                lambda value, default: _normalize_non_text_openvino_device(
+                    str(value).strip() or default
+                ),
+            ),
+            "RAPIDOCR_REC_DEVICE": (
+                "rec_device_name",
                 lambda value, default: _normalize_non_text_openvino_device(
                     str(value).strip() or default
                 ),
@@ -2039,6 +2135,12 @@ class AIModels:
         config["device_name"] = _normalize_non_text_openvino_device(
             config.get("device_name", _DEFAULT_NON_TEXT_OV_DEVICE)
         )
+        for stage_name in ("det", "cls", "rec"):
+            stage_key = f"{stage_name}_device_name"
+            stage_value = config.get(stage_key)
+            if stage_value in (None, ""):
+                stage_value = _default_rapidocr_stage_device(config["device_name"], stage_name)
+            config[stage_key] = _normalize_non_text_openvino_device(stage_value)
         if self.ov_cache_dir is not None:
             config["cache_dir"] = str(self.ov_cache_dir)
         config["runtime_device_name"] = _resolve_non_text_openvino_runtime_device(
@@ -2046,6 +2148,27 @@ class AIModels:
             self.core.available_devices,
             consumer="openvino",
         )
+        for stage_name in ("det", "cls", "rec"):
+            stage_runtime_key = f"{stage_name}_runtime_device_name"
+            stage_device_key = f"{stage_name}_device_name"
+            config[stage_runtime_key] = _resolve_non_text_openvino_runtime_device(
+                str(config[stage_device_key]),
+                self.core.available_devices,
+                consumer="openvino",
+            )
+        config["preprocess_backends"] = {
+            "det": (
+                "opencl"
+                if _openvino_device_expr_requests_gpu(str(config["det_runtime_device_name"]))
+                else "cpu"
+            ),
+            "cls": "cpu",
+            "rec": (
+                "opencl"
+                if _openvino_device_expr_requests_gpu(str(config["rec_runtime_device_name"]))
+                else "cpu"
+            ),
+        }
         return config
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
@@ -2080,6 +2203,9 @@ class AIModels:
             "EngineConfig.openvino.device_name": str(
                 cfg.get("runtime_device_name", cfg.get("device_name", "AUTO"))
             ),
+            "Det.device_name": str(cfg.get("det_runtime_device_name", cfg.get("det_device_name", "AUTO"))),
+            "Cls.device_name": str(cfg.get("cls_runtime_device_name", cfg.get("cls_device_name", "AUTO"))),
+            "Rec.device_name": str(cfg.get("rec_runtime_device_name", cfg.get("rec_device_name", "AUTO"))),
             "EngineConfig.openvino.inference_num_threads": _as_int(
                 cfg.get("inference_num_threads"), -1
             ),
@@ -2202,25 +2328,208 @@ class AIModels:
         return execution_devices
 
     @staticmethod
+    def _rapidocr_execution_matches_requested_device(
+        requested_device: str,
+        actual_devices: List[str],
+    ) -> bool:
+        normalized_actual = _normalize_openvino_devices(actual_devices)
+        if not normalized_actual:
+            return False
+        if _openvino_device_expr_requests_gpu(requested_device):
+            return _has_openvino_gpu_device(normalized_actual)
+        if _openvino_device_expr_requests_cpu(requested_device):
+            return any(device_name.startswith("CPU") for device_name in normalized_actual)
+        if _openvino_device_expr_requests_npu(requested_device):
+            return any(device_name.startswith("NPU") for device_name in normalized_actual)
+        return False
+
+    @staticmethod
     def _validate_rapidocr_execution_devices(
         cfg: Dict[str, Any],
         execution_devices: Dict[str, List[str]],
     ) -> None:
-        runtime_device = str(cfg.get("runtime_device_name", cfg.get("device_name", "AUTO")))
-        if not _openvino_device_expr_requests_gpu(runtime_device):
-            return
-
-        cpu_fallback_stages = [
+        mismatched_stages = [
             stage_name
             for stage_name in ("det", "cls", "rec")
-            if not _has_openvino_gpu_device(execution_devices.get(stage_name))
+            if not AIModels._rapidocr_execution_matches_requested_device(
+                str(
+                    cfg.get(
+                        f"{stage_name}_runtime_device_name",
+                        cfg.get(f"{stage_name}_device_name", cfg.get("runtime_device_name", "AUTO")),
+                    )
+                ),
+                execution_devices.get(stage_name, []),
+            )
         ]
-        if cpu_fallback_stages:
+        if mismatched_stages:
+            expected_devices = {
+                stage_name: str(
+                    cfg.get(
+                        f"{stage_name}_runtime_device_name",
+                        cfg.get(f"{stage_name}_device_name", cfg.get("runtime_device_name", "AUTO")),
+                    )
+                )
+                for stage_name in ("det", "cls", "rec")
+            }
             raise RuntimeError(
                 "RapidOCR execution device validation failed: "
-                f"runtime_device={runtime_device}, execution_devices={execution_devices}, "
-                f"cpu_fallback_stages={cpu_fallback_stages}. No silent fallback is allowed."
+                f"expected_devices={expected_devices}, execution_devices={execution_devices}, "
+                f"mismatched_stages={mismatched_stages}. No silent fallback is allowed."
             )
+
+    def _ensure_ocr_opencl_preprocess(self, cfg: Dict[str, Any]) -> None:
+        preprocess_backends = cfg.get("preprocess_backends", {}) or {}
+        if "opencl" not in preprocess_backends.values():
+            return
+
+        name, vendor = _ensure_intel_opencl_device("RapidOCR preprocessing")
+        self._ocr_opencl_device_name = name
+        self._ocr_opencl_device_vendor = vendor
+
+    @staticmethod
+    def _resize_image_opencl(image: np.ndarray, width: int, height: int) -> np.ndarray:
+        resized = cv2.resize(cv2.UMat(image), (int(width), int(height)))
+        if isinstance(resized, cv2.UMat):
+            return _as_contiguous_bgr_uint8(resized.get(), context="RapidOCR OpenCL resize")
+        return _as_contiguous_bgr_uint8(np.asarray(resized), context="RapidOCR OpenCL resize")
+
+    @staticmethod
+    def _rapidocr_blob_from_image_opencl(
+        image: np.ndarray,
+        target_width: int,
+        target_height: int,
+        mean_values: List[float],
+        std_values: List[float],
+    ) -> np.ndarray:
+        prepared = _as_contiguous_bgr_uint8(image, context="RapidOCR OpenCL preprocess")
+        mean = [float(value) for value in mean_values]
+        std = [float(value) for value in std_values]
+        if not std or max(std) - min(std) > 1e-6:
+            raise RuntimeError(
+                "RapidOCR OpenCL preprocess requires uniform std values per channel. "
+                f"Got std={std_values}"
+            )
+        scalefactor = 1.0 / (255.0 * std[0])
+        mean_pixels = tuple(float(value) * 255.0 for value in mean)
+        blob = cv2.dnn.blobFromImage(
+            cv2.UMat(prepared),
+            scalefactor=scalefactor,
+            size=(int(target_width), int(target_height)),
+            mean=mean_pixels,
+            swapRB=False,
+            crop=False,
+        )
+        return np.ascontiguousarray(blob, dtype=np.float32)
+
+    @staticmethod
+    def _rapidocr_resize_image_within_bounds_opencl(
+        image: np.ndarray,
+        min_side_len: float,
+        max_side_len: float,
+    ) -> Tuple[np.ndarray, float, float]:
+        img = _as_contiguous_bgr_uint8(image, context="RapidOCR preprocess")
+        h, w = img.shape[:2]
+        ratio_h = ratio_w = 1.0
+
+        max_value = max(h, w)
+        if max_value > max_side_len:
+            scale = float(max_side_len) / float(max_value)
+            resize_h = int(round((h * scale) / 32.0) * 32)
+            resize_w = int(round((w * scale) / 32.0) * 32)
+            if resize_h <= 0 or resize_w <= 0:
+                raise RapidOCRError("RapidOCR preprocess resize target is invalid.")
+            img = AIModels._resize_image_opencl(img, resize_w, resize_h)
+            ratio_h = h / float(resize_h)
+            ratio_w = w / float(resize_w)
+
+        h, w = img.shape[:2]
+        min_value = min(h, w)
+        if min_value < min_side_len:
+            scale = float(min_side_len) / float(min_value)
+            resize_h = int(round((h * scale) / 32.0) * 32)
+            resize_w = int(round((w * scale) / 32.0) * 32)
+            if resize_h <= 0 or resize_w <= 0:
+                raise RapidOCRError("RapidOCR preprocess resize target is invalid.")
+            img = AIModels._resize_image_opencl(img, resize_w, resize_h)
+            ratio_h = h / float(resize_h)
+            ratio_w = w / float(resize_w)
+        return img, ratio_h, ratio_w
+
+    @staticmethod
+    def _rapidocr_det_resize_shape(
+        image: np.ndarray,
+        limit_side_len: int,
+        limit_type: str,
+    ) -> Optional[Tuple[int, int]]:
+        h, w = image.shape[:2]
+        if limit_type == "max":
+            if max(h, w) > limit_side_len:
+                ratio = float(limit_side_len) / float(max(h, w))
+            else:
+                ratio = 1.0
+        else:
+            if min(h, w) < limit_side_len:
+                ratio = float(limit_side_len) / float(min(h, w))
+            else:
+                ratio = 1.0
+
+        resize_h = int(round((h * ratio) / 32.0) * 32)
+        resize_w = int(round((w * ratio) / 32.0) * 32)
+        if resize_h <= 0 or resize_w <= 0:
+            return None
+        return resize_h, resize_w
+
+    @staticmethod
+    def _rapidocr_detect_opencl(detector: Any, image: np.ndarray) -> TextDetOutput:
+        start_time = time.perf_counter()
+        if image is None:
+            raise ValueError("img is None")
+
+        image_bgr = _as_contiguous_bgr_uint8(image, context="RapidOCR det")
+        ori_img_shape = image_bgr.shape[0], image_bgr.shape[1]
+        preprocess_op = detector.get_preprocess(max(image_bgr.shape[0], image_bgr.shape[1]))
+        detector.preprocess_op = preprocess_op
+        resize_shape = AIModels._rapidocr_det_resize_shape(
+            image_bgr,
+            int(preprocess_op.limit_side_len),
+            str(preprocess_op.limit_type),
+        )
+        if resize_shape is None:
+            return TextDetOutput()
+        resize_h, resize_w = resize_shape
+        prepro_img = AIModels._rapidocr_blob_from_image_opencl(
+            image_bgr,
+            target_width=resize_w,
+            target_height=resize_h,
+            mean_values=preprocess_op.mean.tolist(),
+            std_values=preprocess_op.std.tolist(),
+        )
+        preds = detector.session(prepro_img)
+        boxes, scores = detector.postprocess_op(preds, ori_img_shape)
+        if len(boxes) < 1:
+            return TextDetOutput()
+
+        boxes = detector.sorted_boxes(boxes)
+        return TextDetOutput(image_bgr, boxes, scores, elapse=time.perf_counter() - start_time)
+
+    def _rapidocr_preprocess_img(
+        self,
+        engine: RapidOCR,
+        ori_img: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        runtime_cfg = self._rapidocr_runtime_cfg or {}
+        preprocess_backends = runtime_cfg.get("preprocess_backends", {}) or {}
+        if preprocess_backends.get("det") != "opencl":
+            return engine.preprocess_img(ori_img)
+
+        op_record: Dict[str, Any] = {}
+        img, ratio_h, ratio_w = self._rapidocr_resize_image_within_bounds_opencl(
+            ori_img,
+            engine.min_side_len,
+            engine.max_side_len,
+        )
+        op_record["preprocess"] = {"ratio_h": ratio_h, "ratio_w": ratio_w}
+        return img, op_record
 
     def _warmup_rapidocr_locked(self) -> None:
         if self._rapidocr_engine is None:
@@ -2265,8 +2574,27 @@ class AIModels:
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
         self._reconfigure_rapidocr_stage_executors(config)
+        self._ensure_ocr_opencl_preprocess(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
+        setattr(self._rapidocr_engine.text_det, "_mt_runtime_device_name", config.get("det_runtime_device_name"))
+        setattr(self._rapidocr_engine.text_cls, "_mt_runtime_device_name", config.get("cls_runtime_device_name"))
+        setattr(self._rapidocr_engine.text_rec, "_mt_runtime_device_name", config.get("rec_runtime_device_name"))
+        setattr(
+            self._rapidocr_engine.text_det,
+            "_mt_preprocess_backend",
+            (config.get("preprocess_backends", {}) or {}).get("det", "cpu"),
+        )
+        setattr(
+            self._rapidocr_engine.text_cls,
+            "_mt_preprocess_backend",
+            (config.get("preprocess_backends", {}) or {}).get("cls", "cpu"),
+        )
+        setattr(
+            self._rapidocr_engine.text_rec,
+            "_mt_preprocess_backend",
+            (config.get("preprocess_backends", {}) or {}).get("rec", "cpu"),
+        )
         execution_devices = self._collect_rapidocr_execution_devices(self._rapidocr_engine)
         self._validate_rapidocr_execution_devices(config, execution_devices)
         self._rapidocr_runtime_cfg = dict(config)
@@ -2276,18 +2604,34 @@ class AIModels:
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
         LOG.info(
-            "RapidOCR ready: config=%s device=%s runtime_device=%s exec_devices=%s hint=%s use_cls=%s max_side_len=%s "
-            "det_limit=%s/%s rec_batch_num=%s ocr_stage_workers=%s",
+            "RapidOCR ready: config=%s device=%s stage_devices=%s stage_runtime_devices=%s exec_devices=%s preprocess_backends=%s opencl_device=%s hint=%s use_cls=%s max_side_len=%s "
+            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_stage_workers=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
-            config.get("runtime_device_name"),
+            {
+                "det": config.get("det_device_name"),
+                "cls": config.get("cls_device_name"),
+                "rec": config.get("rec_device_name"),
+            },
+            {
+                "det": config.get("det_runtime_device_name"),
+                "cls": config.get("cls_runtime_device_name"),
+                "rec": config.get("rec_runtime_device_name"),
+            },
             execution_devices or "unknown",
+            config.get("preprocess_backends"),
+            (
+                f"{self._ocr_opencl_device_name} ({self._ocr_opencl_device_vendor})"
+                if self._ocr_opencl_device_name and self._ocr_opencl_device_vendor
+                else "disabled"
+            ),
             config.get("performance_hint"),
             config.get("use_cls"),
             config.get("max_side_len"),
             config.get("det_limit_type"),
             config.get("det_limit_side_len"),
             config.get("rec_batch_num"),
+            config.get("cls_batch_num"),
             self._ocr_stage_worker_count,
         )
 
@@ -2343,24 +2687,7 @@ class AIModels:
 
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:
-        cv2.ocl.setUseOpenCL(True)
-        if not cv2.ocl.haveOpenCL() or not cv2.ocl.useOpenCL():
-            raise RuntimeError(
-                "InsightFace alignment requires OpenCV OpenCL, but OpenCL is unavailable. "
-                "No silent fallback is allowed."
-            )
-
-        device = cv2.ocl.Device_getDefault()
-        vendor = str(device.vendorName())
-        name = str(device.name())
-        if "INTEL" not in vendor.upper():
-            raise RuntimeError(
-                "InsightFace alignment requires Intel OpenCL device. "
-                f"Current OpenCL device: {name} ({vendor}). "
-                "Set OPENCV_OPENCL_DEVICE to Intel GPU and retry. "
-                "No silent fallback is allowed."
-            )
-
+        name, vendor = _ensure_intel_opencl_device("InsightFace alignment")
         LOG.info(
             "OpenCV OpenCL enabled for InsightFace alignment on Intel device: %s (%s).",
             name,
@@ -2942,9 +3269,11 @@ class AIModels:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
 
-        # Zero-copy fast path: keep contiguous OpenCV BGR buffer when possible.
-        ocr_input = _as_contiguous_bgr_uint8(image, context="OCR")
-        return self._ocr_result_from_raw(self._rapidocr_engine(ocr_input))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._infer_ocr_async(image))
+        raise RuntimeError("Synchronous OCR inference cannot run inside an active event loop.")
 
     @staticmethod
     def _ocr_result_from_raw(raw_result: Any) -> OCRResult:
@@ -3002,8 +3331,8 @@ class AIModels:
         loop = asyncio.get_running_loop()
         return loop.run_in_executor(executor, partial(func, *args))
 
-    @staticmethod
     def _rapidocr_detect_and_pad(
+        self,
         engine: RapidOCR,
         image: np.ndarray,
         op_record: Dict[str, Any],
@@ -3014,7 +3343,11 @@ class AIModels:
             engine.width_height_ratio,
             engine.min_height,
         )
-        return padded, updated_record, engine.text_det(padded)
+        detector = engine.text_det
+        preprocess_backend = str(getattr(detector, "_mt_preprocess_backend", "cpu")).strip().lower()
+        if preprocess_backend == "opencl":
+            return padded, updated_record, self._rapidocr_detect_opencl(detector, padded)
+        return padded, updated_record, detector(padded)
 
     def _rapidocr_crop_regions(self, image: np.ndarray, det_boxes: np.ndarray) -> List[np.ndarray]:
         boxes = np.asarray(det_boxes, dtype=np.float32)
@@ -3102,8 +3435,89 @@ class AIModels:
         return batch_indices, rotated_images, normalized_results
 
     @staticmethod
+    def _rapidocr_recognize_single_batch(
+        recognizer: Any,
+        images: List[np.ndarray],
+        *,
+        return_word_box: bool,
+    ) -> TextRecOutput:
+        start_time = time.perf_counter()
+        img_list = list(images)
+        if not img_list:
+            return TextRecOutput(imgs=[], txts=(), scores=[], word_results=(), elapse=0.0)
+
+        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
+        indices = np.argsort(np.array(width_list))
+        img_num = len(img_list)
+        rec_res: List[Tuple[Tuple[str, float], Any]] = [(("", 0.0), None)] * img_num
+
+        img_c, img_h, img_w = recognizer.rec_image_shape[:3]
+        max_wh_ratio = img_w / img_h
+        wh_ratio_list: List[float] = []
+        ordered_images = [img_list[int(indices[ino])] for ino in range(img_num)]
+        for image in ordered_images:
+            h, w = image.shape[:2]
+            wh_ratio = w * 1.0 / h
+            max_wh_ratio = max(max_wh_ratio, wh_ratio)
+            wh_ratio_list.append(wh_ratio)
+
+        target_width = int(max(img_w, round(img_h * max_wh_ratio)))
+        preprocess_backend = str(getattr(recognizer, "_mt_preprocess_backend", "cpu")).strip().lower()
+        norm_img_batch: List[np.ndarray] = []
+        for image in ordered_images:
+            if preprocess_backend == "opencl":
+                ratio = image.shape[1] / float(image.shape[0])
+                resized_w = min(target_width, int(np.ceil(img_h * ratio)))
+                blob = AIModels._rapidocr_blob_from_image_opencl(
+                    image,
+                    target_width=resized_w,
+                    target_height=int(img_h),
+                    mean_values=[0.5, 0.5, 0.5],
+                    std_values=[0.5, 0.5, 0.5],
+                )[0]
+                padding_im = np.zeros((img_c, img_h, target_width), dtype=np.float32)
+                padding_im[:, :, :resized_w] = blob[:, :, :resized_w]
+                norm_img_batch.append(padding_im)
+            else:
+                norm_img_batch.append(recognizer.resize_norm_img(image, max_wh_ratio))
+
+        batch = np.stack(norm_img_batch, axis=0).astype(np.float32)
+        preds = recognizer.session(batch)
+        line_results, word_results = recognizer.postprocess_op(
+            preds,
+            return_word_box,
+            wh_ratio_list=wh_ratio_list,
+            max_wh_ratio=max_wh_ratio,
+        )
+
+        for result_index, one_res in enumerate(line_results):
+            original_index = int(indices[result_index])
+            if return_word_box:
+                rec_res[original_index] = (one_res, word_results[result_index])
+            else:
+                rec_res[original_index] = (one_res, None)
+
+        all_line_results, all_word_results = list(zip(*rec_res))
+        txts, scores = list(zip(*all_line_results))
+        if recognizer.cfg.lang_type == LangRec.ARABIC:
+            txts = reorder_bidi_for_display(txts)
+
+        return TextRecOutput(
+            img_list,
+            txts,
+            scores,
+            all_word_results,
+            time.perf_counter() - start_time,
+            viser=VisRes(lang_type=recognizer.cfg.lang_type, font_path=recognizer.cfg.font_path),
+        )
+
+    @staticmethod
     def _rapidocr_recognize(engine: RapidOCR, images: List[np.ndarray]) -> TextRecOutput:
-        rec_res = engine.text_rec(TextRecInput(img=images, return_word_box=engine.return_word_box))
+        rec_res = AIModels._rapidocr_recognize_single_batch(
+            engine.text_rec,
+            images,
+            return_word_box=engine.return_word_box,
+        )
         if rec_res.txts is None:
             raise RapidOCRError("The text recognize result is empty")
         return rec_res
@@ -3238,7 +3652,8 @@ class AIModels:
         stage_started_at = time.perf_counter()
         img, op_record = await self._run_in_executor(
             self._shared_cpu_executor,
-            engine.preprocess_img,
+            self._rapidocr_preprocess_img,
+            engine,
             ori_img,
         )
         preprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
@@ -3318,7 +3733,7 @@ class AIModels:
             runtime_cfg = self._rapidocr_runtime_cfg or {}
             box_count = 0 if det_res.boxes is None else int(len(det_res.boxes))
             LOG.warning(
-                "RapidOCR slow request: total=%.1fms preprocess=%.1fms det=%.1fms crop=%.1fms cls=%.1fms rec=%.1fms assemble=%.1fms boxes=%s runtime_device=%s exec_devices=%s",
+                "RapidOCR slow request: total=%.1fms preprocess=%.1fms det=%.1fms crop=%.1fms cls=%.1fms rec=%.1fms assemble=%.1fms boxes=%s stage_runtime_devices=%s exec_devices=%s preprocess_backends=%s",
                 total_ms,
                 preprocess_ms,
                 det_ms,
@@ -3327,8 +3742,13 @@ class AIModels:
                 rec_ms,
                 assemble_ms,
                 box_count,
-                runtime_cfg.get("runtime_device_name", runtime_cfg.get("device_name", "unknown")),
+                {
+                    "det": runtime_cfg.get("det_runtime_device_name"),
+                    "cls": runtime_cfg.get("cls_runtime_device_name"),
+                    "rec": runtime_cfg.get("rec_runtime_device_name"),
+                },
                 runtime_cfg.get("execution_devices", "unknown"),
+                runtime_cfg.get("preprocess_backends", "unknown"),
             )
         return self._ocr_result_from_raw(raw_result)
 

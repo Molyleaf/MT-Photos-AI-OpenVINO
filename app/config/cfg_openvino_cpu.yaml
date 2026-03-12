@@ -14,6 +14,8 @@ Global:
 
 EngineConfig:
   openvino:
+    # Code-level defaults derive stage devices as det=GPU / cls=CPU / rec=GPU when device_name=AUTO/GPU.
+    # Set RAPIDOCR_DEVICE=CPU (or stage-specific RAPIDOCR_*_DEVICE) to force pure-CPU validation.
     device_name: "AUTO"
     inference_num_threads: -1
     performance_hint: "THROUGHPUT"
