@@ -78,12 +78,15 @@
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
 - 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
 - OpenVINO 参数基线：`device_name=AUTO`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
+- OCR `Det/Cls/Rec` 三个 stage 执行器的 worker 数默认必须与 `performance_num_requests` 对齐（当前基线 `2`）；禁止 app 层仍固定单 worker 导致 runtime request budget 空转。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
 - 默认缓存目录应收敛到仓库内可写路径（当前基线 `<PROJECT_ROOT>/cache/openvino`）；仅在显式设置 `OV_CACHE_DIR` 时覆盖默认值。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
+- RapidOCR OpenVINO patch 必须在线程内复用 `InferRequest`；禁止每次调用都重新 `create_infer_request()`。
+- RapidOCR 分类阶段必须校验 OpenVINO 批输出条数；若返回条数与当前批长度不一致，必须自动退回单张分类，禁止出现 `IndexError` 或越界写回。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
@@ -96,6 +99,7 @@
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
 - 必须兼容 `insightface` 旧版 `FaceAnalysis.__init__` 不支持 `providers/allowed_modules` 的情况；此时必须在会话级显式设置 `OpenVINOExecutionProvider` 并校验 provider 顺序。
+- InsightFace 兼容性判断禁止只依赖 `inspect.signature()` 静态签名；必须基于真实实例化结果做兼容重试，避免 `__init__(**kwargs)` 继续把不受支持参数透传到内部实现后再报错。
 - 对 `insightface` 旧版模型路由不兼容时，允许运行时构造仅含检测+识别必需 ONNX 的模型目录用于初始化，但不得改变 `/represent` 接口语义与返回字段。
 - 对齐阶段必须使用 OpenCV + Intel OpenCL（`warpAffine` OpenCL 路径）；OpenCL 不可用或设备非 Intel 时必须直接报错，禁止静默回退 CPU。
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
@@ -327,12 +331,13 @@
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为标准预处理后聚合批推理，维持 PPP 归一化与接口语义不变，同时提升 GPU 利用率。
 - 收敛 OCR 启动行为：默认改为首次 `/ocr` 请求时才懒加载 OCR；如显式开启 `OCR_PREWARM_ENABLED=true`，只做一次性预热并立即释放 OCR，且 `/restart` 会取消未完成的预热。
 - 修复 InsightFace 五点对齐弃用 API warning：本地重写相似变换矩阵估计，保持 OpenCL `warpAffine` 路径与输出语义不变。
-- 修复 RapidOCR 方向分类批次越界：对 OpenVINO 返回结果按当前批次长度裁剪，并移除 crop 深拷贝以降低 OCR CPU 开销。
+- 修复 RapidOCR 方向分类批次越界：当 OpenVINO 分类输出条数与输入批长度不一致时，自动退回单张分类，避免 `IndexError`。
 - 收敛非文本模型路径：Vision-CLIP / OCR / InsightFace 保持各自独立执行路径，但模型准入改为单活租约切换；文本 CLIP 仍常驻。
-- 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
+- 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`，且 `Det/Cls/Rec` stage worker 数与 `performance_num_requests` 对齐；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
 - 收敛 OpenVINO 同步推理调用：InsightFace PPP runner、RapidOCR OpenVINO patch 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
-- 修复 InsightFace 旧版本兼容问题：当 `FaceAnalysis.__init__` 不支持 `providers` 参数时，运行时显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
+- 修复 InsightFace 旧版本兼容问题：当构造阶段不支持 `providers` / `provider_options` / `allowed_modules` 参数时，运行时按兼容顺序重试实例化，再显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
+- 收敛 RapidOCR OpenVINO 请求复用：OCR det/cls/rec 会在线程内复用 `InferRequest`，不再每次调用重新 `create_infer_request()`。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
 - 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。

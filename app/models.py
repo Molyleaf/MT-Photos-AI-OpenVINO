@@ -115,15 +115,33 @@ def _patch_rapidocr_openvino_multi_output() -> None:
     if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
         return
 
+    def _get_thread_local_request(self: Any, compiled_model: ov.CompiledModel) -> ov.InferRequest:
+        request_local = getattr(self, "_mt_request_local", None)
+        if request_local is None:
+            request_local = threading.local()
+            self._mt_request_local = request_local
+
+        request = getattr(request_local, "request", None)
+        if request is None:
+            request = compiled_model.create_infer_request()
+            request_local.request = request
+        return request
+
     def _patched_call(self: Any, input_content: np.ndarray) -> Any:
         try:
             prepared = np.ascontiguousarray(input_content)
             compiled_model = getattr(self, "_mt_compiled_model", None)
             if compiled_model is None:
+                session = getattr(self, "session", None)
+                get_compiled_model = getattr(session, "get_compiled_model", None)
+                if callable(get_compiled_model):
+                    compiled_model = get_compiled_model()
+                    self._mt_compiled_model = compiled_model
+            if compiled_model is None:
                 self.session.infer(inputs=[prepared])
                 return np.asarray(self.session.get_output_tensor().data)
 
-            infer_request = compiled_model.create_infer_request()
+            infer_request = _get_thread_local_request(self, compiled_model)
             infer_request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
             infer_request.infer()
             return np.asarray(infer_request.get_output_tensor(0).data)
@@ -170,10 +188,6 @@ def _patch_rapidocr_openvino_device_selection() -> None:
         if cache_dir not in (None, ""):
             core.set_property({"CACHE_DIR": str(cache_dir)})
 
-        if selected_device in {"CPU", "MULTI:CPU"}:
-            self._mt_device_name = selected_device
-            return
-
         compile_cfg: Dict[str, str] = {}
         for key, ov_key in (
             ("performance_hint", "PERFORMANCE_HINT"),
@@ -199,6 +213,7 @@ def _patch_rapidocr_openvino_device_selection() -> None:
 
         self._mt_core = core
         self._mt_compiled_model = compiled_model
+        self._mt_request_local = threading.local()
         self.session = compiled_model.create_infer_request()
         self._mt_device_name = selected_device
 
@@ -704,9 +719,22 @@ class AIModels:
             max_workers=max(2, min(8, os.cpu_count() or 4)),
             thread_name_prefix="ai-cpu",
         )
-        self._ocr_det_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-det")
-        self._ocr_cls_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-cls")
-        self._ocr_rec_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-rec")
+        self._ocr_stage_worker_count = max(
+            1,
+            _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2),
+        )
+        self._ocr_det_executor = ThreadPoolExecutor(
+            max_workers=self._ocr_stage_worker_count,
+            thread_name_prefix="ocr-det",
+        )
+        self._ocr_cls_executor = ThreadPoolExecutor(
+            max_workers=self._ocr_stage_worker_count,
+            thread_name_prefix="ocr-cls",
+        )
+        self._ocr_rec_executor = ThreadPoolExecutor(
+            max_workers=self._ocr_stage_worker_count,
+            thread_name_prefix="ocr-rec",
+        )
         self._face_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-ov")
         self._family_load_locks = {
             family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
@@ -1978,6 +2006,37 @@ class AIModels:
         return params
 
     @staticmethod
+    def _resolve_rapidocr_stage_worker_count(cfg: Dict[str, Any]) -> int:
+        return max(1, _as_int(cfg.get("performance_num_requests"), 1))
+
+    def _reconfigure_rapidocr_stage_executors(self, cfg: Dict[str, Any]) -> None:
+        worker_count = self._resolve_rapidocr_stage_worker_count(cfg)
+        if worker_count == self._ocr_stage_worker_count:
+            return
+
+        old_executors = (
+            self._ocr_det_executor,
+            self._ocr_cls_executor,
+            self._ocr_rec_executor,
+        )
+        self._ocr_det_executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="ocr-det",
+        )
+        self._ocr_cls_executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="ocr-cls",
+        )
+        self._ocr_rec_executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="ocr-rec",
+        )
+        self._ocr_stage_worker_count = worker_count
+
+        for executor in old_executors:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    @staticmethod
     def _validate_rapidocr_backend(engine: RapidOCR) -> None:
         cfg = getattr(engine, "cfg", None)
         if cfg is None:
@@ -2051,6 +2110,7 @@ class AIModels:
 
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
+        self._reconfigure_rapidocr_stage_executors(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
         self._rapidocr_runtime_cfg = dict(config)
@@ -2059,7 +2119,8 @@ class AIModels:
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
         LOG.info(
-            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s det_limit=%s/%s rec_batch_num=%s",
+            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s "
+            "det_limit=%s/%s rec_batch_num=%s ocr_stage_workers=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
             config.get("performance_hint"),
@@ -2068,6 +2129,7 @@ class AIModels:
             config.get("det_limit_type"),
             config.get("det_limit_side_len"),
             config.get("rec_batch_num"),
+            self._ocr_stage_worker_count,
         )
 
     def _build_openvino_preprocess_runner(
@@ -2403,6 +2465,137 @@ class AIModels:
             "InsightFace session initialization missing; cannot enforce OpenVINOExecutionProvider."
             )
 
+    @staticmethod
+    def _is_insightface_init_kwargs_error(exc: Exception) -> bool:
+        if not isinstance(exc, TypeError):
+            return False
+        message = str(exc)
+        return any(
+            keyword in message
+            for keyword in ("providers", "provider_options", "allowed_modules")
+        )
+
+    def _instantiate_insightface_face_analysis(
+        self,
+        provider_names: List[str],
+        provider_options: Dict[str, str],
+    ) -> Tuple[FaceAnalysis, Path]:
+        source_root = self._resolve_insightface_root()
+        init_signature = inspect.signature(FaceAnalysis.__init__)
+        init_parameters = init_signature.parameters
+        supports_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in init_parameters.values()
+        )
+        supports_allowed_modules = "allowed_modules" in init_parameters
+        supports_provider_kwargs = "providers" in init_parameters or supports_var_kwargs
+        supports_provider_options = "provider_options" in init_parameters or supports_var_kwargs
+        legacy_root: Optional[Path] = None
+
+        def _build_kwargs(
+            runtime_root: Path,
+            *,
+            include_provider_kwargs: bool,
+            include_allowed_modules: bool,
+        ) -> Dict[str, Any]:
+            kwargs: Dict[str, Any] = {
+                "name": MODEL_NAME,
+                "root": str(runtime_root),
+            }
+            if include_allowed_modules:
+                kwargs["allowed_modules"] = ["detection", "recognition"]
+            if include_provider_kwargs:
+                kwargs["providers"] = list(provider_names)
+                if supports_provider_options:
+                    kwargs["provider_options"] = [dict(provider_options)]
+            return kwargs
+
+        attempts: List[Tuple[str, Path, Dict[str, Any]]] = [
+            (
+                "source-with-provider-kwargs",
+                source_root,
+                _build_kwargs(
+                    source_root,
+                    include_provider_kwargs=supports_provider_kwargs,
+                    include_allowed_modules=supports_allowed_modules,
+                ),
+            ),
+            (
+                "source-without-provider-kwargs",
+                source_root,
+                _build_kwargs(
+                    source_root,
+                    include_provider_kwargs=False,
+                    include_allowed_modules=supports_allowed_modules,
+                ),
+            ),
+        ]
+
+        if legacy_root is None:
+            legacy_root = self._prepare_legacy_insightface_runtime_root(source_root)
+        attempts.extend(
+            (
+                (
+                    "legacy-with-provider-kwargs",
+                    legacy_root,
+                    _build_kwargs(
+                        legacy_root,
+                        include_provider_kwargs=supports_provider_kwargs,
+                        include_allowed_modules=supports_allowed_modules,
+                    ),
+                ),
+                (
+                    "legacy-minimal-kwargs",
+                    legacy_root,
+                    _build_kwargs(
+                        legacy_root,
+                        include_provider_kwargs=False,
+                        include_allowed_modules=False,
+                    ),
+                ),
+            )
+        )
+
+        seen_attempts: set[Tuple[str, str]] = set()
+        attempt_errors: List[str] = []
+        last_exc: Optional[Exception] = None
+        for attempt_name, runtime_root, kwargs in attempts:
+            attempt_key = (str(runtime_root), json.dumps(kwargs, sort_keys=True, ensure_ascii=True))
+            if attempt_key in seen_attempts:
+                continue
+            seen_attempts.add(attempt_key)
+            try:
+                face_app = FaceAnalysis(**kwargs)
+                if attempt_name != "source-with-provider-kwargs":
+                    LOG.warning(
+                        "InsightFace initialized via compatibility path %s (runtime_root=%s)",
+                        attempt_name,
+                        runtime_root,
+                    )
+                return face_app, runtime_root
+            except Exception as exc:
+                last_exc = exc
+                attempt_errors.append(f"{attempt_name}: {exc}")
+                if self._is_insightface_init_kwargs_error(exc):
+                    LOG.warning(
+                        "InsightFace init retry after unsupported kwargs on %s: %s",
+                        attempt_name,
+                        exc,
+                    )
+                else:
+                    LOG.warning(
+                        "InsightFace init attempt %s failed (runtime_root=%s): %s",
+                        attempt_name,
+                        runtime_root,
+                        exc,
+                    )
+
+        summary = "; ".join(attempt_errors) or "no attempts executed"
+        raise RuntimeError(
+            "InsightFace initialization failed after compatibility retries: "
+            f"{summary}"
+        ) from last_exc
+
     def _prepare_legacy_insightface_runtime_root(self, source_root: Path) -> Path:
         source_model_dir = source_root / MODEL_NAME
         runtime_root = self.insightface_root / "_runtime_models"
@@ -2449,25 +2642,12 @@ class AIModels:
             os.environ.get("INSIGHTFACE_OV_DEVICE", INFERENCE_DEVICE)
         )
         provider_options = self._build_insightface_provider_options(provider_device)
-        providers: List[Any] = [
-            ("OpenVINOExecutionProvider", provider_options),
-        ]
+        provider_names = ["OpenVINOExecutionProvider"]
         try:
-            root_for_runtime = self._resolve_insightface_root()
-            init_signature = inspect.signature(FaceAnalysis.__init__)
-            legacy_face_analysis = "providers" not in init_signature.parameters
-            if legacy_face_analysis:
-                root_for_runtime = self._prepare_legacy_insightface_runtime_root(root_for_runtime)
-            face_analysis_kwargs: Dict[str, Any] = {
-                "name": MODEL_NAME,
-                "root": str(root_for_runtime),
-            }
-            if "providers" in init_signature.parameters:
-                face_analysis_kwargs["providers"] = providers
-            if "allowed_modules" in init_signature.parameters:
-                face_analysis_kwargs["allowed_modules"] = ["detection", "recognition"]
-
-            face_app = FaceAnalysis(**face_analysis_kwargs)
+            face_app, root_for_runtime = self._instantiate_insightface_face_analysis(
+                provider_names,
+                provider_options,
+            )
             # InsightFace<=0.2.1 ignores providers in __init__; enforce OpenVINO EP explicitly.
             self._enforce_insightface_openvino_provider(face_app, provider_options)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -2476,8 +2656,9 @@ class AIModels:
             self._attach_insightface_preprocess(face_app, device_name=provider_device)
             self._face_engine = face_app
             LOG.info(
-                "InsightFace loaded with providers=%s (runtime_root=%s)",
-                providers,
+                "InsightFace loaded with providers=%s provider_options=%s (runtime_root=%s)",
+                provider_names,
+                provider_options,
                 root_for_runtime,
             )
         except Exception as exc:
@@ -2641,6 +2822,19 @@ class AIModels:
         return [future.result() for future in futures]
 
     @staticmethod
+    def _rapidocr_classify_single_image(classifier: Any, image: np.ndarray) -> Tuple[str, float]:
+        norm_img = classifier.resize_norm_img(image)[np.newaxis, ...].astype(np.float32)
+        prob_out = classifier.session(norm_img)
+        cls_result = list(classifier.postprocess_op(prob_out))
+        if len(cls_result) != 1:
+            raise RapidOCRError(
+                "RapidOCR cls single-image fallback output mismatch: "
+                f"expected=1 got={len(cls_result)}"
+            )
+        label, score = cls_result[0]
+        return str(label), float(score)
+
+    @staticmethod
     def _rapidocr_cls_and_rotate(engine: RapidOCR, images: List[np.ndarray]) -> Tuple[List[np.ndarray], TextClsOutput]:
         start_time = time.perf_counter()
         classifier = engine.text_cls
@@ -2653,17 +2847,32 @@ class AIModels:
         batch_num = classifier.cls_batch_num
         for beg_img_no in range(0, img_num, batch_num):
             end_img_no = min(img_num, beg_img_no + batch_num)
+            batch_indices = [int(indices[ino]) for ino in range(beg_img_no, end_img_no)]
             norm_img_batch = np.stack(
                 [
-                    classifier.resize_norm_img(img_list[int(indices[ino])])
-                    for ino in range(beg_img_no, end_img_no)
+                    classifier.resize_norm_img(img_list[original_index])
+                    for original_index in batch_indices
                 ],
                 axis=0,
             ).astype(np.float32)
             prob_out = classifier.session(norm_img_batch)
-            cls_result = classifier.postprocess_op(prob_out)
-            for rno, (label, score) in enumerate(cls_result):
-                original_index = int(indices[beg_img_no + rno])
+            cls_result = list(classifier.postprocess_op(prob_out))
+            if len(cls_result) != len(batch_indices):
+                LOG.warning(
+                    "RapidOCR cls output size mismatch: expected=%s got=%s; "
+                    "falling back to single-image classification.",
+                    len(batch_indices),
+                    len(cls_result),
+                )
+                classifier.cls_batch_num = 1
+                cls_result = [
+                    AIModels._rapidocr_classify_single_image(
+                        classifier,
+                        img_list[original_index],
+                    )
+                    for original_index in batch_indices
+                ]
+            for original_index, (label, score) in zip(batch_indices, cls_result):
                 cls_res[original_index] = (label, score)
                 if "180" in label and score > classifier.cls_thresh:
                     img_list[original_index] = cv2.rotate(

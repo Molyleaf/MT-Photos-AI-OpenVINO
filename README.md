@@ -32,7 +32,7 @@
 | `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串                                         | `AUTO`                             |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `THROUGHPUT`                       |
-| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数                                                | `2`                                |
+| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数，同时作为 OCR `det/cls/rec` 三个 stage 执行器的 worker 数基线 | `2`                                |
 | `RAPIDOCR_ENABLE_CPU_PINNING`       | 是否启用 CPU 绑核                                               | `true`                             |
 | `RAPIDOCR_NUM_STREAMS`              | OpenVINO stream 数                                             | `2`                                |
 | `RAPIDOCR_ENABLE_HYPER_THREADING`   | 是否启用超线程                                                   | `true`                             |
@@ -60,15 +60,17 @@
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
-- RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，以便在单进程异步服务中形成流水线并行。
+- RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，且三个 stage 的 worker 数默认对齐 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS`，避免 app 层只喂单路导致 OpenVINO request budget 空转。
 - 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - RapidOCR 默认基线使用 `THROUGHPUT + AUTO + rec/cls batch=8`；若更关注单请求尾延迟，可显式改回 `RAPIDOCR_PERFORMANCE_HINT=LATENCY`。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
+- RapidOCR 的 OpenVINO session 会在线程内复用 `InferRequest`；方向分类阶段若发现 OpenVINO 返回条数少于当前批长度，会自动退回单张分类，避免 `IndexError` 并兼容 batch 输出不一致的运行时。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
 - RapidOCR、InsightFace 和 InsightFace 的 OpenVINO PPP 预处理默认都走 `AUTO` 设备选择。
+- 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPU。
 
 ## Windows 本机部署
 
