@@ -599,6 +599,7 @@ class _TextClipRpcServer(socketserver.TCPServer):
 
 
 TaskType = Literal["clip_img", "ocr", "face"]
+NonTextFamily = Literal["vision", "ocr", "face"]
 
 
 @dataclass(slots=True)
@@ -615,8 +616,8 @@ class AIModels:
     """
     Text-CLIP stays resident as a single-threaded singleton service.
     Image-CLIP uses a dedicated batch queue after standardized preprocessing.
-    RapidOCR and InsightFace run through independent async paths instead of a
-    shared non-text worker.
+    Non-text families are lazy-loaded and switch synchronously so only one
+    vision/OCR/face family stays resident at a time.
     """
 
     def __init__(self) -> None:
@@ -718,8 +719,16 @@ class AIModels:
         self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
         self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
         self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
-        self._release_requested = False
+        self._non_text_condition = threading.Condition()
+        self._non_text_active_family: Optional[NonTextFamily] = None
+        self._non_text_inflight: Dict[NonTextFamily, int] = {
+            "vision": 0,
+            "ocr": 0,
+            "face": 0,
+        }
+        self._non_text_transition_in_progress = False
         self._stopping = False
+        self._background_prewarm_cancel = threading.Event()
 
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -732,7 +741,7 @@ class AIModels:
         self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -742,6 +751,7 @@ class AIModels:
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
+            _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
         )
 
     def _configure_openvino_cache(self) -> None:
@@ -753,8 +763,9 @@ class AIModels:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
     def _start_background_prewarm(self) -> None:
-        if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), True):
+        if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False):
             return
+        self._background_prewarm_cancel.clear()
         self._background_prewarm_thread = threading.Thread(
             target=self._background_prewarm_loop,
             name="ai-ocr-prewarm",
@@ -764,23 +775,47 @@ class AIModels:
 
     def _background_prewarm_loop(self) -> None:
         delay_seconds = max(0.0, _as_float(os.environ.get("OCR_PREWARM_DELAY_SECONDS"), 1.0))
-        if delay_seconds > 0.0:
-            time.sleep(delay_seconds)
-        if self._stopping:
+        if self._background_prewarm_cancel.wait(timeout=delay_seconds):
+            return
+        if self._stopping or self._background_prewarm_cancel.is_set():
             return
         try:
             started_at = time.monotonic()
             self._prewarm_ocr_family()
-            LOG.info("RapidOCR background prewarm completed in %.2fs.", time.monotonic() - started_at)
+            if self._stopping or self._background_prewarm_cancel.is_set():
+                LOG.info("RapidOCR background prewarm cancelled before OCR stayed resident.")
+                return
+            self._release_non_text_models_sync(
+                reason="ocr-prewarm",
+                cancel_background_prewarm=False,
+                join_background_prewarm=False,
+            )
+            LOG.info(
+                "RapidOCR background prewarm completed in %.2fs and released OCR family.",
+                time.monotonic() - started_at,
+            )
         except Exception as exc:
             LOG.warning("RapidOCR background prewarm failed: %s", exc, exc_info=True)
 
     def _prewarm_ocr_family(self) -> None:
-        if self._stopping:
+        if self._stopping or self._background_prewarm_cancel.is_set():
             return
-        self._ensure_rapidocr_loaded()
-        with self._rapidocr_load_lock:
-            self._warmup_rapidocr_locked()
+        leased = self._acquire_non_text_family_lease(
+            "ocr",
+            abort_event=self._background_prewarm_cancel,
+        )
+        if not leased:
+            return
+        try:
+            if self._stopping or self._background_prewarm_cancel.is_set():
+                return
+            self._ensure_rapidocr_loaded()
+            with self._rapidocr_load_lock:
+                if self._stopping or self._background_prewarm_cancel.is_set():
+                    return
+                self._warmup_rapidocr_locked()
+        finally:
+            self._release_non_text_family_lease("ocr")
 
     def _init_clip_remote_context(self) -> Optional[Any]:
         clip_device = CLIP_INFERENCE_DEVICE.strip().upper()
@@ -945,6 +980,176 @@ class AIModels:
     def _safe_set_exception(self, future: Future, exc: Exception) -> None:
         if not future.done():
             future.set_exception(exc)
+
+    @staticmethod
+    def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            LOG.error("%s failed after caller detached: %s", task_name, exc, exc_info=exc)
+
+    def _bind_non_text_lease_to_future(self, family: NonTextFamily, future: Future) -> None:
+        future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
+
+    def _join_background_prewarm_thread(self, timeout_seconds: Optional[float]) -> None:
+        thread = self._background_prewarm_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            LOG.warning(
+                "RapidOCR background prewarm thread did not exit within %.1fs.",
+                float(timeout_seconds or 0.0),
+            )
+            return
+        self._background_prewarm_thread = None
+
+    def _acquire_non_text_family_lease(
+        self,
+        family: NonTextFamily,
+        abort_event: Optional[threading.Event] = None,
+    ) -> bool:
+        while True:
+            previous_family: Optional[NonTextFamily]
+            with self._non_text_condition:
+                while self._non_text_transition_in_progress:
+                    if abort_event is not None and abort_event.is_set():
+                        return False
+                    if self._stopping:
+                        raise RuntimeError("模型服务已关闭")
+                    self._non_text_condition.wait(
+                        timeout=0.1 if abort_event is not None else None
+                    )
+                if abort_event is not None and abort_event.is_set():
+                    return False
+                if self._stopping:
+                    raise RuntimeError("模型服务已关闭")
+
+                previous_family = self._non_text_active_family
+                if previous_family in (None, family):
+                    self._non_text_active_family = family
+                    self._non_text_inflight[family] += 1
+                    return True
+
+                if self._non_text_inflight[previous_family] > 0:
+                    if abort_event is not None and abort_event.is_set():
+                        return False
+                    self._non_text_condition.wait(
+                        timeout=0.1 if abort_event is not None else None
+                    )
+                    continue
+
+                self._non_text_transition_in_progress = True
+
+            switch_exc: Optional[Exception] = None
+            unloaded_families: List[NonTextFamily] = []
+            try:
+                unloaded_families = self._unload_non_text_models(keep_family=family)
+            except Exception as exc:
+                switch_exc = exc
+
+            aborted = abort_event is not None and abort_event.is_set()
+            with self._non_text_condition:
+                if switch_exc is None and not aborted:
+                    self._non_text_active_family = family
+                    self._non_text_inflight[family] += 1
+                self._non_text_transition_in_progress = False
+                self._non_text_condition.notify_all()
+
+            if switch_exc is not None:
+                raise switch_exc
+            if aborted:
+                return False
+            if unloaded_families:
+                LOG.info(
+                    "Switched non-text family from %s to %s; released=%s",
+                    previous_family,
+                    family,
+                    ",".join(unloaded_families),
+                )
+            return True
+
+    def _release_non_text_family_lease(self, family: NonTextFamily) -> None:
+        with self._non_text_condition:
+            inflight = self._non_text_inflight[family]
+            if inflight <= 0:
+                return
+            self._non_text_inflight[family] = inflight - 1
+            if self._non_text_inflight[family] == 0:
+                self._non_text_condition.notify_all()
+
+    def _unload_non_text_models_locked(
+        self,
+        keep_family: Optional[NonTextFamily] = None,
+    ) -> List[NonTextFamily]:
+        unloaded: List[NonTextFamily] = []
+        if keep_family != "vision" and (
+            self._clip_vision_model is not None
+            or self._clip_vision_request is not None
+            or self._clip_vision_ppp is not None
+        ):
+            self._unload_clip_vision_model_locked()
+            unloaded.append("vision")
+        if keep_family != "ocr" and self._rapidocr_engine is not None:
+            self._unload_rapidocr_model_locked()
+            unloaded.append("ocr")
+        if keep_family != "face" and (
+            self._face_engine is not None
+            or self._face_det_ppp is not None
+            or self._face_rec_ppp is not None
+        ):
+            self._unload_face_model_locked()
+            unloaded.append("face")
+        return unloaded
+
+    def _unload_non_text_models(
+        self,
+        keep_family: Optional[NonTextFamily] = None,
+    ) -> List[NonTextFamily]:
+        with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
+            unloaded = self._unload_non_text_models_locked(keep_family=keep_family)
+        if unloaded:
+            gc.collect()
+        return unloaded
+
+    def _release_non_text_models_sync(
+        self,
+        reason: str,
+        *,
+        cancel_background_prewarm: bool = True,
+        join_background_prewarm: bool = True,
+    ) -> None:
+        join_timeout_seconds = max(2.0, float(self._execution_timeout_seconds))
+        with self._non_text_condition:
+            while self._non_text_transition_in_progress:
+                if self._stopping:
+                    return
+                self._non_text_condition.wait()
+            self._non_text_transition_in_progress = True
+
+        try:
+            if cancel_background_prewarm:
+                self._background_prewarm_cancel.set()
+            if join_background_prewarm:
+                self._join_background_prewarm_thread(timeout_seconds=join_timeout_seconds)
+
+            with self._non_text_condition:
+                while any(self._non_text_inflight.values()):
+                    self._non_text_condition.wait()
+
+            unloaded = self._unload_non_text_models()
+            LOG.info(
+                "Non-text model release complete: reason=%s unloaded=%s",
+                reason,
+                ",".join(unloaded) if unloaded else "none",
+            )
+        finally:
+            with self._non_text_condition:
+                self._non_text_active_family = None
+                self._non_text_transition_in_progress = False
+                self._non_text_condition.notify_all()
 
     def _load_family_with_process_lock(
         self, family: Literal["vision", "ocr", "face"], loader: Callable[[], None]
@@ -1185,17 +1390,13 @@ class AIModels:
 
             with self._condition:
                 while True:
-                    if self._stopping or self._normal_queue or self._release_requested:
+                    if self._stopping or self._normal_queue:
                         break
                     self._condition.wait()
 
                 if self._stopping:
                     break
 
-                if self._release_requested and not self._normal_queue:
-                    self._release_requested = False
-                    self._unload_clip_vision_model()
-                    continue
                 if self._normal_queue:
                     normal_task = self._normal_queue.popleft()
                     normal_task.started_at = time.monotonic()
@@ -2486,7 +2687,6 @@ class AIModels:
         return rec_res
 
     async def _infer_ocr_async(self, image: np.ndarray) -> OCRResult:
-        await asyncio.to_thread(self._ensure_rapidocr_loaded)
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
 
@@ -2556,6 +2756,14 @@ class AIModels:
         )
         return self._ocr_result_from_raw(raw_result)
 
+    async def _infer_ocr_async_with_lease(self, image: np.ndarray) -> OCRResult:
+        await asyncio.to_thread(self._acquire_non_text_family_lease, "ocr")
+        try:
+            await asyncio.to_thread(self._ensure_rapidocr_loaded)
+            return await self._infer_ocr_async(image)
+        finally:
+            self._release_non_text_family_lease("ocr")
+
     def _infer_face(self, image: np.ndarray) -> List[RepresentResult]:
         if self._face_engine is None:
             raise RuntimeError("Face model is not loaded.")
@@ -2583,6 +2791,14 @@ class AIModels:
             )
         return results
 
+    async def _infer_face_async_with_lease(self, image: np.ndarray) -> List[RepresentResult]:
+        await asyncio.to_thread(self._acquire_non_text_family_lease, "face")
+        try:
+            await asyncio.to_thread(self._ensure_face_loaded)
+            return await self._run_in_executor(self._face_executor, self._infer_face, image)
+        finally:
+            self._release_non_text_family_lease("face")
+
     def ensure_clip_text_model_loaded(self) -> None:
         self._ensure_text_service_ready(preload=True)
 
@@ -2590,22 +2806,20 @@ class AIModels:
         await asyncio.to_thread(self.ensure_clip_text_model_loaded)
 
     def release_models(self) -> None:
-        self._schedule_release()
+        self._release_non_text_models_sync(reason="manual")
 
     def release_models_for_restart(self, text_restore_delay_seconds: Optional[float] = None) -> None:
         _ = text_restore_delay_seconds
-        self._schedule_release()
-
-    def _schedule_release(self) -> None:
-        self._unload_rapidocr_model()
-        self._unload_face_model()
-        with self._condition:
-            if self._stopping:
-                return
-            self._release_requested = True
-            self._condition.notify()
+        self._release_non_text_models_sync(reason="restart")
 
     def release_all_models(self) -> None:
+        self._background_prewarm_cancel.set()
+        self._release_non_text_models_sync(
+            reason="shutdown",
+            cancel_background_prewarm=False,
+            join_background_prewarm=True,
+        )
+
         with self._condition:
             if self._stopping:
                 return
@@ -2618,9 +2832,9 @@ class AIModels:
             self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
 
         self._worker.join()
-        if self._background_prewarm_thread is not None:
-            self._background_prewarm_thread.join(timeout=2.0)
-            self._background_prewarm_thread = None
+        self._join_background_prewarm_thread(
+            timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
+        )
 
         for executor in (
             self._shared_cpu_executor,
@@ -2629,7 +2843,7 @@ class AIModels:
             self._ocr_rec_executor,
             self._face_executor,
         ):
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
         self._shutdown_text_service()
         with self._model_lock:
@@ -2644,41 +2858,80 @@ class AIModels:
 
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         _ = filename
-        self._ensure_clip_vision_loaded()
-        payload = self._preprocess_clip_image_tensor(image)
-        task = self._submit_task(kind="clip_img", payload=payload)
-        return self._wait_task(task)
+        lease_bound = False
+        self._acquire_non_text_family_lease("vision")
+        try:
+            self._ensure_clip_vision_loaded()
+            payload = self._preprocess_clip_image_tensor(image)
+            task = self._submit_task(kind="clip_img", payload=payload)
+            self._bind_non_text_lease_to_future("vision", task.future)
+            lease_bound = True
+            return self._wait_task(task)
+        finally:
+            if not lease_bound:
+                self._release_non_text_family_lease("vision")
 
     async def get_image_embedding_async(
         self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
         _ = filename
-        await asyncio.to_thread(self._ensure_clip_vision_loaded)
-        payload = await self._run_in_executor(
-            self._shared_cpu_executor,
-            self._preprocess_clip_image_tensor,
-            image,
-        )
-        task = self._submit_task(kind="clip_img", payload=payload)
-        return await self._await_task(task)
+        lease_bound = False
+        await asyncio.to_thread(self._acquire_non_text_family_lease, "vision")
+        try:
+            await asyncio.to_thread(self._ensure_clip_vision_loaded)
+            payload = await self._run_in_executor(
+                self._shared_cpu_executor,
+                self._preprocess_clip_image_tensor,
+                image,
+            )
+            task = self._submit_task(kind="clip_img", payload=payload)
+            self._bind_non_text_lease_to_future("vision", task.future)
+            lease_bound = True
+            return await self._await_task(task)
+        finally:
+            if not lease_bound:
+                self._release_non_text_family_lease("vision")
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        self._ensure_rapidocr_loaded()
-        return self._infer_ocr(image)
+        self._acquire_non_text_family_lease("ocr")
+        try:
+            self._ensure_rapidocr_loaded()
+            return self._infer_ocr(image)
+        finally:
+            self._release_non_text_family_lease("ocr")
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        return await asyncio.wait_for(
-            self._infer_ocr_async(image),
-            timeout=self._execution_timeout_seconds,
-        )
+        task = asyncio.create_task(self._infer_ocr_async_with_lease(image))
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._execution_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="OCR task"))
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
+        except asyncio.CancelledError:
+            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="OCR task"))
+            raise
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        self._ensure_face_loaded()
-        return self._infer_face(image)
+        self._acquire_non_text_family_lease("face")
+        try:
+            self._ensure_face_loaded()
+            return self._infer_face(image)
+        finally:
+            self._release_non_text_family_lease("face")
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        await asyncio.to_thread(self._ensure_face_loaded)
-        return await asyncio.wait_for(
-            self._run_in_executor(self._face_executor, self._infer_face, image),
-            timeout=self._execution_timeout_seconds,
-        )
+        task = asyncio.create_task(self._infer_face_async_with_lease(image))
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._execution_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="Face task"))
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
+        except asyncio.CancelledError:
+            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="Face task"))
+            raise

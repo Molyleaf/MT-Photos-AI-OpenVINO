@@ -162,7 +162,7 @@ def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Opti
 async def lifespan(app: FastAPI):
     global models_instance
     _startup_self_check_dri()
-    logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务。")
+    logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
     models_instance = ai_models.AIModels()
     try:
         await models_instance.ensure_clip_text_model_loaded_async()
@@ -173,7 +173,7 @@ async def lifespan(app: FastAPI):
     logging.info("应用关闭：正在释放所有模型。")
     if models_instance:
         if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
-            models_instance.release_all_models()
+            await asyncio.to_thread(models_instance.release_all_models)
         else:
             logging.info("AIModels 实例没有 release_all_models 方法 (lifespan)。")
 
@@ -262,15 +262,15 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
-    logging.info("收到 /restart 请求，正在释放当前非文本模型。常驻 Text-CLIP 保持可用。")
+    logging.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
     if models_instance:
         if (
             hasattr(models_instance, "release_models_for_restart")
             and callable(models_instance.release_models_for_restart)
         ):
-            models_instance.release_models_for_restart()
+            await asyncio.to_thread(models_instance.release_models_for_restart)
         elif hasattr(models_instance, "release_models") and callable(models_instance.release_models):
-            models_instance.release_models()
+            await asyncio.to_thread(models_instance.release_models)
         else:
             logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
     return {"result": "pass"}

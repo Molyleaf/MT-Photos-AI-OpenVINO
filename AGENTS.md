@@ -85,7 +85,8 @@
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
-- 默认应在启动后做一次后台 RapidOCR 预热，把编译/冷加载成本前移。
+- 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
+- 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 
 ### 3.4 InsightFace
 
@@ -116,7 +117,7 @@
 - 生命周期：
 - 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
   - 关闭时释放全部模型
-- Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 各自独立加载与释放，不再共用单一非文本模型族状态机。
+- Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
@@ -140,7 +141,7 @@
 - `result` 固定 `"pass"`。
 
 3. `POST /restart`
-- 语义：触发按需模型释放（不重启进程）。
+- 语义：同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace（不重启进程）。
 - 成功返回：`{"result":"pass"}`。
 
 4. `POST /restart_v2`
@@ -181,10 +182,12 @@
 1. Text-CLIP 作为独立单例服务常驻内存，始终保持单线程后台实例。
 2. `/clip/txt` 不进入 Vision-CLIP / OCR / InsightFace 的任何共享队列。
 3. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
-4. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段，允许不同请求在不同阶段并行推进。
-5. InsightFace 使用独立执行路径，不参与 OCR 或 Vision-CLIP 的调度串行化。
-6. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
-7. `POST /restart` 释放 Vision-CLIP / OCR / InsightFace；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+4. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
+5. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 4 条把 OCR 与其他非文本模型族并行常驻。
+6. InsightFace 使用独立执行路径；但其准入必须遵守第 4 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
+7. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
+8. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+9. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
 
 ---
 
@@ -192,6 +195,7 @@
 
 - 推荐结构：**单进程 FastAPI 异步服务 + 有界批队列/阶段执行器**。
 - 禁止在单进程无限堆线程“硬顶并行度”。
+- 非文本模型族准入必须显式串行化，确保“单活模型族 + 常驻 Text-CLIP”的内存上界可控。
 - 必须控制总并行度：
   - `总并行度 = 各阶段执行器线程数之和`
 - 原因：
@@ -268,6 +272,7 @@
 - [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO(AUTO) + PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
 - [ ] 是否遵守“Text-CLIP 独立常驻单例 + 非文本单模型族串行切换”策略
+- [ ] 是否保持 OCR 默认懒加载，且显式预热后会立即释放
 - [ ] 是否采用单进程 FastAPI 异步服务 + 有界批队列/阶段执行器，并规避线程过度订阅
 - [ ] 是否同步更新 `README.md` 与 `requirements.txt`
 
@@ -320,10 +325,10 @@
 - 修复 InsightFace OpenCL 对齐补丁兼容性：`norm_crop` 现在兼容 `UMat/ndarray` 输入，并对 `estimate_norm` 返回值执行显式矩阵校验，避免 `warpAffine` 参数类型错误。
 - 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，单进程下保持单线程后台实例，不再参与非文本队列插队与回切。
 - 收敛 `/clip/img` 吞吐路径：视觉请求改为标准预处理后聚合批推理，维持 PPP 归一化与接口语义不变，同时提升 GPU 利用率。
-- 收敛 OCR 冷启动：服务会在启动后后台预热一次 RapidOCR，并通过 OpenVINO cache 把编译成本前移。
+- 收敛 OCR 启动行为：默认改为首次 `/ocr` 请求时才懒加载 OCR；如显式开启 `OCR_PREWARM_ENABLED=true`，只做一次性预热并立即释放 OCR，且 `/restart` 会取消未完成的预热。
 - 修复 InsightFace 五点对齐弃用 API warning：本地重写相似变换矩阵估计，保持 OpenCL `warpAffine` 路径与输出语义不变。
 - 修复 RapidOCR 方向分类批次越界：对 OpenVINO 返回结果按当前批次长度裁剪，并移除 crop 深拷贝以降低 OCR CPU 开销。
-- 收敛非文本模型路径：Vision-CLIP / OCR / InsightFace 改为独立执行与独立释放，文本 CLIP 仍常驻。
+- 收敛非文本模型路径：Vision-CLIP / OCR / InsightFace 保持各自独立执行路径，但模型准入改为单活租约切换；文本 CLIP 仍常驻。
 - 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
 - 收敛 OpenVINO 同步推理调用：InsightFace PPP runner、RapidOCR OpenVINO patch 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
