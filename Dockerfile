@@ -27,8 +27,7 @@ RUN set -eux; \
     ov_opencl_runtime_deps="\
         libdrm2 \
         libze1 \
-        ocl-icd-libopencl1 \
-        mesa-opencl-icd"; \
+        ocl-icd-libopencl1"; \
     intel_compute_runtime_deps="\
         intel-opencl-icd \
         libze-intel-gpu1"; \
