@@ -6,6 +6,8 @@ import os
 from typing import List
 from pydantic import BaseModel
 
+from models.constants import MODEL_NAME as INSIGHTFACE_MODEL_NAME
+
 # --- /check 响应 ---
 class CheckResponse(BaseModel):
     result: str
@@ -50,7 +52,7 @@ class RepresentResult(BaseModel):
 
 class RepresentResponse(BaseModel):
     detector_backend: str = "insightface"
-    recognition_model: str = os.environ.get("MODEL_NAME", "buffalo_l")
+    recognition_model: str = os.environ.get("MODEL_NAME", INSIGHTFACE_MODEL_NAME)
     result: List[RepresentResult]
 
 # --- /restart 响应 ---

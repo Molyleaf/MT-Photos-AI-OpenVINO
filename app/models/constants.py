@@ -1,0 +1,46 @@
+import logging
+import os
+from pathlib import Path
+
+import numpy as np
+
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_APP_DIR = _PACKAGE_DIR.parent
+_PROJECT_ROOT = _APP_DIR.parent
+_QA_CLIP_ROOT = _PACKAGE_DIR / "QA-CLIP"
+_QA_CLIP_CLIP_ROOT = _QA_CLIP_ROOT / "clip"
+PACKAGE_DIR = _PACKAGE_DIR
+APP_DIR = _APP_DIR
+PROJECT_ROOT = _PROJECT_ROOT
+QA_CLIP_ROOT = _QA_CLIP_ROOT
+QA_CLIP_CLIP_ROOT = _QA_CLIP_CLIP_ROOT
+
+INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "AUTO")
+CLIP_INFERENCE_DEVICE = os.environ.get("CLIP_INFERENCE_DEVICE", INFERENCE_DEVICE)
+
+MODEL_NAME = "antelopev2"
+CLIP_EMBEDDING_DIMS = 768
+CONTEXT_LENGTH = 77
+CLIP_IMAGE_RESOLUTION = 224
+
+_CLIP_IMAGE_MEAN = np.array((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
+_CLIP_IMAGE_STD = np.array((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
+
+QUEUE_MAX_SIZE = int(os.environ.get("INFERENCE_QUEUE_MAX_SIZE", "64"))
+TASK_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_TASK_TIMEOUT", "10"))
+QUEUE_TIMEOUT_SECONDS = int(
+    os.environ.get("INFERENCE_QUEUE_TIMEOUT", str(TASK_TIMEOUT_SECONDS))
+)
+EXEC_TIMEOUT_SECONDS = int(
+    os.environ.get("INFERENCE_EXEC_TIMEOUT", str(max(30, TASK_TIMEOUT_SECONDS)))
+)
+
+RAPIDOCR_V5_MOBILE_DET_FILE = "ch_PP-OCRv5_mobile_det.onnx"
+RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
+RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
+RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
+
+LOG = logging.getLogger("models")
+DEFAULT_NON_TEXT_OV_DEVICE = "AUTO"
+PROCESS_LOCK_POLL_SECONDS = 0.05
+TEXT_RPC_HOST = "127.0.0.1"

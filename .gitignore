@@ -9,7 +9,9 @@ venv/
 .env
 .idea/
 
-models/
+models/insightface
+models/qa-clip
+models/rapidocr
 cache/
 example/
 

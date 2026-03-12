@@ -18,12 +18,12 @@ def _resolve_project_root() -> Path:
     if env_root:
         return Path(env_root).expanduser().resolve()
 
-    app_dir = Path(__file__).resolve().parent
-    candidates = [app_dir.parent, app_dir, Path.cwd().resolve()]
+    convert_dir = Path(__file__).resolve().parent
+    candidates = [convert_dir.parent, Path.cwd().resolve()]
     for candidate in candidates:
         if (candidate / "app").exists() and (candidate / "README.md").exists():
             return candidate
-    return app_dir.parent
+    return convert_dir.parent
 
 
 PROJECT_ROOT = _resolve_project_root()

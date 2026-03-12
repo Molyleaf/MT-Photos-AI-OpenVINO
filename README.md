@@ -10,6 +10,7 @@
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 服务入口：`app/server.py`
+- QA-CLIP 离线转换脚本：`convert/convert.py`
 
 ## 运行时环境变量
 

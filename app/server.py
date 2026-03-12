@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
-import models as ai_models
+from models import AIModels, MODEL_NAME
 from schemas import (
     CheckResponse,
     TextClipRequest,
@@ -73,7 +73,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
             detail="Invalid API key",
         )
 
-models_instance: Optional[ai_models.AIModels] = None
+models_instance: Optional[AIModels] = None
 MAX_IMAGE_SIDE = 10000
 
 
@@ -163,7 +163,7 @@ async def lifespan(app: FastAPI):
     global models_instance
     _startup_self_check_dri()
     logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
-    models_instance = ai_models.AIModels()
+    models_instance = AIModels()
     try:
         await models_instance.ensure_clip_text_model_loaded_async()
     except Exception as e:
@@ -351,7 +351,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
         results_dict = [r.model_dump() for r in face_results_list]
         return {
             "detector_backend": "insightface",
-            "recognition_model": ai_models.MODEL_NAME,
+            "recognition_model": MODEL_NAME,
             "result": results_dict
         }
     except Exception as e:

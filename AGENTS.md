@@ -16,10 +16,10 @@
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.zju.edu.cn/debian/`，PyPI 使用 `https://mirrors.zju.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
-- 模型编排：`app/models.py`。
-- 模型转换：`app/convert.py`（QA-CLIP -> OpenVINO IR）。
+- 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr.py`、`insightface.py` 拆分）。
+- 模型转换：`convert/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
-- QA-CLIP 子库：`app/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
+- QA-CLIP 子库：`app/models/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
 - 配置存储：`app/config`。
 - 参考文件（对齐端点用）：`example/`。
 
@@ -27,12 +27,12 @@
 
 ## 2. QA-CLIP 子库边界（硬约束）
 
-1. `app/QA-CLIP` 视为上游镜像目录，默认**禁止功能性改动**。
+1. `app/models/QA-CLIP` 视为上游镜像目录，默认**禁止功能性改动**。
 2. 允许改动仅限：
   - 兼容性修复（Python/OpenVINO/依赖版本适配）
   - 只优化性能且不改变语义的改动
-3. CLIP 相关依赖必须从 `app/QA-CLIP/clip` 引用；禁止继续依赖历史 `/app/clip` 路径。
-4. 若确需改动 `app/QA-CLIP`，必须在提交说明里写清楚：
+3. CLIP 相关依赖必须从 `app/models/QA-CLIP/clip` 引用；禁止继续依赖历史 `/app/clip` 路径。
+4. 若确需改动 `app/models/QA-CLIP`，必须在提交说明里写清楚：
   - 改动类型（兼容性 or 性能）
   - 不改语义的证据（接口/输出维度/精度基线）
 
@@ -215,7 +215,7 @@
 
 ## 7. AI 常见坏味道（黑名单：硬性禁止）
 
-1. 修改 `app/QA-CLIP` 语义代码（非兼容性/纯性能优化）。
+1. 修改 `app/models/QA-CLIP` 语义代码（非兼容性/纯性能优化）。
 2. 继续使用 `/app/clip` 旧引用路径。
 3. 把 RapidOCR 回退为 `rapidocr-openvino` 或对其模型私自量化。
 4. 未经说明地变更端点响应字段、`msg` 出现时机、错误处理语义。
@@ -266,6 +266,7 @@
 - `python -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`
+- `python -m compileall convert`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
 - 关键端点冒烟：`/check`、`/clip/txt`、`/ocr`、`/represent`
 
@@ -274,7 +275,7 @@
 ## 11. 最终自检清单（必须逐条勾选）
 
 - [ ] 是否保持 QA-CLIP 子库边界（未做语义改动，或已说明兼容/性能理由）
-- [ ] 是否完全切换到 `app/QA-CLIP/clip` 引用路径
+- [ ] 是否完全切换到 `app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
@@ -294,7 +295,7 @@
   - 实现约束、后端选择原因、无 silent fallback 规则
   - 容器构建内部实践、镜像裁剪策略、依赖清理策略
   - 稳定性修复记录、兼容性说明、上线验收清单
-  - `app/convert.py`、NNCF、IR 导出和模型转换流程说明
+  - `convert/convert.py`、NNCF、IR 导出和模型转换流程说明
   - Agent/开发自检、压测、调度策略、文档同步要求
 
 ---
@@ -426,7 +427,7 @@ curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" 
 
 ---
 
-## 14. `app/convert.py` 运行环境
+## 14. `convert/convert.py` 运行环境
 
 | 环境变量 | 可选值 | 默认值 |
 |---|---|---|
@@ -436,4 +437,4 @@ curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `QA_CLIP_ENABLE_NNCF_WEIGHT_COMPRESSION` | `0`（关闭）或 `1`（开启） | `0` |
 | `QA_CLIP_NNCF_WEIGHT_MODE` | NNCF 压缩模式名（常见：`INT8_ASYM` / `INT8_SYM` / `NF4` / `E2M1`） | `INT8_ASYM` |
 
-`convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。
+`convert/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。
