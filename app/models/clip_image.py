@@ -1,5 +1,4 @@
 import asyncio
-import threading
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -8,7 +7,7 @@ import cv2
 import numpy as np
 import openvino as ov
 
-from .common import _InferenceTask, _OpenVinoPreprocessRunner, _as_contiguous_bgr_uint8
+from .common import _InferenceTask, _as_contiguous_bgr_uint8
 from .constants import (
     CLIP_EMBEDDING_DIMS,
     CLIP_IMAGE_RESOLUTION,
