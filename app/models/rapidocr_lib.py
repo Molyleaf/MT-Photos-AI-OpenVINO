@@ -18,7 +18,10 @@ from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecOu
 from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
 
-from schemas import OCRBox, OCRResult
+try:
+    from ..schemas import OCRBox, OCRResult
+except ImportError:
+    from schemas import OCRBox, OCRResult
 
 from .common import (
     _as_bool,

@@ -16,7 +16,7 @@
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.zju.edu.cn/debian/`，PyPI 使用 `https://mirrors.zju.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
-- 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr.py`、`insightface.py` 拆分）。
+- 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）。
 - 模型转换：`convert/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
 - QA-CLIP 子库：`app/models/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
@@ -32,7 +32,8 @@
   - 兼容性修复（Python/OpenVINO/依赖版本适配）
   - 只优化性能且不改变语义的改动
 3. CLIP 相关依赖必须从 `app/models/QA-CLIP/clip` 引用；禁止继续依赖历史 `/app/clip` 路径。
-4. 若确需改动 `app/models/QA-CLIP`，必须在提交说明里写清楚：
+4. 当前运行时仍直接依赖 `app/models/QA-CLIP/clip/bert_tokenizer.py` 与 `vocab.txt`；在未迁出 tokenizer 资源前，**禁止整体删除 `app/models/QA-CLIP`**。
+5. 若确需改动 `app/models/QA-CLIP`，必须在提交说明里写清楚：
   - 改动类型（兼容性 or 性能）
   - 不改语义的证据（接口/输出维度/精度基线）
 

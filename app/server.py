@@ -13,13 +13,20 @@ from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
-from models import AIModels, MODEL_NAME
-from schemas import (
-    CheckResponse,
-    TextClipRequest,
-    # RepresentResponse, # 不再用于 /represent 的响应模型
-    RestartResponse
-)
+try:
+    from .models import AIModels, MODEL_NAME
+    from .schemas import (
+        CheckResponse,
+        TextClipRequest,
+        RestartResponse,
+    )
+except ImportError:
+    from models import AIModels, MODEL_NAME
+    from schemas import (
+        CheckResponse,
+        TextClipRequest,
+        RestartResponse,
+    )
 
 # --- NSSM 日志优化和级别设置 ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -13,7 +13,10 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 
-from schemas import FacialArea, RepresentResult
+try:
+    from ..schemas import FacialArea, RepresentResult
+except ImportError:
+    from schemas import FacialArea, RepresentResult
 
 from .common import (
     _OpenVinoPreprocessRunner,

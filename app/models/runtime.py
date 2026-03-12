@@ -36,7 +36,7 @@ from .constants import (
     QUEUE_TIMEOUT_SECONDS,
 )
 from .insightface import InsightFaceMixin
-from .rapidocr import RapidOCRMixin
+from .rapidocr_lib import RapidOCRMixin
 
 
 class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):

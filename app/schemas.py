@@ -2,11 +2,8 @@
 # --------------------------------------------------
 # 这个文件包含所有在 server 和 models 之间共享的 Pydantic 模型
 # --------------------------------------------------
-import os
 from typing import List
 from pydantic import BaseModel
-
-from models.constants import MODEL_NAME as INSIGHTFACE_MODEL_NAME
 
 # --- /check 响应 ---
 class CheckResponse(BaseModel):
@@ -52,7 +49,7 @@ class RepresentResult(BaseModel):
 
 class RepresentResponse(BaseModel):
     detector_backend: str = "insightface"
-    recognition_model: str = os.environ.get("MODEL_NAME", INSIGHTFACE_MODEL_NAME)
+    recognition_model: str = "antelopev2"
     result: List[RepresentResult]
 
 # --- /restart 响应 ---

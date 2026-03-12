@@ -11,6 +11,7 @@
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 服务入口：`app/server.py`
 - QA-CLIP 离线转换脚本：`convert/convert.py`
+- 源码运行时需保留 `app/models/QA-CLIP/clip`，服务当前仍使用其中的 tokenizer 与词表资源
 
 ## 运行时环境变量
 
