@@ -162,24 +162,26 @@ def _patch_rapidocr_openvino_device_selection() -> None:
     if getattr(OpenVINOInferSession, "_mt_device_patch", False):
         return
 
-    original_init = OpenVINOInferSession.__init__
-
     def _patched_init(self: Any, cfg: Any) -> None:
-        original_init(self, cfg)
-
         engine_cfg = cfg.get("engine_cfg", {}) or {}
-        selected_device = _normalize_non_text_openvino_device(
+        configured_device = _normalize_non_text_openvino_device(
             str(engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)))
         )
-
-        requires_gpu = selected_device != "AUTO" and "GPU" in selected_device
         core = Core()
-        available_devices = [str(item).upper() for item in core.available_devices]
-        if requires_gpu and not _has_openvino_gpu_device(available_devices):
+        selected_device = _resolve_non_text_openvino_runtime_device(
+            configured_device,
+            core.available_devices,
+            consumer="openvino",
+        )
+
+        model_path = cfg.get("model_path", None)
+        if model_path is None:
             raise RuntimeError(
-                f"RapidOCR OpenVINO device={selected_device} requires GPU, "
-                f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
+                "RapidOCR OpenVINO local model_path is required. "
+                "Online download fallback is disabled."
             )
+        model_path = Path(model_path)
+        self._verify_model(model_path)
 
         cpu_config = CPUConfig(engine_cfg)
         core.set_property("CPU", cpu_config.get_config())
@@ -200,6 +202,7 @@ def _patch_rapidocr_openvino_device_selection() -> None:
             compile_cfg[ov_key] = str(value)
 
         try:
+            self.model = core.read_model(model_path)
             compiled_model = core.compile_model(
                 model=self.model,
                 device_name=selected_device,
@@ -216,6 +219,8 @@ def _patch_rapidocr_openvino_device_selection() -> None:
         self._mt_request_local = threading.local()
         self.session = compiled_model.create_infer_request()
         self._mt_device_name = selected_device
+        self._mt_configured_device_name = configured_device
+        self._mt_execution_devices = tuple(_get_compiled_model_execution_devices(compiled_model))
 
     OpenVINOInferSession.__init__ = _patched_init  # type: ignore[assignment]
     OpenVINOInferSession._mt_device_patch = True  # type: ignore[attr-defined]
@@ -352,6 +357,96 @@ def _normalize_non_text_openvino_device(device_expr: str) -> str:
         return "AUTO"
 
     return normalized
+
+
+def _resolve_non_text_openvino_runtime_device(
+    device_expr: str,
+    available_devices: Any,
+    *,
+    consumer: Literal["openvino", "ort_ep"],
+) -> str:
+    normalized = _normalize_non_text_openvino_device(device_expr)
+    available = _normalize_openvino_devices(available_devices)
+    available_set = set(available)
+    has_gpu = _has_openvino_gpu_device(available)
+    explicit_gpu_devices = _extract_explicit_gpu_devices(normalized)
+    missing_explicit_gpu = [
+        device_name for device_name in explicit_gpu_devices if device_name not in available_set
+    ]
+    if missing_explicit_gpu:
+        raise RuntimeError(
+            "Requested GPU device is unavailable. "
+            f"requested={missing_explicit_gpu} available_devices={sorted(available)}. "
+            "No silent fallback is allowed."
+        )
+
+    gpu_requested = normalized.startswith("GPU") or any(
+        token.startswith("GPU") for token in _split_openvino_device_expr(normalized)
+    )
+    if gpu_requested and not has_gpu:
+        raise RuntimeError(
+            f"OpenVINO device={normalized} requires GPU, "
+            f"but available_devices={sorted(available)}. No silent fallback is allowed."
+        )
+
+    if consumer == "ort_ep":
+        if normalized == "AUTO":
+            return "GPU" if has_gpu else "AUTO"
+        if normalized.startswith("GPU."):
+            return "GPU"
+        if normalized.startswith("CPU."):
+            return "CPU"
+        if normalized.startswith("NPU."):
+            return "NPU"
+        if normalized.startswith("MULTI:"):
+            tokens = _split_openvino_device_expr(normalized)
+            if any(token.startswith("GPU") for token in tokens) and has_gpu:
+                return "GPU"
+            if tokens and all(token.startswith("CPU") for token in tokens):
+                return "CPU"
+            if tokens and all(token.startswith("NPU") for token in tokens):
+                return "NPU"
+            return "AUTO"
+        return normalized
+
+    if normalized == "AUTO":
+        return "AUTO:GPU,CPU" if has_gpu else "AUTO"
+    return normalized
+
+
+def _get_compiled_model_execution_devices(compiled_model: Any) -> List[str]:
+    if compiled_model is None:
+        return []
+    get_property = getattr(compiled_model, "get_property", None)
+    if not callable(get_property):
+        return []
+
+    for property_name in ("EXECUTION_DEVICES", "EXECUTION_DEVICE"):
+        try:
+            value = get_property(property_name)
+        except Exception:
+            continue
+        if value in (None, ""):
+            continue
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [str(value).strip()]
+    return []
+
+
+def _get_openvino_session_execution_devices(session_like: Any) -> List[str]:
+    compiled_model = getattr(session_like, "_mt_compiled_model", None)
+    if compiled_model is None:
+        session = getattr(session_like, "session", None)
+        get_compiled_model = getattr(session, "get_compiled_model", None)
+        if callable(get_compiled_model):
+            try:
+                compiled_model = get_compiled_model()
+            except Exception:
+                compiled_model = None
+    return _get_compiled_model_execution_devices(compiled_model)
 
 
 def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
@@ -746,6 +841,13 @@ class AIModels:
         self._queue_capacity = max(1, QUEUE_MAX_SIZE)
         self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
         self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
+        self._ocr_execution_timeout_seconds = max(
+            1,
+            _as_int(
+                os.environ.get("OCR_EXEC_TIMEOUT"),
+                max(30, self._execution_timeout_seconds),
+            ),
+        )
         self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
         self._non_text_condition = threading.Condition()
         self._non_text_active_family: Optional[NonTextFamily] = None
@@ -769,13 +871,14 @@ class AIModels:
         self._start_background_prewarm()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s",
             CLIP_INFERENCE_DEVICE,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
             self._queue_capacity,
             self._queue_timeout_seconds,
             self._execution_timeout_seconds,
+            self._ocr_execution_timeout_seconds,
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
@@ -1922,14 +2025,11 @@ class AIModels:
         )
         if self.ov_cache_dir is not None:
             config["cache_dir"] = str(self.ov_cache_dir)
-
-        available_devices = [str(item).upper() for item in self.core.available_devices]
-        requires_gpu = "GPU" in str(config["device_name"]).upper()
-        if requires_gpu and not _has_openvino_gpu_device(available_devices):
-            raise RuntimeError(
-                f"RapidOCR OpenVINO device={config['device_name']} requires GPU, "
-                f"but available_devices={sorted(available_devices)}. No silent fallback is allowed."
-            )
+        config["runtime_device_name"] = _resolve_non_text_openvino_runtime_device(
+            str(config["device_name"]),
+            self.core.available_devices,
+            consumer="openvino",
+        )
         return config
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
@@ -1961,7 +2061,9 @@ class AIModels:
             "Det.engine_type": EngineType.OPENVINO,
             "Cls.engine_type": EngineType.OPENVINO,
             "Rec.engine_type": EngineType.OPENVINO,
-            "EngineConfig.openvino.device_name": str(cfg.get("device_name", "AUTO")),
+            "EngineConfig.openvino.device_name": str(
+                cfg.get("runtime_device_name", cfg.get("device_name", "AUTO"))
+            ),
             "EngineConfig.openvino.inference_num_threads": _as_int(
                 cfg.get("inference_num_threads"), -1
             ),
@@ -2068,6 +2170,21 @@ class AIModels:
         self._validate_rapidocr_backend(engine)
         return engine
 
+    @staticmethod
+    def _collect_rapidocr_execution_devices(engine: RapidOCR) -> Dict[str, List[str]]:
+        execution_devices: Dict[str, List[str]] = {}
+        for stage_name, attr_name in (
+            ("det", "text_det"),
+            ("cls", "text_cls"),
+            ("rec", "text_rec"),
+        ):
+            stage = getattr(engine, attr_name, None)
+            session = getattr(stage, "session", None)
+            devices = _get_openvino_session_execution_devices(session)
+            if devices:
+                execution_devices[stage_name] = devices
+        return execution_devices
+
     def _warmup_rapidocr_locked(self) -> None:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
@@ -2113,16 +2230,20 @@ class AIModels:
         self._reconfigure_rapidocr_stage_executors(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
+        execution_devices = self._collect_rapidocr_execution_devices(self._rapidocr_engine)
         self._rapidocr_runtime_cfg = dict(config)
+        self._rapidocr_runtime_cfg["execution_devices"] = execution_devices
         if config.get("det_limit_type") == "min":
             LOG.warning(
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
         LOG.info(
-            "RapidOCR ready: config=%s device=%s hint=%s use_cls=%s max_side_len=%s "
+            "RapidOCR ready: config=%s device=%s runtime_device=%s exec_devices=%s hint=%s use_cls=%s max_side_len=%s "
             "det_limit=%s/%s rec_batch_num=%s ocr_stage_workers=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
+            config.get("runtime_device_name"),
+            execution_devices or "unknown",
             config.get("performance_hint"),
             config.get("use_cls"),
             config.get("max_side_len"),
@@ -2622,8 +2743,13 @@ class AIModels:
         return runtime_root
 
     @staticmethod
-    def _validate_insightface_openvino_provider(face_app: FaceAnalysis) -> None:
+    def _validate_insightface_openvino_provider(
+        face_app: FaceAnalysis,
+        expected_device_type: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         models_map = getattr(face_app, "models", {})
+        runtime_state: Dict[str, Dict[str, Any]] = {}
+        normalized_expected = str(expected_device_type or "").strip().upper()
         for task_name, model in models_map.items():
             session = getattr(model, "session", None)
             if session is None or not hasattr(session, "get_providers"):
@@ -2636,10 +2762,40 @@ class AIModels:
                     "OpenVINOExecutionProvider must be the active primary provider. "
                     "No silent fallback is allowed."
                 )
+            task_state: Dict[str, Any] = {"providers": providers}
+            get_provider_options = getattr(session, "get_provider_options", None)
+            if callable(get_provider_options):
+                try:
+                    provider_options = get_provider_options()
+                except Exception:
+                    provider_options = None
+                if isinstance(provider_options, dict):
+                    openvino_options = provider_options.get("OpenVINOExecutionProvider")
+                    if isinstance(openvino_options, dict):
+                        normalized_options = {
+                            str(key): str(value) for key, value in openvino_options.items()
+                        }
+                        task_state["openvino_options"] = normalized_options
+                        actual_device = str(
+                            normalized_options.get("device_type", "")
+                        ).strip().upper()
+                        if normalized_expected and actual_device and actual_device != normalized_expected:
+                            raise RuntimeError(
+                                "InsightFace provider validation failed for task="
+                                f"{task_name}, expected device_type={normalized_expected} "
+                                f"but got {actual_device}. No silent fallback is allowed."
+                            )
+            runtime_state[task_name] = task_state
+        return runtime_state
 
     def _load_face_locked(self) -> None:
-        provider_device = _normalize_non_text_openvino_device(
+        configured_provider_device = _normalize_non_text_openvino_device(
             os.environ.get("INSIGHTFACE_OV_DEVICE", INFERENCE_DEVICE)
+        )
+        provider_device = _resolve_non_text_openvino_runtime_device(
+            configured_provider_device,
+            self.core.available_devices,
+            consumer="ort_ep",
         )
         provider_options = self._build_insightface_provider_options(provider_device)
         provider_names = ["OpenVINOExecutionProvider"]
@@ -2652,13 +2808,28 @@ class AIModels:
             self._enforce_insightface_openvino_provider(face_app, provider_options)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
             self._enforce_insightface_openvino_provider(face_app, provider_options)
-            self._validate_insightface_openvino_provider(face_app)
+            provider_runtime = self._validate_insightface_openvino_provider(
+                face_app,
+                expected_device_type=provider_device,
+            )
             self._attach_insightface_preprocess(face_app, device_name=provider_device)
+            ppp_execution_devices = {
+                "det": _get_compiled_model_execution_devices(
+                    getattr(self._face_det_ppp, "compiled_model", None)
+                ),
+                "rec": _get_compiled_model_execution_devices(
+                    getattr(self._face_rec_ppp, "compiled_model", None)
+                ),
+            }
             self._face_engine = face_app
             LOG.info(
-                "InsightFace loaded with providers=%s provider_options=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s (runtime_root=%s)",
                 provider_names,
+                configured_provider_device,
+                provider_device,
                 provider_options,
+                provider_runtime,
+                ppp_execution_devices,
                 root_for_runtime,
             )
         except Exception as exc:
@@ -2900,12 +3071,21 @@ class AIModels:
             raise RuntimeError("RapidOCR model is not loaded.")
 
         engine = self._rapidocr_engine
+        total_started_at = time.perf_counter()
         ori_img = _as_contiguous_bgr_uint8(image, context="OCR")
-        img, op_record = await self._run_in_executor(self._shared_cpu_executor, engine.preprocess_img, ori_img)
+        preprocess_ms = det_ms = crop_ms = cls_ms = rec_ms = assemble_ms = 0.0
+        stage_started_at = time.perf_counter()
+        img, op_record = await self._run_in_executor(
+            self._shared_cpu_executor,
+            engine.preprocess_img,
+            ori_img,
+        )
+        preprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
         det_res, cls_res, rec_res = TextDetOutput(), TextClsOutput(), TextRecOutput()
 
         if engine.use_det:
             try:
+                stage_started_at = time.perf_counter()
                 img, op_record, det_res = await self._run_in_executor(
                     self._ocr_det_executor,
                     self._rapidocr_detect_and_pad,
@@ -2913,28 +3093,33 @@ class AIModels:
                     img,
                     op_record,
                 )
+                det_ms = (time.perf_counter() - stage_started_at) * 1000.0
             except RapidOCRError as exc:
                 LOG.warning(exc)
                 return OCRResult(texts=[], scores=[], boxes=[])
             if det_res.boxes is None:
                 return OCRResult(texts=[], scores=[], boxes=[])
+            stage_started_at = time.perf_counter()
             cropped_img_list = await self._run_in_executor(
                 self._shared_cpu_executor,
                 self._rapidocr_crop_regions,
                 img,
                 det_res.boxes,
             )
+            crop_ms = (time.perf_counter() - stage_started_at) * 1000.0
         else:
             cropped_img_list = [img]
 
         if engine.use_cls:
             try:
+                stage_started_at = time.perf_counter()
                 cls_img_list, cls_res = await self._run_in_executor(
                     self._ocr_cls_executor,
                     self._rapidocr_cls_and_rotate,
                     engine,
                     cropped_img_list,
                 )
+                cls_ms = (time.perf_counter() - stage_started_at) * 1000.0
             except RapidOCRError as exc:
                 LOG.warning(exc)
                 return OCRResult(texts=[], scores=[], boxes=[])
@@ -2943,16 +3128,19 @@ class AIModels:
 
         if engine.use_rec:
             try:
+                stage_started_at = time.perf_counter()
                 rec_res = await self._run_in_executor(
                     self._ocr_rec_executor,
                     self._rapidocr_recognize,
                     engine,
                     cls_img_list,
                 )
+                rec_ms = (time.perf_counter() - stage_started_at) * 1000.0
             except RapidOCRError as exc:
                 LOG.warning(exc)
                 return OCRResult(texts=[], scores=[], boxes=[])
 
+        stage_started_at = time.perf_counter()
         raw_result = await self._run_in_executor(
             self._shared_cpu_executor,
             engine.build_final_output,
@@ -2963,15 +3151,29 @@ class AIModels:
             cropped_img_list,
             op_record,
         )
+        assemble_ms = (time.perf_counter() - stage_started_at) * 1000.0
+        total_ms = (time.perf_counter() - total_started_at) * 1000.0
+        slow_threshold_ms = max(
+            1000.0,
+            min(float(self._ocr_execution_timeout_seconds) * 500.0, 5000.0),
+        )
+        if total_ms >= slow_threshold_ms:
+            runtime_cfg = self._rapidocr_runtime_cfg or {}
+            box_count = 0 if det_res.boxes is None else int(len(det_res.boxes))
+            LOG.warning(
+                "RapidOCR slow request: total=%.1fms preprocess=%.1fms det=%.1fms crop=%.1fms cls=%.1fms rec=%.1fms assemble=%.1fms boxes=%s runtime_device=%s exec_devices=%s",
+                total_ms,
+                preprocess_ms,
+                det_ms,
+                crop_ms,
+                cls_ms,
+                rec_ms,
+                assemble_ms,
+                box_count,
+                runtime_cfg.get("runtime_device_name", runtime_cfg.get("device_name", "unknown")),
+                runtime_cfg.get("execution_devices", "unknown"),
+            )
         return self._ocr_result_from_raw(raw_result)
-
-    async def _infer_ocr_async_with_lease(self, image: np.ndarray) -> OCRResult:
-        await asyncio.to_thread(self._acquire_non_text_family_lease, "ocr")
-        try:
-            await asyncio.to_thread(self._ensure_rapidocr_loaded)
-            return await self._infer_ocr_async(image)
-        finally:
-            self._release_non_text_family_lease("ocr")
 
     def _infer_face(self, image: np.ndarray) -> List[RepresentResult]:
         if self._face_engine is None:
@@ -2999,14 +3201,6 @@ class AIModels:
                 )
             )
         return results
-
-    async def _infer_face_async_with_lease(self, image: np.ndarray) -> List[RepresentResult]:
-        await asyncio.to_thread(self._acquire_non_text_family_lease, "face")
-        try:
-            await asyncio.to_thread(self._ensure_face_loaded)
-            return await self._run_in_executor(self._face_executor, self._infer_face, image)
-        finally:
-            self._release_non_text_family_lease("face")
 
     def ensure_clip_text_model_loaded(self) -> None:
         self._ensure_text_service_ready(preload=True)
@@ -3110,18 +3304,33 @@ class AIModels:
             self._release_non_text_family_lease("ocr")
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        task = asyncio.create_task(self._infer_ocr_async_with_lease(image))
+        lease_bound = False
+        await asyncio.to_thread(self._acquire_non_text_family_lease, "ocr")
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=self._execution_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="OCR task"))
-            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
-        except asyncio.CancelledError:
-            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="OCR task"))
-            raise
+            await asyncio.to_thread(self._ensure_rapidocr_loaded)
+            task = asyncio.create_task(self._infer_ocr_async(image))
+            self._bind_non_text_lease_to_future("ocr", task)
+            lease_bound = True
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=self._ocr_execution_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                task.add_done_callback(
+                    partial(self._log_detached_async_task_failure, task_name="OCR task")
+                )
+                raise RuntimeError(
+                    f"推理任务执行超时（>{self._ocr_execution_timeout_seconds}s）"
+                ) from exc
+            except asyncio.CancelledError:
+                task.add_done_callback(
+                    partial(self._log_detached_async_task_failure, task_name="OCR task")
+                )
+                raise
+        finally:
+            if not lease_bound:
+                self._release_non_text_family_lease("ocr")
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         self._acquire_non_text_family_lease("face")
@@ -3132,15 +3341,28 @@ class AIModels:
             self._release_non_text_family_lease("face")
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        task = asyncio.create_task(self._infer_face_async_with_lease(image))
+        lease_bound = False
+        await asyncio.to_thread(self._acquire_non_text_family_lease, "face")
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=self._execution_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="Face task"))
-            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
-        except asyncio.CancelledError:
-            task.add_done_callback(partial(self._log_detached_async_task_failure, task_name="Face task"))
-            raise
+            await asyncio.to_thread(self._ensure_face_loaded)
+            future = self._run_in_executor(self._face_executor, self._infer_face, image)
+            self._bind_non_text_lease_to_future("face", future)
+            lease_bound = True
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=self._execution_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                future.add_done_callback(
+                    partial(self._log_detached_async_task_failure, task_name="Face task")
+                )
+                raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
+            except asyncio.CancelledError:
+                future.add_done_callback(
+                    partial(self._log_detached_async_task_failure, task_name="Face task")
+                )
+                raise
+        finally:
+            if not lease_bound:
+                self._release_non_text_family_lease("face")

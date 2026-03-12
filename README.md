@@ -23,13 +23,14 @@
 | `INFERENCE_TASK_TIMEOUT`            | 兼容旧配置的总超时基线；未显式设置新变量时用作排队超时默认值，并为执行超时提供下限 | `10`                               |
 | `INFERENCE_QUEUE_TIMEOUT`           | 非文本任务排队超时（秒）                                               | 跟随 `INFERENCE_TASK_TIMEOUT`       |
 | `INFERENCE_EXEC_TIMEOUT`            | 非文本任务执行超时（秒）；默认至少 `30` 秒                              | `max(30, INFERENCE_TASK_TIMEOUT)`  |
+| `OCR_EXEC_TIMEOUT`                  | 仅覆盖 OCR 推理执行超时（秒）；模型加载不计入该窗口，未设置时默认至少 `30` 秒       | `max(30, INFERENCE_EXEC_TIMEOUT)`  |
 | `OV_CACHE_DIR`                      | 可选：自定义 OpenVINO 编译缓存目录；未设置时默认使用 `<repo>/cache/openvino`     | `<repo>/cache/openvino`             |
 | `CLIP_IMAGE_BATCH`                  | `/clip/img` 在标准预处理完成后的批大小上限                                   | `8`                                 |
 | `CLIP_IMAGE_BATCH_WAIT_MS`          | `/clip/img` 微批等待窗口（毫秒）                                          | `5`                                 |
 | `RAPIDOCR_OPENVINO_CONFIG_PATH`     | RapidOCR YAML 配置文件路径；服务会将该文件直接作为 `config_path` 传给 `RapidOCR` | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR`                | RapidOCR 模型目录                                             | `<repo>/models/rapidocr`           |
 | `RAPIDOCR_FONT_PATH`                | RapidOCR 字体文件路径；空表示不指定                                    | 空                                  |
-| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串                                         | `AUTO`                             |
+| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 设备字符串；`AUTO` 在 GPU 可见时会优先解析为 `AUTO:GPU,CPU` | `AUTO`                             |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `THROUGHPUT`                       |
 | `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数，同时作为 OCR `det/cls/rec` 三个 stage 执行器的 worker 数基线 | `2`                                |
@@ -45,7 +46,7 @@
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `8`                                |
 | `OCR_PREWARM_ENABLED`               | 是否启用一次性后台 RapidOCR 预热；预热完成后会立即释放 OCR 模型                 | `false`                             |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 一次性后台预热延迟（秒）；仅在 `OCR_PREWARM_ENABLED=true` 时生效      | `1.0`                               |
-| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`                                      | `AUTO`                             |
+| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；`AUTO` 在 GPU 可见时会优先解析为 `GPU`     | `AUTO`                             |
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
@@ -61,16 +62,17 @@
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
 - RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，且三个 stage 的 worker 数默认对齐 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS`，避免 app 层只喂单路导致 OpenVINO request budget 空转。
-- 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器。
+- 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器；OCR/Face 的异步路径会先完成模型加载，再进入执行超时窗口。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
-- RapidOCR 默认基线使用 `THROUGHPUT + AUTO + rec/cls batch=8`；若更关注单请求尾延迟，可显式改回 `RAPIDOCR_PERFORMANCE_HINT=LATENCY`。
+- RapidOCR 默认基线使用 `THROUGHPUT + AUTO + rec/cls batch=8`；当容器内 GPU 可见时，运行时会把 `AUTO` 收敛到 GPU 优先的 `AUTO:GPU,CPU`，并在日志中输出 `device`、`runtime_device` 与 `exec_devices` 便于核对实际落点。若更关注单请求尾延迟，可显式改回 `RAPIDOCR_PERFORMANCE_HINT=LATENCY`。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - RapidOCR 的 OpenVINO session 会在线程内复用 `InferRequest`；方向分类阶段若发现 OpenVINO 返回条数少于当前批长度，会自动退回单张分类，避免 `IndexError` 并兼容 batch 输出不一致的运行时。
+- RapidOCR 会在慢请求时输出阶段耗时拆分日志（`preprocess/det/crop/cls/rec/assemble`），便于区分是检测、裁剪还是识别阶段拖慢了整体时延。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
-- RapidOCR、InsightFace 和 InsightFace 的 OpenVINO PPP 预处理默认都走 `AUTO` 设备选择。
-- 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPU。
+- InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
+- 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
 
 ## Windows 本机部署
 
@@ -153,7 +155,7 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`；如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 
@@ -191,6 +193,7 @@ docker run -d \
   -e CLIP_IMAGE_BATCH=8 \
   -e RAPIDOCR_DEVICE=AUTO \
   -e INSIGHTFACE_OV_DEVICE=AUTO \
+  -e OCR_EXEC_TIMEOUT=30 \
   mt-photos-ai-openvino
 ```
 

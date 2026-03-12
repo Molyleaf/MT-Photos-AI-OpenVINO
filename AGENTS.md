@@ -73,7 +73,7 @@
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
 - 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；必须把 `app/config/cfg_openvino_cpu.yaml` 作为 `RapidOCR(config_path=...)` 传入，禁止继续依赖库内默认 YAML。
-- RapidOCR OpenVINO 设备基线使用 `AUTO`；显式环境变量优先于 YAML，且不得被 YAML 旧值覆盖。
+- RapidOCR OpenVINO 设备基线使用 `AUTO`；显式环境变量优先于 YAML，且不得被 YAML 旧值覆盖；当 `AUTO` 且 GPU 可见时，运行时必须按 GPU 优先解析到 `AUTO:GPU,CPU`，并在日志里输出配置设备与实际编译设备。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
 - 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
@@ -88,6 +88,7 @@
 - RapidOCR OpenVINO patch 必须在线程内复用 `InferRequest`；禁止每次调用都重新 `create_infer_request()`。
 - RapidOCR 分类阶段必须校验 OpenVINO 批输出条数；若返回条数与当前批长度不一致，必须自动退回单张分类，禁止出现 `IndexError` 或越界写回。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
+- OCR 执行超时允许通过 `OCR_EXEC_TIMEOUT` 单独覆盖；默认不得低于 `30s`，且异步路径中模型加载/切换等待不得挤占 OCR 纯执行超时窗口。
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 
@@ -95,7 +96,7 @@
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
-- InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时。
+- InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时；当 `AUTO` 且 GPU 可见时，运行时必须显式收敛到 `GPU`，并在日志里输出 `configured_device/runtime_device/provider_runtime`。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
 - 必须兼容 `insightface` 旧版 `FaceAnalysis.__init__` 不支持 `providers/allowed_modules` 的情况；此时必须在会话级显式设置 `OpenVINOExecutionProvider` 并校验 provider 顺序。
@@ -338,6 +339,9 @@
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当构造阶段不支持 `providers` / `provider_options` / `allowed_modules` 参数时，运行时按兼容顺序重试实例化，再显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 收敛 RapidOCR OpenVINO 请求复用：OCR det/cls/rec 会在线程内复用 `InferRequest`，不再每次调用重新 `create_infer_request()`。
+- 收敛 RapidOCR GPU 设备选择：当 `RAPIDOCR_DEVICE=AUTO` 且 GPU 可见时，运行时改为 GPU 优先编译到 `AUTO:GPU,CPU`，并避免先走一遍临时 CPU compile 路径；日志会输出 `device/runtime_device/exec_devices`。
+- 收敛 OCR 异步超时语义：OCR 的模型加载与租约切换不再占用执行超时窗口，并新增 `OCR_EXEC_TIMEOUT` 作为 OCR 专属执行超时覆盖；慢请求会输出 `preprocess/det/crop/cls/rec/assemble` 阶段耗时。
+- 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
 - 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。
@@ -365,10 +369,12 @@ services:
       - INFERENCE_QUEUE_MAX_SIZE=64
       - INFERENCE_TASK_TIMEOUT=10
       - INFERENCE_EXEC_TIMEOUT=30
+      - OCR_EXEC_TIMEOUT=30
 ```
 
 说明：
-- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径（RapidOCR / InsightFace / PPP）默认使用 `AUTO`。
+- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，RapidOCR 编译到 `AUTO:GPU,CPU`，InsightFace EP/PPP 收敛到 `GPU`。
+- 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
 
 #### B. 启动与设备可见性判定
