@@ -551,20 +551,33 @@ class _InterProcessFileLock:
 @dataclass(slots=True)
 class _OpenVinoPreprocessRunner:
     compiled_model: ov.CompiledModel
-    request: ov.InferRequest
     input_port: Any
     output_port: Any
     runner_name: str
     input_height: int
     input_width: int
+    _request_local: threading.local = field(
+        init=False,
+        repr=False,
+        default_factory=threading.local,
+    )
+
+    def _get_request(self) -> ov.InferRequest:
+        request = getattr(self._request_local, "request", None)
+        if request is None:
+            # OpenVINO InferRequest cannot be reused concurrently across worker threads.
+            request = self.compiled_model.create_infer_request()
+            self._request_local.request = request
+        return request
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
         prepared = np.ascontiguousarray(tensor, dtype=np.uint8)
-        self.request.set_tensor(self.input_port, ov.Tensor(prepared, shared_memory=True))
+        request = self._get_request()
+        request.set_tensor(self.input_port, ov.Tensor(prepared, shared_memory=True))
         # Avoid InferRequest.infer() OVDict wrapping for anonymous Result ports on some OV runtimes.
-        self.request.start_async()
-        self.request.wait()
-        return np.asarray(self.request.get_tensor(self.output_port).data)
+        request.start_async()
+        request.wait()
+        return np.asarray(request.get_tensor(self.output_port).data)
 
     def validate(self) -> None:
         sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)
@@ -1897,7 +1910,6 @@ class AIModels:
         )
         runner = _OpenVinoPreprocessRunner(
             compiled_model=compiled,
-            request=compiled.create_infer_request(),
             input_port=compiled.input(0),
             output_port=compiled.output(0),
             runner_name=runner_name,
