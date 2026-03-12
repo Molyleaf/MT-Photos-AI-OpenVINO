@@ -1,7 +1,8 @@
 import asyncio
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -18,6 +19,42 @@ from .constants import (
 
 
 class ClipImageMixin:
+    core: ov.Core
+    qa_clip_path: Path
+    _clip_inference_device: str
+    _clip_remote_context: Any
+    _condition: Any
+    _stopping: bool
+    _normal_queue: Any
+    _shared_cpu_executor: ThreadPoolExecutor
+    _clip_image_batch_size: int
+    _clip_image_batch_wait_seconds: float
+    _clip_vision_load_lock: Any
+    _clip_vision_model: Optional[ov.CompiledModel]
+    _clip_vision_ppp: Any
+    _clip_vision_request: Optional[ov.InferRequest]
+    _clip_vision_input_name: Optional[str]
+    _clip_vision_host_input_cache: dict[tuple[int, int, int], tuple[ov.Tensor, Any]]
+    _clip_vision_host_tensor_enabled: bool
+
+    if TYPE_CHECKING:
+        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
+        def _build_openvino_preprocess_runner(self, **kwargs: Any) -> Any: ...
+        def _safe_set_result(self, future: Future[Any], value: Any) -> None: ...
+        def _safe_set_exception(self, future: Future[Any], exc: Exception) -> None: ...
+        def _submit_task(self, kind: str, payload: Any) -> _InferenceTask: ...
+        def _wait_task(self, task: _InferenceTask) -> Any: ...
+        async def _await_task(self, task: _InferenceTask) -> Any: ...
+        def _bind_non_text_lease_to_future(self, family: str, future: Future[Any]) -> None: ...
+        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        def _release_non_text_family_lease(self, family: str) -> None: ...
+        @staticmethod
+        def _run_in_executor(
+            executor: ThreadPoolExecutor,
+            func: Any,
+            *args: Any,
+        ) -> asyncio.Future[Any]: ...
+
     def _worker_loop(self) -> None:
         while True:
             normal_task: Optional[_InferenceTask] = None

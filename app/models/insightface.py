@@ -5,18 +5,24 @@ import os
 import shutil
 import sys
 import types
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 
-try:
+if TYPE_CHECKING:
+    from app.schemas import FacialArea, RepresentResult
+elif __package__ and "." in __package__:
     from ..schemas import FacialArea, RepresentResult
-except ImportError:
-    from schemas import FacialArea, RepresentResult
+else:
+    _schemas = import_module("schemas")
+    FacialArea = _schemas.FacialArea
+    RepresentResult = _schemas.RepresentResult
 
 from .common import (
     _OpenVinoPreprocessRunner,
@@ -129,6 +135,40 @@ def _estimate_insightface_norm_matrix(
 
 
 class InsightFaceMixin:
+    core: Any
+    ov_cache_dir: Optional[Path]
+    insightface_root: Path
+    insightface_model_root: Path
+    _face_engine: Optional[FaceAnalysis]
+    _face_det_ppp: Optional[_OpenVinoPreprocessRunner]
+    _face_rec_ppp: Optional[_OpenVinoPreprocessRunner]
+    _face_load_lock: Any
+    _face_executor: ThreadPoolExecutor
+    _execution_timeout_seconds: int
+
+    if TYPE_CHECKING:
+        def _build_openvino_preprocess_runner(
+            self,
+            runner_name: str,
+            device_name: str,
+            output_height: int,
+            output_width: int,
+            mean_values: List[float],
+            std_values: List[float],
+        ) -> _OpenVinoPreprocessRunner: ...
+        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
+        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        def _release_non_text_family_lease(self, family: str) -> None: ...
+        @staticmethod
+        def _run_in_executor(
+            executor: ThreadPoolExecutor,
+            func: Any,
+            *args: Any,
+        ) -> asyncio.Future[Any]: ...
+        def _bind_non_text_lease_to_future(self, family: str, future: Future[Any]) -> None: ...
+        @staticmethod
+        def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
+
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:
         name, vendor = _ensure_intel_opencl_device("InsightFace alignment")
@@ -231,6 +271,7 @@ class InsightFaceMixin:
             batched_output = bool(getattr(model_self, "batched", False))
 
             for idx, stride in enumerate(model_self._feat_stride_fpn):
+                kps_preds: Optional[np.ndarray] = None
                 if batched_output:
                     scores = net_outs[idx][0]
                     bbox_preds = net_outs[idx + fmc][0] * stride
@@ -266,6 +307,11 @@ class InsightFaceMixin:
                 bboxes_list.append(pos_bboxes)
 
                 if model_self.use_kps:
+                    if kps_preds is None:
+                        raise RuntimeError(
+                            "InsightFace detector returned no keypoint predictions "
+                            "for a keypoint-enabled model."
+                        )
                     kpss = distance2kps(anchor_centers, kps_preds)
                     kpss = kpss.reshape((kpss.shape[0], -1, 2))
                     pos_kpss = kpss[pos_inds]

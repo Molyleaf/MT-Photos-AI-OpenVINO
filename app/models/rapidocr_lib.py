@@ -3,10 +3,11 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -18,10 +19,14 @@ from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecOu
 from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
 
-try:
+if TYPE_CHECKING:
+    from app.schemas import OCRBox, OCRResult
+elif __package__ and "." in __package__:
     from ..schemas import OCRBox, OCRResult
-except ImportError:
-    from schemas import OCRBox, OCRResult
+else:
+    _schemas = import_module("schemas")
+    OCRBox = _schemas.OCRBox
+    OCRResult = _schemas.OCRResult
 
 from .common import (
     _as_bool,
@@ -50,6 +55,29 @@ from .constants import (
     RAPIDOCR_V5_MOBILE_DET_FILE,
     RAPIDOCR_V5_MOBILE_REC_FILE,
 )
+
+_OV_DEVICE_PRIORITIES_KEY = str(
+    getattr(ov.properties.device, "priorities", "MULTI_DEVICE_PRIORITIES")
+)
+_OV_AUTO_STARTUP_FALLBACK_KEY = str(
+    getattr(ov.properties.intel_auto, "enable_startup_fallback", "ENABLE_STARTUP_FALLBACK")
+)
+_OV_AUTO_RUNTIME_FALLBACK_KEY = str(
+    getattr(ov.properties.intel_auto, "enable_runtime_fallback", "ENABLE_RUNTIME_FALLBACK")
+)
+
+_TextClsResult = Tuple[str, float]
+_TextRecWordResult = Tuple[str, float, Optional[List[List[int]]]]
+
+
+def _empty_text_rec_output() -> TextRecOutput:
+    return TextRecOutput(
+        imgs=[],
+        txts=cast(Any, tuple()),
+        scores=[],
+        word_results=cast(Any, tuple()),
+        elapse=0.0,
+    )
 
 
 def _patch_rapidocr_openvino_multi_output() -> None:
@@ -155,9 +183,9 @@ def _patch_rapidocr_openvino_device_selection() -> None:
         if selected_device.startswith("AUTO:"):
             device_priorities = ",".join(_split_openvino_device_expr(selected_device))
             if device_priorities:
-                compile_cfg[str(ov.properties.device.priorities)] = device_priorities
-            compile_cfg[str(ov.properties.intel_auto.enable_startup_fallback)] = "false"
-            compile_cfg[str(ov.properties.intel_auto.enable_runtime_fallback)] = "false"
+                compile_cfg[_OV_DEVICE_PRIORITIES_KEY] = device_priorities
+            compile_cfg[_OV_AUTO_STARTUP_FALLBACK_KEY] = "false"
+            compile_cfg[_OV_AUTO_RUNTIME_FALLBACK_KEY] = "false"
 
         try:
             self.model = core.read_model(model_path)
@@ -189,6 +217,37 @@ _patch_rapidocr_openvino_device_selection()
 
 
 class RapidOCRMixin:
+    core: ov.Core
+    ov_cache_dir: Optional[Path]
+    rapidocr_config_path: Path
+    rapidocr_model_dir_path: Path
+    rapidocr_font_path: str
+    _rapidocr_load_lock: Any
+    _rapidocr_engine: Optional[RapidOCR]
+    _rapidocr_runtime_cfg: Optional[Dict[str, Any]]
+    _ocr_opencl_device_name: Optional[str]
+    _ocr_opencl_device_vendor: Optional[str]
+    _ocr_stage_worker_count: int
+    _ocr_det_executor: ThreadPoolExecutor
+    _ocr_cls_executor: ThreadPoolExecutor
+    _ocr_rec_executor: ThreadPoolExecutor
+    _shared_cpu_executor: ThreadPoolExecutor
+    _ocr_execution_timeout_seconds: int
+
+    if TYPE_CHECKING:
+        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
+        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        def _release_non_text_family_lease(self, family: str) -> None: ...
+        @staticmethod
+        def _run_in_executor(
+            executor: ThreadPoolExecutor,
+            func: Any,
+            *args: Any,
+        ) -> asyncio.Future[Any]: ...
+        def _bind_non_text_lease_to_future(self, family: str, future: Future[Any]) -> None: ...
+        @staticmethod
+        def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
+
     def _require_rapidocr_config_path(self) -> Path:
         if not self.rapidocr_config_path.is_file():
             raise FileNotFoundError(
@@ -737,7 +796,12 @@ class RapidOCRMixin:
             return TextDetOutput()
 
         boxes = detector.sorted_boxes(boxes)
-        return TextDetOutput(image_bgr, boxes, scores, elapse=time.perf_counter() - start_time)
+        return TextDetOutput(
+            img=image_bgr,
+            boxes=np.asarray(boxes, dtype=np.float32),
+            scores=[float(score) for score in scores],
+            elapse=time.perf_counter() - start_time,
+        )
 
     def _rapidocr_preprocess_img(
         self,
@@ -1048,12 +1112,14 @@ class RapidOCRMixin:
         start_time = time.perf_counter()
         img_list = list(images)
         if not img_list:
-            return TextRecOutput(imgs=[], txts=(), scores=[], word_results=(), elapse=0.0)
+            return _empty_text_rec_output()
 
         width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
         indices = np.argsort(np.array(width_list))
         img_num = len(img_list)
-        rec_res: List[Tuple[Tuple[str, float], Any]] = [(("", 0.0), None)] * img_num
+        rec_res: List[Tuple[_TextClsResult, Optional[_TextRecWordResult]]] = [
+            (("", 0.0), None) for _ in range(img_num)
+        ]
 
         img_c, img_h, img_w = recognizer.rec_image_shape[:3]
         max_wh_ratio = img_w / img_h
@@ -1097,21 +1163,28 @@ class RapidOCRMixin:
         for result_index, one_res in enumerate(line_results):
             original_index = int(indices[result_index])
             if return_word_box:
-                rec_res[original_index] = (one_res, word_results[result_index])
+                rec_res[original_index] = (
+                    (str(one_res[0]), float(one_res[1])),
+                    cast(_TextRecWordResult, word_results[result_index]),
+                )
             else:
-                rec_res[original_index] = (one_res, None)
+                rec_res[original_index] = ((str(one_res[0]), float(one_res[1])), None)
 
         all_line_results, all_word_results = list(zip(*rec_res))
         txts, scores = list(zip(*all_line_results))
         if recognizer.cfg.lang_type == LangRec.ARABIC:
             txts = reorder_bidi_for_display(txts)
 
+        normalized_word_results: List[_TextRecWordResult] = []
+        for word_result in all_word_results:
+            normalized_word_results.append(word_result or ("", 1.0, None))
+
         return TextRecOutput(
-            img_list,
-            txts,
-            scores,
-            all_word_results,
-            time.perf_counter() - start_time,
+            imgs=img_list,
+            txts=cast(Any, tuple(str(text) for text in txts)),
+            scores=[float(score) for score in scores],
+            word_results=cast(Any, tuple(normalized_word_results)),
+            elapse=time.perf_counter() - start_time,
             viser=VisRes(lang_type=recognizer.cfg.lang_type, font_path=recognizer.cfg.font_path),
         )
 
@@ -1192,7 +1265,7 @@ class RapidOCRMixin:
         start_time = time.perf_counter()
         img_list = list(images)
         if not img_list:
-            return TextRecOutput(imgs=[], txts=(), scores=[], word_results=(), elapse=0.0)
+            return _empty_text_rec_output()
 
         batch_indices_list = self._rapidocr_build_sorted_batch_indices(
             img_list,
@@ -1213,12 +1286,15 @@ class RapidOCRMixin:
 
         texts: List[str] = [""] * len(img_list)
         scores: List[float] = [0.0] * len(img_list)
-        word_results: List[Any] = [None] * len(img_list)
+        word_results: List[_TextRecWordResult] = [("", 1.0, None) for _ in range(len(img_list))]
         viser: Any = None
         for batch_indices, batch_output in batch_outputs:
             batch_texts = list(batch_output.txts or ())
             batch_scores = [float(score) for score in (batch_output.scores or ())]
-            batch_word_results = list(batch_output.word_results or ())
+            batch_word_results = [
+                cast(_TextRecWordResult, item)
+                for item in list(batch_output.word_results or ())
+            ]
             if (
                 len(batch_texts) != len(batch_indices)
                 or len(batch_scores) != len(batch_indices)
@@ -1238,9 +1314,9 @@ class RapidOCRMixin:
 
         return TextRecOutput(
             imgs=img_list,
-            txts=tuple(texts),
+            txts=cast(Any, tuple(texts)),
             scores=scores,
-            word_results=tuple(word_results),
+            word_results=cast(Any, tuple(word_results)),
             elapse=time.perf_counter() - start_time,
             viser=viser,
         )
@@ -1261,7 +1337,9 @@ class RapidOCRMixin:
             ori_img,
         )
         preprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
-        det_res, cls_res, rec_res = TextDetOutput(), TextClsOutput(), TextRecOutput()
+        det_res = TextDetOutput()
+        cls_res = TextClsOutput()
+        rec_res = _empty_text_rec_output()
 
         if engine.use_det:
             try:

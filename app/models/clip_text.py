@@ -5,7 +5,8 @@ import socketserver
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import openvino as ov
@@ -50,6 +51,31 @@ def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -
 
 
 class ClipTextMixin:
+    _pid: int
+    _execution_timeout_seconds: int
+    _clip_inference_device: str
+    qa_clip_path: Path
+    _clip_remote_context: Any
+    _clip_text_model: Optional[ov.CompiledModel]
+    _clip_text_request: Optional[ov.InferRequest]
+    _clip_text_input_names: Optional[Tuple[str, str]]
+    _clip_text_host_input_cache: Dict[int, Tuple[ov.Tensor, Any, ov.Tensor, Any]]
+    _clip_text_host_tensor_enabled: bool
+    _clip_text_lock: Any
+    _text_service_meta_path: Path
+    _text_service_lock: Any
+    _text_service_owner: bool
+    _text_service_server: Optional[_TextClipRpcServer]
+    _text_service_thread: Optional[threading.Thread]
+    _text_service_port: Optional[int]
+
+    if TYPE_CHECKING:
+        def _compile_clip_model(
+            self,
+            model_or_path: Any,
+            performance_hint: str,
+        ) -> ov.CompiledModel: ...
+
     def _read_text_service_meta(self) -> Optional[Dict[str, Any]]:
         try:
             raw = json.loads(self._text_service_meta_path.read_text(encoding="utf-8"))
@@ -127,7 +153,8 @@ class ClipTextMixin:
                     response = {"error": str(exc)}
                 self.wfile.write((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
 
-        server = _TextClipRpcServer((TEXT_RPC_HOST, 0), _TextClipRequestHandler)
+        handler_class = cast(type[socketserver.BaseRequestHandler], _TextClipRequestHandler)
+        server = _TextClipRpcServer((TEXT_RPC_HOST, 0), handler_class)
         self._text_service_server = server
         self._text_service_port = int(server.server_address[1])
         self._write_text_service_meta(self._text_service_port)
