@@ -300,7 +300,7 @@ def _ensure_intel_opencl_device(feature_name: str) -> Tuple[str, str]:
             "No silent fallback is allowed."
         )
 
-    device = cv2.ocl.Device_getDefault()
+    device = cv2.ocl.Device.getDefault()
     vendor = str(device.vendorName())
     name = str(device.name())
     if "INTEL" not in vendor.upper():
