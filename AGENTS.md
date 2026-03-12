@@ -74,11 +74,13 @@
 - 禁止对 RapidOCR 模型做量化或结构改写。
 - 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；必须把 `app/config/cfg_openvino_cpu.yaml` 作为 `RapidOCR(config_path=...)` 传入，禁止继续依赖库内默认 YAML。
 - RapidOCR OpenVINO 设备基线使用 `AUTO`；显式环境变量优先于 YAML，且不得被 YAML 旧值覆盖；当 `AUTO` 且 GPU 可见时，运行时必须按 GPU 优先解析到 `AUTO:GPU,CPU`，并在日志里输出配置设备与实际编译设备。
+- 当 RapidOCR 运行时设备解析到 `AUTO:GPU,CPU` 或显式 `GPU*` 时，必须显式关闭 OpenVINO AUTO 的 startup/runtime CPU fallback，并校验 `Det/Cls/Rec` 的实际 `exec_devices` 全部落在 GPU；若任一 stage 落回 CPU，必须直接报错，禁止“首个请求先在 CPU 上跑一遍”。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
 - 预处理基线（面向 i7-11800H 核显）：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
 - OpenVINO 参数基线：`device_name=AUTO`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
 - OCR `Det/Cls/Rec` 三个 stage 执行器的 worker 数默认必须与 `performance_num_requests` 对齐（当前基线 `2`）；禁止 app 层仍固定单 worker 导致 runtime request budget 空转。
+- OCR `Cls/Rec` 在单个大图请求内也必须按批次拆分后并发投喂现有 stage worker，不能只在“多个请求同时到来”时才利用 `performance_num_requests`；否则会出现 GPU 长时间空转而 CPU 串行预处理堆积。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；禁止 YAML 覆盖显式运行时设备设置。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
@@ -339,7 +341,8 @@
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当构造阶段不支持 `providers` / `provider_options` / `allowed_modules` 参数时，运行时按兼容顺序重试实例化，再显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 收敛 RapidOCR OpenVINO 请求复用：OCR det/cls/rec 会在线程内复用 `InferRequest`，不再每次调用重新 `create_infer_request()`。
-- 收敛 RapidOCR GPU 设备选择：当 `RAPIDOCR_DEVICE=AUTO` 且 GPU 可见时，运行时改为 GPU 优先编译到 `AUTO:GPU,CPU`，并避免先走一遍临时 CPU compile 路径；日志会输出 `device/runtime_device/exec_devices`。
+- 收敛 RapidOCR GPU 设备选择：当 `RAPIDOCR_DEVICE=AUTO` 且 GPU 可见时，运行时改为 GPU 优先编译到 `AUTO:GPU,CPU`，并显式关闭 OpenVINO AUTO startup/runtime CPU fallback；若 `Det/Cls/Rec` 任一 stage 的 `exec_devices` 未落到 GPU，初始化直接失败，日志会输出 `device/runtime_device/exec_devices`。
+- 收敛 OCR 单请求 GPU 利用率：`Cls/Rec` 会按 `cls_batch_num/rec_batch_num` 切成子批并发投递到现有 stage worker，不再把整张大图的所有文本框压成单个 stage 任务，减少 GPU 空转与 CPU 串行阻塞。
 - 收敛 OCR 异步超时语义：OCR 的模型加载与租约切换不再占用执行超时窗口，并新增 `OCR_EXEC_TIMEOUT` 作为 OCR 专属执行超时覆盖；慢请求会输出 `preprocess/det/crop/cls/rec/assemble` 阶段耗时。
 - 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。

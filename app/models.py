@@ -201,6 +201,13 @@ def _patch_rapidocr_openvino_device_selection() -> None:
                 continue
             compile_cfg[ov_key] = str(value)
 
+        if selected_device.startswith("AUTO:"):
+            device_priorities = ",".join(_split_openvino_device_expr(selected_device))
+            if device_priorities:
+                compile_cfg[str(ov.properties.device.priorities)] = device_priorities
+            compile_cfg[str(ov.properties.intel_auto.enable_startup_fallback)] = "false"
+            compile_cfg[str(ov.properties.intel_auto.enable_runtime_fallback)] = "false"
+
         try:
             self.model = core.read_model(model_path)
             compiled_model = core.compile_model(
@@ -447,6 +454,15 @@ def _get_openvino_session_execution_devices(session_like: Any) -> List[str]:
             except Exception:
                 compiled_model = None
     return _get_compiled_model_execution_devices(compiled_model)
+
+
+def _openvino_device_expr_requests_gpu(device_expr: str) -> bool:
+    normalized = str(device_expr or "").strip().upper()
+    if not normalized:
+        return False
+    if normalized.startswith("GPU"):
+        return True
+    return any(token.startswith("GPU") for token in _split_openvino_device_expr(normalized))
 
 
 def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
@@ -2185,6 +2201,27 @@ class AIModels:
                 execution_devices[stage_name] = devices
         return execution_devices
 
+    @staticmethod
+    def _validate_rapidocr_execution_devices(
+        cfg: Dict[str, Any],
+        execution_devices: Dict[str, List[str]],
+    ) -> None:
+        runtime_device = str(cfg.get("runtime_device_name", cfg.get("device_name", "AUTO")))
+        if not _openvino_device_expr_requests_gpu(runtime_device):
+            return
+
+        cpu_fallback_stages = [
+            stage_name
+            for stage_name in ("det", "cls", "rec")
+            if not _has_openvino_gpu_device(execution_devices.get(stage_name))
+        ]
+        if cpu_fallback_stages:
+            raise RuntimeError(
+                "RapidOCR execution device validation failed: "
+                f"runtime_device={runtime_device}, execution_devices={execution_devices}, "
+                f"cpu_fallback_stages={cpu_fallback_stages}. No silent fallback is allowed."
+            )
+
     def _warmup_rapidocr_locked(self) -> None:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
@@ -2231,6 +2268,7 @@ class AIModels:
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
         execution_devices = self._collect_rapidocr_execution_devices(self._rapidocr_engine)
+        self._validate_rapidocr_execution_devices(config, execution_devices)
         self._rapidocr_runtime_cfg = dict(config)
         self._rapidocr_runtime_cfg["execution_devices"] = execution_devices
         if config.get("det_limit_type") == "min":
@@ -3006,50 +3044,119 @@ class AIModels:
         return str(label), float(score)
 
     @staticmethod
-    def _rapidocr_cls_and_rotate(engine: RapidOCR, images: List[np.ndarray]) -> Tuple[List[np.ndarray], TextClsOutput]:
-        start_time = time.perf_counter()
-        classifier = engine.text_cls
-        img_list = list(images)
-        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
-        indices = np.argsort(np.array(width_list))
+    def _rapidocr_build_sorted_batch_indices(
+        images: List[np.ndarray],
+        batch_num: int,
+    ) -> List[List[int]]:
+        if not images:
+            return []
 
-        img_num = len(img_list)
-        cls_res = [("", 0.0)] * img_num
-        batch_num = classifier.cls_batch_num
-        for beg_img_no in range(0, img_num, batch_num):
-            end_img_no = min(img_num, beg_img_no + batch_num)
-            batch_indices = [int(indices[ino]) for ino in range(beg_img_no, end_img_no)]
-            norm_img_batch = np.stack(
-                [
-                    classifier.resize_norm_img(img_list[original_index])
-                    for original_index in batch_indices
-                ],
-                axis=0,
-            ).astype(np.float32)
-            prob_out = classifier.session(norm_img_batch)
-            cls_result = list(classifier.postprocess_op(prob_out))
-            if len(cls_result) != len(batch_indices):
-                LOG.warning(
-                    "RapidOCR cls output size mismatch: expected=%s got=%s; "
-                    "falling back to single-image classification.",
-                    len(batch_indices),
-                    len(cls_result),
+        width_list = [img.shape[1] / float(img.shape[0]) for img in images]
+        indices = np.argsort(np.array(width_list))
+        batch_size = max(1, int(batch_num))
+        return [
+            [int(indices[ino]) for ino in range(beg_img_no, min(len(images), beg_img_no + batch_size))]
+            for beg_img_no in range(0, len(images), batch_size)
+        ]
+
+    @staticmethod
+    def _rapidocr_classify_batch(
+        engine: RapidOCR,
+        images: List[np.ndarray],
+        batch_indices: List[int],
+    ) -> Tuple[List[int], List[np.ndarray], List[Tuple[str, float]]]:
+        classifier = engine.text_cls
+        batch_images = [images[original_index] for original_index in batch_indices]
+        if not batch_images:
+            return batch_indices, [], []
+
+        norm_img_batch = np.stack(
+            [classifier.resize_norm_img(image) for image in batch_images],
+            axis=0,
+        ).astype(np.float32)
+        prob_out = classifier.session(norm_img_batch)
+        cls_result = list(classifier.postprocess_op(prob_out))
+        if len(cls_result) != len(batch_indices):
+            LOG.warning(
+                "RapidOCR cls output size mismatch: expected=%s got=%s; "
+                "falling back to single-image classification.",
+                len(batch_indices),
+                len(cls_result),
+            )
+            cls_result = [
+                AIModels._rapidocr_classify_single_image(classifier, image)
+                for image in batch_images
+            ]
+
+        rotated_images = list(batch_images)
+        normalized_results: List[Tuple[str, float]] = []
+        for relative_index, (label, score) in enumerate(cls_result):
+            label_str = str(label)
+            score_float = float(score)
+            normalized_results.append((label_str, score_float))
+            if "180" in label_str and score_float > classifier.cls_thresh:
+                rotated_images[relative_index] = cv2.rotate(
+                    rotated_images[relative_index],
+                    cv2.ROTATE_180,
                 )
-                classifier.cls_batch_num = 1
-                cls_result = [
-                    AIModels._rapidocr_classify_single_image(
-                        classifier,
-                        img_list[original_index],
-                    )
-                    for original_index in batch_indices
-                ]
-            for original_index, (label, score) in zip(batch_indices, cls_result):
-                cls_res[original_index] = (label, score)
-                if "180" in label and score > classifier.cls_thresh:
-                    img_list[original_index] = cv2.rotate(
-                        img_list[original_index],
-                        cv2.ROTATE_180,
-                    )
+        return batch_indices, rotated_images, normalized_results
+
+    @staticmethod
+    def _rapidocr_recognize(engine: RapidOCR, images: List[np.ndarray]) -> TextRecOutput:
+        rec_res = engine.text_rec(TextRecInput(img=images, return_word_box=engine.return_word_box))
+        if rec_res.txts is None:
+            raise RapidOCRError("The text recognize result is empty")
+        return rec_res
+
+    @staticmethod
+    def _rapidocr_recognize_batch(
+        engine: RapidOCR,
+        images: List[np.ndarray],
+        batch_indices: List[int],
+    ) -> Tuple[List[int], TextRecOutput]:
+        batch_images = [images[original_index] for original_index in batch_indices]
+        return batch_indices, AIModels._rapidocr_recognize(engine, batch_images)
+
+    async def _rapidocr_cls_and_rotate_async(
+        self,
+        engine: RapidOCR,
+        images: List[np.ndarray],
+    ) -> Tuple[List[np.ndarray], TextClsOutput]:
+        start_time = time.perf_counter()
+        img_list = list(images)
+        if not img_list:
+            output = TextClsOutput(img_list=[], cls_res=[], elapse=0.0)
+            return [], output
+
+        batch_indices_list = self._rapidocr_build_sorted_batch_indices(
+            img_list,
+            engine.text_cls.cls_batch_num,
+        )
+        batch_outputs = await asyncio.gather(
+            *[
+                self._run_in_executor(
+                    self._ocr_cls_executor,
+                    self._rapidocr_classify_batch,
+                    engine,
+                    img_list,
+                    batch_indices,
+                )
+                for batch_indices in batch_indices_list
+            ]
+        )
+
+        cls_res: List[Tuple[str, float]] = [("", 0.0)] * len(img_list)
+        for batch_indices, rotated_images, batch_results in batch_outputs:
+            if len(rotated_images) != len(batch_indices) or len(batch_results) != len(batch_indices):
+                raise RapidOCRError(
+                    "RapidOCR cls batch output mismatch: "
+                    f"expected={len(batch_indices)} got_images={len(rotated_images)} "
+                    f"got_results={len(batch_results)}"
+                )
+            for relative_index, original_index in enumerate(batch_indices):
+                img_list[original_index] = rotated_images[relative_index]
+                cls_res[original_index] = batch_results[relative_index]
+
         output = TextClsOutput(
             img_list=img_list,
             cls_res=cls_res,
@@ -3059,12 +3166,66 @@ class AIModels:
             raise RapidOCRError("The text classifier is empty")
         return output.img_list, output
 
-    @staticmethod
-    def _rapidocr_recognize(engine: RapidOCR, images: List[np.ndarray]) -> TextRecOutput:
-        rec_res = engine.text_rec(TextRecInput(img=images, return_word_box=engine.return_word_box))
-        if rec_res.txts is None:
-            raise RapidOCRError("The text recognize result is empty")
-        return rec_res
+    async def _rapidocr_recognize_async(
+        self,
+        engine: RapidOCR,
+        images: List[np.ndarray],
+    ) -> TextRecOutput:
+        start_time = time.perf_counter()
+        img_list = list(images)
+        if not img_list:
+            return TextRecOutput(imgs=[], txts=(), scores=[], word_results=(), elapse=0.0)
+
+        batch_indices_list = self._rapidocr_build_sorted_batch_indices(
+            img_list,
+            engine.text_rec.rec_batch_num,
+        )
+        batch_outputs = await asyncio.gather(
+            *[
+                self._run_in_executor(
+                    self._ocr_rec_executor,
+                    self._rapidocr_recognize_batch,
+                    engine,
+                    img_list,
+                    batch_indices,
+                )
+                for batch_indices in batch_indices_list
+            ]
+        )
+
+        texts: List[str] = [""] * len(img_list)
+        scores: List[float] = [0.0] * len(img_list)
+        word_results: List[Any] = [None] * len(img_list)
+        viser: Any = None
+        for batch_indices, batch_output in batch_outputs:
+            batch_texts = list(batch_output.txts or ())
+            batch_scores = [float(score) for score in (batch_output.scores or ())]
+            batch_word_results = list(batch_output.word_results or ())
+            if (
+                len(batch_texts) != len(batch_indices)
+                or len(batch_scores) != len(batch_indices)
+                or len(batch_word_results) != len(batch_indices)
+            ):
+                raise RapidOCRError(
+                    "RapidOCR rec batch output mismatch: "
+                    f"expected={len(batch_indices)} got_txts={len(batch_texts)} "
+                    f"got_scores={len(batch_scores)} got_words={len(batch_word_results)}"
+                )
+            if viser is None:
+                viser = batch_output.viser
+            for relative_index, original_index in enumerate(batch_indices):
+                texts[original_index] = str(batch_texts[relative_index])
+                scores[original_index] = batch_scores[relative_index]
+                word_results[original_index] = batch_word_results[relative_index]
+
+        return TextRecOutput(
+            imgs=img_list,
+            txts=tuple(texts),
+            scores=scores,
+            word_results=tuple(word_results),
+            elapse=time.perf_counter() - start_time,
+            viser=viser,
+        )
 
     async def _infer_ocr_async(self, image: np.ndarray) -> OCRResult:
         if self._rapidocr_engine is None:
@@ -3113,9 +3274,7 @@ class AIModels:
         if engine.use_cls:
             try:
                 stage_started_at = time.perf_counter()
-                cls_img_list, cls_res = await self._run_in_executor(
-                    self._ocr_cls_executor,
-                    self._rapidocr_cls_and_rotate,
+                cls_img_list, cls_res = await self._rapidocr_cls_and_rotate_async(
                     engine,
                     cropped_img_list,
                 )
@@ -3129,9 +3288,7 @@ class AIModels:
         if engine.use_rec:
             try:
                 stage_started_at = time.perf_counter()
-                rec_res = await self._run_in_executor(
-                    self._ocr_rec_executor,
-                    self._rapidocr_recognize,
+                rec_res = await self._rapidocr_recognize_async(
                     engine,
                     cls_img_list,
                 )

@@ -3,7 +3,7 @@ insightface
 fastapi
 pydantic
 openvino
-# RapidOCR 3.7.0 runs with the upstream package plus the local OpenVINO GPU-first routing, staged timeout controls, and lazy-load lifecycle logic in app/models.py.
+# RapidOCR 3.7.0 runs with the upstream package plus the local OpenVINO GPU-first/no-fallback routing, staged timeout controls, per-stage sub-batch dispatch, and lazy-load lifecycle logic in app/models.py.
 rapidocr==3.7.0
 onnxruntime-openvino
 uvicorn
