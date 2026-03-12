@@ -5,7 +5,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -13,7 +13,6 @@ import openvino as ov
 
 from .constants import (
     DEFAULT_NON_TEXT_OV_DEVICE,
-    LOG,
     PROCESS_LOCK_POLL_SECONDS,
 )
 
