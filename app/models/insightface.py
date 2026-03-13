@@ -452,7 +452,7 @@ class InsightFaceMixin(ABC):
         if kpss is not None:
             kpss = kpss[order, :, :]
             kpss = kpss[keep, :, :]
-        if max_num > 0 and det.shape[0] > max_num:
+        if 0 < max_num < det.shape[0]:
             area = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
             img_center = image.shape[0] // 2, image.shape[1] // 2
             offsets = np.vstack(
