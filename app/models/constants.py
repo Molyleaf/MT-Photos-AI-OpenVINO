@@ -43,7 +43,7 @@ RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
 RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
 RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
 
-LOG = logging.getLogger("models")
+LOG = logging.getLogger("mt_photos_ai.models")
 DEFAULT_NON_TEXT_OV_DEVICE = "AUTO"
 PROCESS_LOCK_POLL_SECONDS = 0.05
 TEXT_RPC_HOST = "127.0.0.1"

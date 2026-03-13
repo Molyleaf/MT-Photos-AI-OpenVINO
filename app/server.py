@@ -7,6 +7,57 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_APP_DIR)
+_LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
+_LOG_NAMESPACE = "mt_photos_ai"
+_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+_APP_LOG_HANDLER_FLAG = "_mt_photos_ai_handler"
+
+
+def _configure_application_logging() -> None:
+    log_level_name = os.environ.get("LOG_LEVEL", "WARNING").upper()
+    log_level = getattr(logging, log_level_name, logging.WARNING)
+    namespace_logger = logging.getLogger(_LOG_NAMESPACE)
+    namespace_logger.setLevel(log_level)
+    namespace_logger.propagate = False
+
+    configured_handlers = [
+        handler
+        for handler in namespace_logger.handlers
+        if getattr(handler, _APP_LOG_HANDLER_FLAG, False)
+    ]
+    if configured_handlers:
+        for handler in configured_handlers:
+            handler.setLevel(log_level)
+        return
+
+    formatter = logging.Formatter(_LOG_FORMAT)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    setattr(console_handler, _APP_LOG_HANDLER_FLAG, True)
+    namespace_logger.addHandler(console_handler)
+
+    if sys.platform == "win32":
+        try:
+            file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a")
+        except Exception as exc:
+            print(f"无法设置文件日志: {exc}")
+        else:
+            file_handler.setLevel(log_level)
+            file_handler.setFormatter(formatter)
+            setattr(file_handler, _APP_LOG_HANDLER_FLAG, True)
+            namespace_logger.addHandler(file_handler)
+
+
+def _configure_standalone_logging() -> None:
+    _configure_application_logging()
+
+
+_configure_application_logging()
+
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
@@ -21,26 +72,7 @@ from models.schemas import (
     RestartResponse,
 )
 
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_APP_DIR)
-_LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
-LOGGER = logging.getLogger("mt_photos_ai.server")
-
-
-def _configure_standalone_logging() -> None:
-    log_level_name = os.environ.get("LOG_LEVEL", "WARNING").upper()
-    log_level = getattr(logging, log_level_name, logging.WARNING)
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if sys.platform == "win32":
-        try:
-            handlers.insert(0, logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a"))
-        except Exception as exc:
-            print(f"无法设置文件日志: {exc}")
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=handlers,
-    )
+LOGGER = logging.getLogger(f"{_LOG_NAMESPACE}.server")
 
 
 API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"

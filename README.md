@@ -61,11 +61,13 @@
 | `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口                                                      | `8060`                             |
-| `LOG_LEVEL`                         | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`  | `WARNING`                          |
+| `LOG_LEVEL`                         | `mt_photos_ai.*` 应用/模型日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` | `WARNING`                          |
 
 补充说明：
 
 - 开发机本地验证时，建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。`RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE` 当前仅保留兼容占位，不参与运行时选路。
+- 服务会在 `uvicorn server:app` 和 `python server.py` 两种启动路径下都把 `mt_photos_ai.*` 日志输出到控制台；Windows 直接运行时还会追加写入 `<repo>/server.log`。
+- 如需看到启动自检、模型族切换和 `/restart` 释放日志，请显式设置 `LOG_LEVEL=INFO`。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。

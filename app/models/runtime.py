@@ -44,23 +44,10 @@ from .rapidocr_lib import RapidOCRMixin
 
 
 class _NonTextFamilyStateModel:
+    """`transitions` injects the trigger methods onto this model instance."""
+
     def __init__(self) -> None:
         self.state = "idle"
-
-    def begin_switch(self) -> None:
-        raise NotImplementedError
-
-    def release_to_idle(self) -> None:
-        raise NotImplementedError
-
-    def activate_vision(self) -> None:
-        raise NotImplementedError
-
-    def activate_ocr(self) -> None:
-        raise NotImplementedError
-
-    def activate_face(self) -> None:
-        raise NotImplementedError
 
 
 class _NonTextFamilyStateMachine:

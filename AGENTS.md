@@ -129,6 +129,7 @@
 - 生命周期：
 - 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
   - 关闭时释放全部模型
+- 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
@@ -196,7 +197,7 @@
 3. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
 4. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
 5. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
-6. 非文本模型族切换状态机必须显式建模，当前基线为 `transitions`；禁止再回到多布尔位 + 条件变量拼接出的隐式状态机。
+6. 非文本模型族切换状态机必须显式建模，当前基线为 `transitions`；禁止再回到多布尔位 + 条件变量拼接出的隐式状态机。状态机事件必须由 `transitions` 绑定或由显式包装器触发，禁止在 model 上预先定义同名 `NotImplementedError` 占位方法覆盖 trigger 入口。
 7. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 5 条把 OCR 与其他非文本模型族并行常驻。
 8. InsightFace 使用独立执行路径；但其准入必须遵守第 5 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
 9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
