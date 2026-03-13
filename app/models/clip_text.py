@@ -58,7 +58,6 @@ class ClipTextMixin:
     _clip_remote_context: Any
     _clip_text_model: Optional[ov.CompiledModel]
     _clip_text_request: Optional[ov.InferRequest]
-    _clip_text_input_names: Optional[Tuple[str, str]]
     _clip_text_host_input_cache: Dict[int, Tuple[ov.Tensor, Any, ov.Tensor, Any]]
     _clip_text_host_tensor_enabled: bool
     _clip_text_lock: Any
@@ -216,51 +215,59 @@ class ClipTextMixin:
             self._load_text_model_once_locked()
             return self._infer_clip_text_batch([text])[0]
 
+    def _require_text_service_port(self) -> int:
+        port = self._text_service_port
+        if port is None:
+            raise RuntimeError("Text-CLIP RPC service port is unavailable.")
+        return int(port)
+
+    def _send_text_service_request(
+        self,
+        request: Dict[str, Any],
+        *,
+        timeout_seconds: float,
+        recv_size: int = 16384,
+    ) -> Dict[str, Any]:
+        response_line = b""
+        with socket.create_connection(
+            (TEXT_RPC_HOST, self._require_text_service_port()),
+            timeout=timeout_seconds,
+        ) as conn:
+            conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
+            conn.shutdown(socket.SHUT_WR)
+            while not response_line.endswith(b"\n"):
+                chunk = conn.recv(recv_size)
+                if not chunk:
+                    break
+                response_line += chunk
+
+        if not response_line:
+            raise RuntimeError("Text-CLIP RPC service returned empty response.")
+        response = json.loads(response_line.decode("utf-8"))
+        if not isinstance(response, dict):
+            raise RuntimeError("Text-CLIP RPC service returned invalid payload.")
+        return response
+
     def _request_text_embedding_remote(self, text: str) -> List[float]:
         self._ensure_text_service_ready(preload=False)
         if self._text_service_owner:
             return self._infer_text_locally(text)
-        if self._text_service_port is None:
-            raise RuntimeError("Text-CLIP RPC service port is unavailable.")
-
-        response_line = b""
+        timeout_seconds = max(1.0, float(self._execution_timeout_seconds))
+        request = {"op": "embed", "text": text}
         try:
-            with socket.create_connection(
-                (TEXT_RPC_HOST, self._text_service_port),
-                timeout=max(1.0, float(self._execution_timeout_seconds)),
-            ) as conn:
-                request = {"op": "embed", "text": text}
-                conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
-                conn.shutdown(socket.SHUT_WR)
-                while not response_line.endswith(b"\n"):
-                    chunk = conn.recv(16384)
-                    if not chunk:
-                        break
-                    response_line += chunk
+            response = self._send_text_service_request(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
         except OSError:
             self._text_service_port = None
             self._ensure_text_service_ready(preload=False)
             if self._text_service_owner:
                 return self._infer_text_locally(text)
-            if self._text_service_port is None:
-                raise RuntimeError("Text-CLIP RPC service port is unavailable.")
-            response_line = b""
-            with socket.create_connection(
-                (TEXT_RPC_HOST, self._text_service_port),
-                timeout=max(1.0, float(self._execution_timeout_seconds)),
-            ) as conn:
-                request = {"op": "embed", "text": text}
-                conn.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
-                conn.shutdown(socket.SHUT_WR)
-                while not response_line.endswith(b"\n"):
-                    chunk = conn.recv(16384)
-                    if not chunk:
-                        break
-                    response_line += chunk
-
-        if not response_line:
-            raise RuntimeError("Text-CLIP RPC service returned empty response.")
-        response = json.loads(response_line.decode("utf-8"))
+            response = self._send_text_service_request(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
         if "error" in response:
             raise RuntimeError(str(response["error"]))
         result = response.get("result")
@@ -342,10 +349,6 @@ class ClipTextMixin:
 
         self._clip_text_model = compiled_model
         self._clip_text_request = compiled_model.create_infer_request()
-        self._clip_text_input_names = (
-            self._clip_text_model.inputs[0].any_name,
-            self._clip_text_model.inputs[1].any_name,
-        )
         self._clip_text_host_input_cache.clear()
         self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
         LOG.info("CLIP Text model loaded on %s.", self._clip_inference_device)
@@ -353,8 +356,6 @@ class ClipTextMixin:
     def _infer_clip_text_batch(self, texts: List[str]) -> List[List[float]]:
         if not self._clip_text_model or not self._clip_text_request:
             raise RuntimeError("CLIP text model is not loaded.")
-        if self._clip_text_input_names is None:
-            raise RuntimeError("CLIP text input metadata is not initialized.")
 
         input_ids = _tokenize_for_clip(texts, context_length=CONTEXT_LENGTH)
         attention_mask = np.array(input_ids != _PAD_TOKEN_ID, dtype=np.int64)

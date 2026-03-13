@@ -181,10 +181,6 @@ async def lifespan(app: FastAPI):
     _startup_self_check_dri()
     logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
     models_instance = AIModels()
-    try:
-        await models_instance.ensure_clip_text_model_loaded_async()
-    except Exception as e:
-        logging.critical(f"应用启动时基础模型加载失败: {e}", exc_info=True)
 
     yield
     logging.info("应用关闭：正在释放所有模型。")

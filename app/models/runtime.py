@@ -5,9 +5,10 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterator, List, Optional
 
 import openvino as ov
 
@@ -15,11 +16,11 @@ from .clip_image import ClipImageMixin
 from .clip_text import ClipTextMixin
 from .common import (
     _AdmissionController,
-    _InferenceTask,
+    NonTextFamily,
+    _ClipImageTask,
     _InferenceCancelled,
     _InterProcessFileLock,
     _OpenVinoPreprocessRunner,
-    TaskType,
     _as_bool,
     _as_float,
     _as_int,
@@ -52,6 +53,21 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def __init__(self) -> None:
         self._pid = os.getpid()
+        self._stopping = False
+        self._initialize_paths()
+        self._initialize_openvino_runtime()
+        self._initialize_model_load_locks()
+        self._initialize_text_clip_state()
+        self._initialize_clip_image_state()
+        self._initialize_non_text_model_state()
+        self._initialize_execution_controls()
+        self._initialize_non_text_family_state()
+        self._start_clip_image_worker()
+        self._ensure_text_service_ready(preload=True)
+        self._start_background_services()
+        self._log_ready()
+
+    def _initialize_paths(self) -> None:
         self.model_base_path = Path(
             os.environ.get("MODEL_PATH", str(PROJECT_ROOT / "models"))
         )
@@ -78,28 +94,33 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
         self.rapidocr_model_dir_path = Path(self.rapidocr_model_dir).expanduser().resolve()
         self.rapidocr_font_path = os.environ.get("RAPIDOCR_FONT_PATH", "")
+        self._runtime_state_dir = (PROJECT_ROOT / "cache" / "runtime").resolve()
+        self._runtime_state_dir.mkdir(parents=True, exist_ok=True)
 
+    def _initialize_openvino_runtime(self) -> None:
         self.core = ov.Core()
         self._configure_openvino_cache()
-
         self._clip_remote_context_device_name: Optional[str] = None
         self._clip_remote_context = self._init_clip_remote_context()
 
+    def _initialize_model_load_locks(self) -> None:
         self._model_lock = threading.Lock()
         self._clip_vision_load_lock = threading.Lock()
         self._rapidocr_load_lock = threading.Lock()
         self._face_load_lock = threading.Lock()
+        self._family_load_locks = {
+            family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
+            for family in ("vision", "ocr", "face")
+        }
 
+    def _initialize_text_clip_state(self) -> None:
         self._clip_text_model: Optional[ov.CompiledModel] = None
         self._clip_text_request: Optional[ov.InferRequest] = None
-        self._clip_text_input_names: Optional[tuple[str, str]] = None
         self._clip_text_host_input_cache: Dict[
             int, tuple[ov.Tensor, Any, ov.Tensor, Any]
         ] = {}
         self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
         self._clip_text_lock = threading.Lock()
-        self._runtime_state_dir = (PROJECT_ROOT / "cache" / "runtime").resolve()
-        self._runtime_state_dir.mkdir(parents=True, exist_ok=True)
         self._text_service_meta_path = self._runtime_state_dir / "text-clip-service.json"
         self._text_service_lock = _InterProcessFileLock(
             self._runtime_state_dir / "text-clip-service.lock"
@@ -108,6 +129,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._text_service_server = None
         self._text_service_thread: Optional[threading.Thread] = None
         self._text_service_port: Optional[int] = None
+
+    def _initialize_clip_image_state(self) -> None:
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
@@ -122,6 +145,11 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             0.0,
             _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
         )
+        self._clip_image_condition = threading.Condition()
+        self._clip_image_queue: Deque[_ClipImageTask] = deque()
+        self._clip_image_worker: Optional[threading.Thread] = None
+
+    def _initialize_non_text_model_state(self) -> None:
         self._rapidocr_engine = None
         self._rapidocr_engines = None
         self._rapidocr_engine_pool = None
@@ -129,6 +157,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_engine = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+
+    def _initialize_execution_controls(self) -> None:
         configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
         self._queue_capacity = min(MAX_PENDING_IMAGE_REQUESTS, configured_queue_capacity)
         if configured_queue_capacity > self._queue_capacity:
@@ -138,37 +168,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 MAX_PENDING_IMAGE_REQUESTS,
                 self._queue_capacity,
             )
+
         self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
         self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
-        self._image_admission = _AdmissionController("image", self._queue_capacity)
-        self._shared_cpu_executor = ThreadPoolExecutor(
-            max_workers=max(2, min(8, os.cpu_count() or 4)),
-            thread_name_prefix="ai-cpu",
-        )
-        self._control_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="ai-ctl",
-        )
-        self._ocr_stage_worker_count = max(
-            1,
-            _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2),
-        )
-        self._ocr_det_executor = ThreadPoolExecutor(
-            max_workers=self._ocr_stage_worker_count,
-            thread_name_prefix="ocr-det",
-        )
-        self._face_worker_count = self._resolve_face_worker_count()
-        self._face_executor = ThreadPoolExecutor(
-            max_workers=self._face_worker_count,
-            thread_name_prefix="face-ov",
-        )
-        self._family_load_locks = {
-            family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
-            for family in ("vision", "ocr", "face")
-        }
-
-        self._condition = threading.Condition()
-        self._normal_queue: Deque[_InferenceTask] = deque()
         self._ocr_execution_timeout_seconds = max(
             1,
             _as_int(
@@ -181,41 +183,70 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             0.0,
             _as_float(os.environ.get("NON_TEXT_IDLE_RELEASE_SECONDS"), 60.0),
         )
-        self._request_activity_lock = threading.Lock()
-        self._last_request_monotonic = time.monotonic()
-        self._idle_release_stop = threading.Event()
-        self._idle_release_wakeup = threading.Event()
-        self._idle_release_thread: Optional[threading.Thread] = None
+
+        self._image_admission = _AdmissionController("image", self._queue_capacity)
+        self._ocr_worker_count = max(
+            1,
+            _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2),
+        )
+        self._face_worker_count = self._resolve_face_worker_count()
         self._ocr_admission = _AdmissionController(
             "ocr",
-            self._resolve_ocr_request_capacity(self._ocr_stage_worker_count),
+            self._resolve_ocr_request_capacity(self._ocr_worker_count),
         )
         self._face_admission = _AdmissionController(
             "face",
             self._resolve_face_request_capacity(self._face_worker_count),
         )
+
+        self._shared_cpu_executor = ThreadPoolExecutor(
+            max_workers=max(2, min(8, os.cpu_count() or 4)),
+            thread_name_prefix="ai-cpu",
+        )
+        self._control_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="ai-ctl",
+        )
+        self._ocr_executor = ThreadPoolExecutor(
+            max_workers=self._ocr_worker_count,
+            thread_name_prefix="ocr",
+        )
+        self._face_executor = ThreadPoolExecutor(
+            max_workers=self._face_worker_count,
+            thread_name_prefix="face-ov",
+        )
+
+        self._request_activity_lock = threading.Lock()
+        self._last_request_monotonic = time.monotonic()
+        self._idle_release_stop = threading.Event()
+        self._idle_release_wakeup = threading.Event()
+        self._idle_release_thread: Optional[threading.Thread] = None
+        self._background_prewarm_cancel = threading.Event()
+        self._background_prewarm_thread: Optional[threading.Thread] = None
+
+    def _initialize_non_text_family_state(self) -> None:
         self._non_text_condition = threading.Condition()
-        self._non_text_active_family: Optional[str] = None
-        self._non_text_inflight: Dict[str, int] = {
+        self._non_text_active_family: Optional[NonTextFamily] = None
+        self._non_text_inflight: Dict[NonTextFamily, int] = {
             "vision": 0,
             "ocr": 0,
             "face": 0,
         }
         self._non_text_transition_in_progress = False
-        self._stopping = False
-        self._background_prewarm_cancel = threading.Event()
 
-        self._worker = threading.Thread(
+    def _start_clip_image_worker(self) -> None:
+        self._clip_image_worker = threading.Thread(
             target=self._worker_loop,
             name="ai-model-worker",
             daemon=True,
         )
-        self._worker.start()
-        self._ensure_text_service_ready(preload=True)
-        self._background_prewarm_thread: Optional[threading.Thread] = None
+        self._clip_image_worker.start()
+
+    def _start_background_services(self) -> None:
         self._start_background_prewarm()
         self._start_idle_release_monitor()
 
+    def _log_ready(self) -> None:
         LOG.info(
             "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_admission=%s",
             self._clip_inference_device,
@@ -465,37 +496,37 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             f"{runtime_hint}"
         ) from last_exc
 
-    def _queue_size_locked(self) -> int:
-        return len(self._normal_queue)
+    def _clip_image_queue_size_locked(self) -> int:
+        return len(self._clip_image_queue)
 
-    def _submit_task(self, kind: TaskType, payload: Any) -> _InferenceTask:
+    def _submit_clip_image_task(self, payload: Any) -> _ClipImageTask:
         future: Future[Any] = Future()
-        task = _InferenceTask(kind=kind, payload=payload, future=future, created_at=time.time())
-        with self._condition:
+        task = _ClipImageTask(payload=payload, future=future, created_at=time.time())
+        with self._clip_image_condition:
             if self._stopping:
                 future.set_exception(RuntimeError("模型服务已关闭"))
                 return task
-            if self._queue_size_locked() >= self._queue_capacity:
+            if self._clip_image_queue_size_locked() >= self._queue_capacity:
                 future.set_exception(
                     RuntimeError(f"推理队列已满（上限 {self._queue_capacity}），请稍后重试")
                 )
                 return task
-            self._normal_queue.append(task)
-            self._condition.notify()
+            self._clip_image_queue.append(task)
+            self._clip_image_condition.notify()
         return task
 
-    def _cancel_task_if_queued(self, task: _InferenceTask, exc: Exception) -> bool:
-        with self._condition:
+    def _cancel_clip_image_task_if_queued(self, task: _ClipImageTask, exc: Exception) -> bool:
+        with self._clip_image_condition:
             if task.started_event.is_set():
                 return False
             try:
-                self._normal_queue.remove(task)
+                self._clip_image_queue.remove(task)
             except ValueError:
                 return False
         self._safe_set_exception(task.future, exc)
         return True
 
-    def _wait_task(self, task: _InferenceTask) -> Any:
+    def _wait_clip_image_task(self, task: _ClipImageTask) -> Any:
         if task.future.done():
             return task.future.result()
 
@@ -504,7 +535,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             if task.future.done():
                 return task.future.result()
             queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
-            if self._cancel_task_if_queued(task, queue_exc):
+            if self._cancel_clip_image_task_if_queued(task, queue_exc):
                 raise queue_exc
             if not bool(task.started_event.wait(timeout=0.05)) and not task.future.done():
                 raise queue_exc
@@ -514,7 +545,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         except FutureTimeoutError as exc:
             raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
 
-    async def _await_task(self, task: _InferenceTask) -> Any:
+    async def _await_clip_image_task(self, task: _ClipImageTask) -> Any:
         if task.future.done():
             return task.future.result()
 
@@ -525,7 +556,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             if task.future.done():
                 return task.future.result()
             queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
-            if self._cancel_task_if_queued(task, queue_exc):
+            if self._cancel_clip_image_task_if_queued(task, queue_exc):
                 raise queue_exc
             started = bool(await asyncio.to_thread(task.started_event.wait, 0.05))
             if not started and not task.future.done():
@@ -547,18 +578,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         if not future.done():
             future.set_exception(exc)
 
-    @staticmethod
-    def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None:
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exc is not None:
-            LOG.error("%s failed after caller detached: %s", task_name, exc, exc_info=exc)
-
     def _bind_non_text_lease_to_future(
         self,
-        family: str,
+        family: NonTextFamily,
         future: Future[Any] | asyncio.Future[Any],
     ) -> None:
         future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
@@ -568,6 +590,54 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         future: Future[Any] | asyncio.Future[Any],
     ) -> None:
         future.add_done_callback(lambda _future: self._release_image_request_slot())
+
+    @contextmanager
+    def _non_text_request_scope(
+        self,
+        *,
+        family: NonTextFamily,
+        label: str,
+        admission: _AdmissionController,
+        ensure_loaded: Callable[[], None],
+    ) -> Iterator[None]:
+        self._acquire_image_request_slot(label)
+        try:
+            self._acquire_non_text_family_lease(family)
+            try:
+                ensure_loaded()
+                self._acquire_admission(admission, label)
+                try:
+                    yield
+                finally:
+                    admission.release()
+            finally:
+                self._release_non_text_family_lease(family)
+        finally:
+            self._release_image_request_slot()
+
+    @asynccontextmanager
+    async def _non_text_request_scope_async(
+        self,
+        *,
+        family: NonTextFamily,
+        label: str,
+        admission: _AdmissionController,
+        ensure_loaded: Callable[[], None],
+    ) -> AsyncIterator[None]:
+        self._acquire_image_request_slot(label)
+        try:
+            await self._acquire_non_text_family_lease_async(family)
+            try:
+                await self._run_control(ensure_loaded)
+                await self._acquire_admission_async(admission, label)
+                try:
+                    yield
+                finally:
+                    admission.release()
+            finally:
+                self._release_non_text_family_lease(family)
+        finally:
+            self._release_image_request_slot()
 
     def _has_loaded_non_text_models_locked(self) -> bool:
         return bool(
@@ -599,11 +669,11 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _acquire_non_text_family_lease(
         self,
-        family: str,
+        family: NonTextFamily,
         abort_event: Optional[threading.Event] = None,
     ) -> bool | None:
         while True:
-            previous_family: Optional[str]
+            previous_family: Optional[NonTextFamily]
             with self._non_text_condition:
                 while self._non_text_transition_in_progress:
                     if abort_event is not None and abort_event.is_set():
@@ -662,9 +732,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 )
             return True
 
-    async def _acquire_non_text_family_lease_async(self, family: str) -> bool:
+    async def _acquire_non_text_family_lease_async(self, family: NonTextFamily) -> bool:
         while True:
-            previous_family: Optional[str]
+            previous_family: Optional[NonTextFamily]
             need_wait = False
             with self._non_text_condition:
                 if self._stopping:
@@ -714,7 +784,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 )
             return True
 
-    def _release_non_text_family_lease(self, family: str) -> None:
+    def _release_non_text_family_lease(self, family: NonTextFamily) -> None:
         with self._non_text_condition:
             inflight = self._non_text_inflight[family]
             if inflight <= 0:
@@ -795,7 +865,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 self._non_text_condition.notify_all()
 
     def _load_family_with_process_lock(
-        self, family: str, loader: Callable[[], None]
+        self, family: NonTextFamily, loader: Callable[[], None]
     ) -> None:
         lock = self._family_load_locks[family]
         started_at = time.monotonic()
@@ -820,7 +890,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     def _unload_text_model_locked(self) -> None:
         self._clip_text_request = None
         self._clip_text_model = None
-        self._clip_text_input_names = None
         self._clip_text_host_input_cache.clear()
         self._text_service_port = None
         gc.collect()
@@ -957,18 +1026,19 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             join_background_prewarm=True,
         )
 
-        with self._condition:
+        with self._clip_image_condition:
             if self._stopping:
                 return
             self._stopping = True
-            pending_tasks = list(self._normal_queue)
-            self._normal_queue.clear()
-            self._condition.notify_all()
+            pending_tasks = list(self._clip_image_queue)
+            self._clip_image_queue.clear()
+            self._clip_image_condition.notify_all()
 
         for task in pending_tasks:
             self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
 
-        self._worker.join()
+        if self._clip_image_worker is not None:
+            self._clip_image_worker.join()
         self._join_background_prewarm_thread(
             timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
         )
@@ -976,7 +1046,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         for executor in (
             self._control_executor,
             self._shared_cpu_executor,
-            self._ocr_det_executor,
+            self._ocr_executor,
             self._face_executor,
         ):
             executor.shutdown(wait=True, cancel_futures=True)

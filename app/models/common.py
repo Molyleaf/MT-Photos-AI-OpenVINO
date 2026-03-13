@@ -234,19 +234,6 @@ def _get_compiled_model_execution_devices(compiled_model: Any) -> List[str]:
     return []
 
 
-def _get_openvino_session_execution_devices(session_like: Any) -> List[str]:
-    compiled_model = getattr(session_like, "_mt_compiled_model", None)
-    if compiled_model is None:
-        session = getattr(session_like, "session", None)
-        get_compiled_model = getattr(session, "get_compiled_model", None)
-        if callable(get_compiled_model):
-            try:
-                compiled_model = get_compiled_model()
-            except Exception:
-                compiled_model = None
-    return _get_compiled_model_execution_devices(compiled_model)
-
-
 def _openvino_device_expr_requests_gpu(device_expr: str) -> bool:
     normalized = str(device_expr or "").strip().upper()
     if not normalized:
@@ -272,25 +259,6 @@ def _openvino_device_expr_requests_npu(device_expr: str) -> bool:
     if normalized.startswith("NPU"):
         return True
     return any(token.startswith("NPU") for token in _split_openvino_device_expr(normalized))
-
-
-def _default_rapidocr_stage_device(base_device: str, stage_name: str) -> str:
-    normalized = _normalize_non_text_openvino_device(base_device)
-    stage = str(stage_name).strip().lower()
-    if stage in {"cls", "rec"}:
-        if _openvino_device_expr_requests_npu(normalized) and not _openvino_device_expr_requests_cpu(
-            normalized
-        ):
-            return "CPU"
-        return "CPU"
-
-    if _openvino_device_expr_requests_cpu(normalized):
-        return "CPU"
-    if _openvino_device_expr_requests_npu(normalized):
-        return "NPU"
-    if _openvino_device_expr_requests_gpu(normalized) or normalized == "AUTO":
-        return "GPU"
-    return normalized
 
 
 def _ensure_intel_opencl_device(feature_name: str) -> Tuple[str, str]:
@@ -533,13 +501,11 @@ class _TextClipRpcServer(socketserver.TCPServer):
     allow_reuse_address = True
 
 
-TaskType = Literal["clip_img", "ocr", "face"]
 NonTextFamily = Literal["vision", "ocr", "face"]
 
 
 @dataclass(slots=True)
-class _InferenceTask:
-    kind: TaskType
+class _ClipImageTask:
     payload: Any
     future: Future
     created_at: float

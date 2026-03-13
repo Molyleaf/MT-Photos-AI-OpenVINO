@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from pathlib import Path
 from queue import LifoQueue
@@ -61,41 +61,36 @@ class RapidOCRMixin:
     _rapidocr_engines: Optional[Tuple[RapidOCR, ...]]
     _rapidocr_engine_pool: Optional[LifoQueue]
     _rapidocr_runtime_cfg: Optional[Dict[str, Any]]
-    _ocr_stage_worker_count: int
-    _ocr_det_executor: ThreadPoolExecutor
+    _ocr_worker_count: int
+    _ocr_executor: ThreadPoolExecutor
     _shared_cpu_executor: ThreadPoolExecutor
     _ocr_admission: _AdmissionController
     _ocr_execution_timeout_seconds: int
 
     if TYPE_CHECKING:
-        def _acquire_image_request_slot(self, label: str) -> None: ...
-        def _release_image_request_slot(self) -> None: ...
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
-        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
-        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
-        def _release_non_text_family_lease(self, family: str) -> None: ...
-        def _acquire_admission(self, admission: _AdmissionController, label: str) -> None: ...
-        async def _acquire_admission_async(
+        def _non_text_request_scope(
             self,
+            *,
+            family: str,
             admission: _AdmissionController,
             label: str,
-        ) -> None: ...
-        def _run_control(
+            ensure_loaded: Any,
+        ) -> Any: ...
+        async def _non_text_request_scope_async(
             self,
-            func: Any,
-            *args: Any,
-        ) -> asyncio.Future[Any]: ...
+            *,
+            family: str,
+            admission: _AdmissionController,
+            label: str,
+            ensure_loaded: Any,
+        ) -> Any: ...
         @staticmethod
         def _run_in_executor(
             executor: ThreadPoolExecutor,
             func: Any,
             *args: Any,
         ) -> asyncio.Future[Any]: ...
-        def _bind_non_text_lease_to_future(
-            self,
-            family: str,
-            future: Future[Any] | asyncio.Future[Any],
-        ) -> None: ...
         async def _await_with_timeout_and_cooperative_cancel(
             self,
             awaitable: asyncio.Future[Any] | asyncio.Task[Any],
@@ -104,8 +99,6 @@ class RapidOCRMixin:
             timeout_seconds: float,
             task_name: str,
         ) -> Any: ...
-        @staticmethod
-        def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
 
     def _require_rapidocr_config_path(self) -> Path:
         if not self.rapidocr_config_path.is_file():
@@ -126,50 +119,35 @@ class RapidOCRMixin:
             handler.addFilter(message_filter)
         setattr(RAPIDOCR_LOGGER, "_mt_expected_no_text_filter", message_filter)
 
-    def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
-        requested_device = _normalize_non_text_openvino_device(
-            os.environ.get("RAPIDOCR_DEVICE", "CPU")
-        )
-        if requested_device != "CPU":
-            LOG.warning(
-                "RapidOCR upstream OpenVINO backend is CPU-only; coercing RAPIDOCR_DEVICE=%s to CPU.",
-                requested_device,
-            )
-        config: Dict[str, Any] = {
+    @staticmethod
+    def _build_rapidocr_default_config(requested_device: str) -> Dict[str, Any]:
+        return {
             "requested_device_name": requested_device,
             "device_name": "CPU",
             "det_device_name": "CPU",
             "cls_device_name": "CPU",
             "rec_device_name": "CPU",
-            "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
-            "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "THROUGHPUT"),
-            "performance_num_requests": _as_int(
-                os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2
-            ),
-            "enable_cpu_pinning": _as_bool(os.environ.get("RAPIDOCR_ENABLE_CPU_PINNING"), True),
-            "num_streams": _as_int(os.environ.get("RAPIDOCR_NUM_STREAMS"), 2),
-            "enable_hyper_threading": _as_bool(
-                os.environ.get("RAPIDOCR_ENABLE_HYPER_THREADING"), True
-            ),
-            "scheduling_core_type": os.environ.get("RAPIDOCR_SCHEDULING_CORE_TYPE", "ANY_CORE"),
-            "use_cls": _as_bool(os.environ.get("RAPIDOCR_USE_CLS"), True),
-            "max_side_len": _as_int(os.environ.get("RAPIDOCR_MAX_SIDE_LEN"), 960),
-            "det_limit_side_len": _as_int(os.environ.get("RAPIDOCR_DET_LIMIT_SIDE_LEN"), 960),
-            "det_limit_type": _normalize_rapidocr_limit_type(
-                os.environ.get("RAPIDOCR_DET_LIMIT_TYPE", "max")
-            ),
-            "rec_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_REC_BATCH_NUM"), 8)),
-            "cls_batch_num": max(1, _as_int(os.environ.get("RAPIDOCR_CLS_BATCH_NUM"), 8)),
+            "inference_num_threads": -1,
+            "performance_hint": "THROUGHPUT",
+            "performance_num_requests": 2,
+            "enable_cpu_pinning": True,
+            "num_streams": 2,
+            "enable_hyper_threading": True,
+            "scheduling_core_type": "ANY_CORE",
+            "use_cls": True,
+            "max_side_len": 960,
+            "det_limit_side_len": 960,
+            "det_limit_type": "max",
+            "rec_batch_num": 8,
+            "cls_batch_num": 8,
         }
 
-        config_path = self._require_rapidocr_config_path()
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    @staticmethod
+    def _apply_rapidocr_yaml_overrides(config: Dict[str, Any], loaded: Dict[str, Any]) -> None:
         ov_cfg = loaded.get("EngineConfig", {}).get("openvino", {})
         for key in list(config.keys()):
             if key in ov_cfg:
                 config[key] = ov_cfg[key]
-        config["requested_device_name"] = requested_device
-        config["device_name"] = "CPU"
 
         global_cfg = loaded.get("Global", {})
         if "use_cls" in global_cfg:
@@ -202,6 +180,8 @@ class RapidOCRMixin:
                 1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
             )
 
+    @staticmethod
+    def _apply_rapidocr_env_overrides(config: Dict[str, Any]) -> None:
         env_override_map: Dict[str, Tuple[str, Any]] = {
             "RAPIDOCR_INFERENCE_NUM_THREADS": (
                 "inference_num_threads",
@@ -262,6 +242,8 @@ class RapidOCRMixin:
                 continue
             config[cfg_name] = parser(raw_env, config[cfg_name])
 
+    @staticmethod
+    def _warn_rapidocr_stage_device_overrides() -> None:
         for env_name in ("RAPIDOCR_DET_DEVICE", "RAPIDOCR_CLS_DEVICE", "RAPIDOCR_REC_DEVICE"):
             raw_env = os.environ.get(env_name)
             if raw_env is None or str(raw_env).strip() == "":
@@ -274,6 +256,12 @@ class RapidOCRMixin:
                     normalized,
                 )
 
+    def _finalize_rapidocr_runtime_config(
+        self,
+        config: Dict[str, Any],
+        requested_device: str,
+    ) -> Dict[str, Any]:
+        config["requested_device_name"] = requested_device
         config["device_name"] = "CPU"
         config["det_device_name"] = "CPU"
         config["cls_device_name"] = "CPU"
@@ -285,6 +273,24 @@ class RapidOCRMixin:
         config["cls_runtime_device_name"] = "CPU"
         config["rec_runtime_device_name"] = "CPU"
         return config
+
+    def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
+        requested_device = _normalize_non_text_openvino_device(
+            os.environ.get("RAPIDOCR_DEVICE", "CPU")
+        )
+        if requested_device != "CPU":
+            LOG.warning(
+                "RapidOCR upstream OpenVINO backend is CPU-only; coercing RAPIDOCR_DEVICE=%s to CPU.",
+                requested_device,
+            )
+        config = self._build_rapidocr_default_config(requested_device)
+
+        config_path = self._require_rapidocr_config_path()
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self._apply_rapidocr_yaml_overrides(config, loaded)
+        self._apply_rapidocr_env_overrides(config)
+        self._warn_rapidocr_stage_device_overrides()
+        return self._finalize_rapidocr_runtime_config(config, requested_device)
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
         required_files = {
@@ -446,7 +452,7 @@ class RapidOCRMixin:
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
         rapidocr_params = self._build_rapidocr_runtime_params(config)
-        engine_pool_size = max(1, self._ocr_stage_worker_count)
+        engine_pool_size = max(1, self._ocr_worker_count)
         engines = tuple(
             self._instantiate_rapidocr(dict(rapidocr_params)) for _ in range(engine_pool_size)
         )
@@ -614,50 +620,36 @@ class RapidOCRMixin:
         if self._rapidocr_engine_pool is None:
             raise RuntimeError("RapidOCR model is not loaded.")
         return await self._run_in_executor(
-            self._ocr_det_executor,
+            self._ocr_executor,
             self._run_rapidocr_with_pooled_engine,
             image,
             cancel_event,
         )
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        self._acquire_image_request_slot("OCR")
-        try:
-            self._acquire_non_text_family_lease("ocr")
-            try:
-                self._ensure_rapidocr_loaded()
-                self._acquire_admission(self._ocr_admission, "OCR")
-                try:
-                    return self._infer_ocr(image)
-                finally:
-                    self._ocr_admission.release()
-            finally:
-                self._release_non_text_family_lease("ocr")
-        finally:
-            self._release_image_request_slot()
+        with self._non_text_request_scope(
+            family="ocr",
+            label="OCR",
+            admission=self._ocr_admission,
+            ensure_loaded=self._ensure_rapidocr_loaded,
+        ):
+            return self._infer_ocr(image)
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        self._acquire_image_request_slot("OCR")
         cancel_event = threading.Event()
-        try:
-            await self._acquire_non_text_family_lease_async("ocr")
-            try:
-                await self._run_control(self._ensure_rapidocr_loaded)
-                await self._acquire_admission_async(self._ocr_admission, "OCR")
-                try:
-                    task: asyncio.Task[OCRResult] = asyncio.create_task(
-                        self._infer_ocr_async(image, cancel_event=cancel_event)
-                    )
-                    return await self._await_with_timeout_and_cooperative_cancel(
-                        task,
-                        cancel_event=cancel_event,
-                        timeout_seconds=self._ocr_execution_timeout_seconds,
-                        task_name="OCR task",
-                    )
-                finally:
-                    self._ocr_admission.release()
-            finally:
-                self._release_non_text_family_lease("ocr")
-        finally:
-            self._release_image_request_slot()
+        async with self._non_text_request_scope_async(
+            family="ocr",
+            label="OCR",
+            admission=self._ocr_admission,
+            ensure_loaded=self._ensure_rapidocr_loaded,
+        ):
+            task: asyncio.Task[OCRResult] = asyncio.create_task(
+                self._infer_ocr_async(image, cancel_event=cancel_event)
+            )
+            return await self._await_with_timeout_and_cooperative_cancel(
+                task,
+                cancel_event=cancel_event,
+                timeout_seconds=self._ocr_execution_timeout_seconds,
+                task_name="OCR task",
+            )
 

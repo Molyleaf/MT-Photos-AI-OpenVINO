@@ -6,6 +6,7 @@ import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -54,6 +55,22 @@ _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
     dtype=np.float32,
 )
 _INSIGHTFACE_BATCH_DIM_PARAM = "batch"
+
+
+@dataclass(frozen=True)
+class _InsightFaceInitAttempt:
+    name: str
+    runtime_root: Path
+    kwargs: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _LoadedInsightFaceRuntime:
+    face_app: FaceAnalysis
+    runtime_root: Path
+    provider_runtime: Dict[str, Dict[str, Any]]
+    ppp_execution_devices: Dict[str, List[str]]
+    rec_session_shapes: Dict[str, List[str]]
 
 
 def _estimate_similarity_transform_matrix(src: Any, dst: Any) -> np.ndarray:
@@ -155,8 +172,6 @@ class InsightFaceMixin:
     _execution_timeout_seconds: int
 
     if TYPE_CHECKING:
-        def _acquire_image_request_slot(self, label: str) -> None: ...
-        def _release_image_request_slot(self) -> None: ...
         def _build_openvino_preprocess_runner(
             self,
             runner_name: str,
@@ -167,16 +182,22 @@ class InsightFaceMixin:
             std_values: List[float],
         ) -> _OpenVinoPreprocessRunner: ...
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
-        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
-        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
-        def _release_non_text_family_lease(self, family: str) -> None: ...
-        def _acquire_admission(self, admission: _AdmissionController, label: str) -> None: ...
-        async def _acquire_admission_async(
+        def _non_text_request_scope(
             self,
+            *,
+            family: str,
             admission: _AdmissionController,
             label: str,
-        ) -> None: ...
-        def _run_control(self, func: Any, *args: Any) -> asyncio.Future[Any]: ...
+            ensure_loaded: Any,
+        ) -> Any: ...
+        async def _non_text_request_scope_async(
+            self,
+            *,
+            family: str,
+            admission: _AdmissionController,
+            label: str,
+            ensure_loaded: Any,
+        ) -> Any: ...
         @staticmethod
         def _run_in_executor(
             executor: ThreadPoolExecutor,
@@ -708,13 +729,13 @@ class InsightFaceMixin:
             for keyword in ("providers", "provider_options", "allowed_modules")
         )
 
-    def _instantiate_insightface_face_analysis(
-        self,
+    @staticmethod
+    def _build_insightface_init_attempts(
+        source_root: Path,
+        runtime_root: Path,
         provider_names: List[str],
         provider_options: Dict[str, str],
-    ) -> Tuple[FaceAnalysis, Path]:
-        source_root = self._resolve_insightface_root()
-        runtime_root = self._prepare_insightface_runtime_root(source_root)
+    ) -> List[_InsightFaceInitAttempt]:
         init_signature = inspect.signature(FaceAnalysis.__init__)
         init_parameters = init_signature.parameters
         supports_var_kwargs = any(
@@ -726,14 +747,14 @@ class InsightFaceMixin:
         supports_provider_options = "provider_options" in init_parameters or supports_var_kwargs
 
         def _build_kwargs(
-            runtime_root: Path,
+            root: Path,
             *,
             include_provider_kwargs: bool,
             include_allowed_modules: bool,
         ) -> Dict[str, Any]:
             kwargs: Dict[str, Any] = {
                 "name": MODEL_NAME,
-                "root": str(runtime_root),
+                "root": str(root),
             }
             if include_allowed_modules:
                 kwargs["allowed_modules"] = ["detection", "recognition"]
@@ -743,8 +764,8 @@ class InsightFaceMixin:
                     kwargs["provider_options"] = [dict(provider_options)]
             return kwargs
 
-        attempts: List[Tuple[str, Path, Dict[str, Any]]] = [
-            (
+        return [
+            _InsightFaceInitAttempt(
                 "runtime-with-provider-kwargs",
                 runtime_root,
                 _build_kwargs(
@@ -753,7 +774,7 @@ class InsightFaceMixin:
                     include_allowed_modules=supports_allowed_modules,
                 ),
             ),
-            (
+            _InsightFaceInitAttempt(
                 "runtime-without-provider-kwargs",
                 runtime_root,
                 _build_kwargs(
@@ -762,7 +783,7 @@ class InsightFaceMixin:
                     include_allowed_modules=supports_allowed_modules,
                 ),
             ),
-            (
+            _InsightFaceInitAttempt(
                 "source-with-provider-kwargs",
                 source_root,
                 _build_kwargs(
@@ -771,7 +792,7 @@ class InsightFaceMixin:
                     include_allowed_modules=supports_allowed_modules,
                 ),
             ),
-            (
+            _InsightFaceInitAttempt(
                 "source-without-provider-kwargs",
                 source_root,
                 _build_kwargs(
@@ -780,64 +801,80 @@ class InsightFaceMixin:
                     include_allowed_modules=supports_allowed_modules,
                 ),
             ),
+            _InsightFaceInitAttempt(
+                "legacy-with-provider-kwargs",
+                runtime_root,
+                _build_kwargs(
+                    runtime_root,
+                    include_provider_kwargs=supports_provider_kwargs,
+                    include_allowed_modules=supports_allowed_modules,
+                ),
+            ),
+            _InsightFaceInitAttempt(
+                "legacy-minimal-kwargs",
+                runtime_root,
+                _build_kwargs(
+                    runtime_root,
+                    include_provider_kwargs=False,
+                    include_allowed_modules=False,
+                ),
+            ),
         ]
-        attempts.extend(
-            (
-                (
-                    "legacy-with-provider-kwargs",
-                    runtime_root,
-                    _build_kwargs(
-                        runtime_root,
-                        include_provider_kwargs=supports_provider_kwargs,
-                        include_allowed_modules=supports_allowed_modules,
-                    ),
-                ),
-                (
-                    "legacy-minimal-kwargs",
-                    runtime_root,
-                    _build_kwargs(
-                        runtime_root,
-                        include_provider_kwargs=False,
-                        include_allowed_modules=False,
-                    ),
-                ),
-            )
+
+    def _instantiate_insightface_face_analysis(
+        self,
+        provider_names: List[str],
+        provider_options: Dict[str, str],
+    ) -> Tuple[FaceAnalysis, Path]:
+        source_root = self._resolve_insightface_root()
+        runtime_root = self._prepare_insightface_runtime_root(source_root)
+        attempts = self._build_insightface_init_attempts(
+            source_root,
+            runtime_root,
+            provider_names,
+            provider_options,
         )
 
         seen_attempts: set[Tuple[str, str]] = set()
         attempt_errors: List[str] = []
         last_exc: Optional[Exception] = None
-        for attempt_name, runtime_root, kwargs in attempts:
-            attempt_key = (str(runtime_root), json.dumps(kwargs, sort_keys=True, ensure_ascii=True))
+        for attempt in attempts:
+            attempt_key = (
+                str(attempt.runtime_root),
+                json.dumps(attempt.kwargs, sort_keys=True, ensure_ascii=True),
+            )
             if attempt_key in seen_attempts:
                 continue
             seen_attempts.add(attempt_key)
             try:
-                face_app = FaceAnalysis(**kwargs)
+                face_app = FaceAnalysis(**attempt.kwargs)
                 self._normalize_insightface_recognition_state(
                     getattr(face_app, "models", {}).get("recognition")
                 )
-                if attempt_name not in {"runtime-with-provider-kwargs", "source-with-provider-kwargs"}:
+                if attempt.name not in {
+                    "runtime-with-provider-kwargs",
+                    "source-with-provider-kwargs",
+                }:
                     LOG.warning(
                         "InsightFace initialized via compatibility path %s (runtime_root=%s)",
-                        attempt_name,
-                        runtime_root,
+                        attempt.name,
+                        attempt.runtime_root,
                     )
-                return face_app, runtime_root
+                return face_app, attempt.runtime_root
             except Exception as exc:
                 last_exc = exc
-                attempt_errors.append(f"{attempt_name}: {exc}")
+                attempt_errors.append(f"{attempt.name}: {exc}")
                 if self._is_insightface_init_kwargs_error(exc):
                     LOG.warning(
                         "InsightFace init retry after unsupported kwargs on %s: %s",
-                        attempt_name,
+                        attempt.name,
                         exc,
                     )
                 else:
                     LOG.warning(
                         "InsightFace init attempt %s failed (runtime_root=%s): %s",
-                        attempt_name,
-                        runtime_root,
+                        attempt.name,
+                        attempt.runtime_root,
                         exc,
                     )
 
@@ -846,6 +883,48 @@ class InsightFaceMixin:
             "InsightFace initialization failed after compatibility retries: "
             f"{summary}"
         ) from last_exc
+
+    def _initialize_loaded_insightface_runtime(
+        self,
+        provider_names: List[str],
+        provider_options: Dict[str, str],
+        provider_device: str,
+    ) -> _LoadedInsightFaceRuntime:
+        face_app, runtime_root = self._instantiate_insightface_face_analysis(
+            provider_names,
+            provider_options,
+        )
+        self._enforce_insightface_openvino_provider(face_app, provider_options)
+        face_app.prepare(ctx_id=0, det_thresh=0.5, det_size=(640, 640))
+        self._enforce_insightface_openvino_provider(face_app, provider_options)
+        self._normalize_insightface_detector_state(
+            getattr(face_app, "det_model"),
+            det_size=(640, 640),
+            det_thresh=float(getattr(face_app, "det_thresh", 0.5) or 0.5),
+        )
+        rec_session_shapes = self._normalize_insightface_recognition_state(
+            getattr(face_app, "models", {}).get("recognition")
+        )
+        provider_runtime = self._validate_insightface_openvino_provider(
+            face_app,
+            expected_device_type=provider_device,
+        )
+        self._attach_insightface_preprocess(face_app, device_name=provider_device)
+        ppp_execution_devices = {
+            "det": _get_compiled_model_execution_devices(
+                getattr(self._face_det_ppp, "compiled_model", None)
+            ),
+            "rec": _get_compiled_model_execution_devices(
+                getattr(self._face_rec_ppp, "compiled_model", None)
+            ),
+        }
+        return _LoadedInsightFaceRuntime(
+            face_app=face_app,
+            runtime_root=runtime_root,
+            provider_runtime=provider_runtime,
+            ppp_execution_devices=ppp_execution_devices,
+            rec_session_shapes=rec_session_shapes,
+        )
 
     @staticmethod
     def _validate_insightface_openvino_provider(
@@ -920,47 +999,24 @@ class InsightFaceMixin:
         provider_options = self._build_insightface_provider_options(provider_device)
         provider_names = ["OpenVINOExecutionProvider"]
         try:
-            face_app, root_for_runtime = self._instantiate_insightface_face_analysis(
+            runtime = self._initialize_loaded_insightface_runtime(
                 provider_names,
                 provider_options,
+                provider_device,
             )
-            self._enforce_insightface_openvino_provider(face_app, provider_options)
-            face_app.prepare(ctx_id=0, det_thresh=0.5, det_size=(640, 640))
-            self._enforce_insightface_openvino_provider(face_app, provider_options)
-            self._normalize_insightface_detector_state(
-                getattr(face_app, "det_model"),
-                det_size=(640, 640),
-                det_thresh=float(getattr(face_app, "det_thresh", 0.5) or 0.5),
-            )
-            rec_session_shapes = self._normalize_insightface_recognition_state(
-                getattr(face_app, "models", {}).get("recognition")
-            )
-            provider_runtime = self._validate_insightface_openvino_provider(
-                face_app,
-                expected_device_type=provider_device,
-            )
-            self._attach_insightface_preprocess(face_app, device_name=provider_device)
-            ppp_execution_devices = {
-                "det": _get_compiled_model_execution_devices(
-                    getattr(self._face_det_ppp, "compiled_model", None)
-                ),
-                "rec": _get_compiled_model_execution_devices(
-                    getattr(self._face_rec_ppp, "compiled_model", None)
-                ),
-            }
-            self._face_engine = face_app
+            self._face_engine = runtime.face_app
             LOG.info(
                 "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s rec_session_shapes=%s face_workers=%s face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 provider_options,
-                provider_runtime,
-                ppp_execution_devices,
-                rec_session_shapes,
+                runtime.provider_runtime,
+                runtime.ppp_execution_devices,
+                runtime.rec_session_shapes,
                 getattr(self._face_executor, "_max_workers", "unknown"),
                 self._face_admission.capacity,
-                root_for_runtime,
+                runtime.runtime_root,
             )
         except Exception as exc:
             self._face_engine = None
@@ -1045,45 +1101,31 @@ class InsightFaceMixin:
         return results
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        self._acquire_image_request_slot("InsightFace")
-        try:
-            self._acquire_non_text_family_lease("face")
-            try:
-                self._ensure_face_loaded()
-                self._acquire_admission(self._face_admission, "InsightFace")
-                try:
-                    return self._infer_face(image)
-                finally:
-                    self._face_admission.release()
-            finally:
-                self._release_non_text_family_lease("face")
-        finally:
-            self._release_image_request_slot()
+        with self._non_text_request_scope(
+            family="face",
+            label="InsightFace",
+            admission=self._face_admission,
+            ensure_loaded=self._ensure_face_loaded,
+        ):
+            return self._infer_face(image)
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        self._acquire_image_request_slot("InsightFace")
         cancel_event = threading.Event()
-        try:
-            await self._acquire_non_text_family_lease_async("face")
-            try:
-                await self._run_control(self._ensure_face_loaded)
-                await self._acquire_admission_async(self._face_admission, "InsightFace")
-                try:
-                    future = self._run_in_executor(
-                        self._face_executor,
-                        self._infer_face,
-                        image,
-                        cancel_event,
-                    )
-                    return await self._await_with_timeout_and_cooperative_cancel(
-                        future,
-                        cancel_event=cancel_event,
-                        timeout_seconds=self._execution_timeout_seconds,
-                        task_name="Face task",
-                    )
-                finally:
-                    self._face_admission.release()
-            finally:
-                self._release_non_text_family_lease("face")
-        finally:
-            self._release_image_request_slot()
+        async with self._non_text_request_scope_async(
+            family="face",
+            label="InsightFace",
+            admission=self._face_admission,
+            ensure_loaded=self._ensure_face_loaded,
+        ):
+            future = self._run_in_executor(
+                self._face_executor,
+                self._infer_face,
+                image,
+                cancel_event,
+            )
+            return await self._await_with_timeout_and_cooperative_cancel(
+                future,
+                cancel_event=cancel_event,
+                timeout_seconds=self._execution_timeout_seconds,
+                task_name="Face task",
+            )

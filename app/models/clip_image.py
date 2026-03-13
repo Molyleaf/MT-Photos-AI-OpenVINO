@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import openvino as ov
 
-from .common import TaskType, _InferenceTask, _as_contiguous_bgr_uint8
+from .common import _ClipImageTask, _as_contiguous_bgr_uint8
 from .constants import (
     CLIP_EMBEDDING_DIMS,
     CLIP_IMAGE_RESOLUTION,
@@ -23,9 +23,9 @@ class ClipImageMixin:
     qa_clip_path: Path
     _clip_inference_device: str
     _clip_remote_context: Any
-    _condition: Any
+    _clip_image_condition: Any
     _stopping: bool
-    _normal_queue: Any
+    _clip_image_queue: Any
     _shared_cpu_executor: ThreadPoolExecutor
     _clip_image_batch_size: int
     _clip_image_batch_wait_seconds: float
@@ -41,9 +41,9 @@ class ClipImageMixin:
         def _build_openvino_preprocess_runner(self, **kwargs: Any) -> Any: ...
         def _safe_set_result(self, future: Future[Any], value: Any) -> None: ...
         def _safe_set_exception(self, future: Future[Any], exc: Exception) -> None: ...
-        def _submit_task(self, kind: TaskType, payload: Any) -> _InferenceTask: ...
-        def _wait_task(self, task: _InferenceTask) -> Any: ...
-        async def _await_task(self, task: _InferenceTask) -> Any: ...
+        def _submit_clip_image_task(self, payload: Any) -> _ClipImageTask: ...
+        def _wait_clip_image_task(self, task: _ClipImageTask) -> Any: ...
+        async def _await_clip_image_task(self, task: _ClipImageTask) -> Any: ...
         def _bind_non_text_lease_to_future(
             self,
             family: str,
@@ -70,26 +70,28 @@ class ClipImageMixin:
 
     def _worker_loop(self) -> None:
         while True:
-            normal_task: Optional[_InferenceTask] = None
+            clip_image_task: Optional[_ClipImageTask] = None
 
-            with self._condition:
+            with self._clip_image_condition:
                 while True:
-                    if self._stopping or self._normal_queue:
+                    if self._stopping or self._clip_image_queue:
                         break
-                    self._condition.wait()
+                    self._clip_image_condition.wait()
 
                 if self._stopping:
                     break
 
-                if self._normal_queue:
-                    normal_task = self._normal_queue.popleft()
-                    normal_task.started_at = time.monotonic()
-                    normal_task.started_event.set()
+                if self._clip_image_queue:
+                    clip_image_task = self._clip_image_queue.popleft()
+                    clip_image_task.started_at = time.monotonic()
+                    clip_image_task.started_event.set()
 
-            if normal_task is not None:
-                self._handle_clip_image_tasks(self._collect_clip_image_batch(normal_task))
+            if clip_image_task is not None:
+                self._handle_clip_image_tasks(
+                    self._collect_clip_image_batch(clip_image_task)
+                )
 
-    def _collect_clip_image_batch(self, first_task: _InferenceTask) -> List[_InferenceTask]:
+    def _collect_clip_image_batch(self, first_task: _ClipImageTask) -> List[_ClipImageTask]:
         batch = [first_task]
         if self._clip_image_batch_size <= 1:
             return batch
@@ -97,24 +99,21 @@ class ClipImageMixin:
         deadline = time.monotonic() + self._clip_image_batch_wait_seconds
 
         while len(batch) < self._clip_image_batch_size:
-            with self._condition:
-                if not self._normal_queue:
+            with self._clip_image_condition:
+                if not self._clip_image_queue:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0.0:
                         return batch
-                    self._condition.wait(timeout=remaining)
+                    self._clip_image_condition.wait(timeout=remaining)
                     continue
 
-                next_task = self._normal_queue[0]
-                if next_task.kind != "clip_img":
-                    return batch
-                popped = self._normal_queue.popleft()
+                popped = self._clip_image_queue.popleft()
                 popped.started_at = time.monotonic()
                 popped.started_event.set()
                 batch.append(popped)
         return batch
 
-    def _handle_clip_image_tasks(self, tasks: List[_InferenceTask]) -> None:
+    def _handle_clip_image_tasks(self, tasks: List[_ClipImageTask]) -> None:
         if not tasks:
             return
         try:
@@ -275,12 +274,12 @@ class ClipImageMixin:
             try:
                 self._ensure_clip_vision_loaded()
                 payload = self._preprocess_clip_image_tensor(image)
-                task = self._submit_task(kind="clip_img", payload=payload)
+                task = self._submit_clip_image_task(payload=payload)
                 self._bind_non_text_lease_to_future("vision", task.future)
                 self._bind_image_request_slot_to_future(task.future)
                 lease_bound = True
                 image_slot_bound = True
-                return self._wait_task(task)
+                return self._wait_clip_image_task(task)
             finally:
                 if not lease_bound:
                     self._release_non_text_family_lease("vision")
@@ -301,12 +300,12 @@ class ClipImageMixin:
                     self._preprocess_clip_image_tensor,
                     image,
                 )
-                task = self._submit_task(kind="clip_img", payload=payload)
+                task = self._submit_clip_image_task(payload=payload)
                 self._bind_non_text_lease_to_future("vision", task.future)
                 self._bind_image_request_slot_to_future(task.future)
                 lease_bound = True
                 image_slot_bound = True
-                return await self._await_task(task)
+                return await self._await_clip_image_task(task)
             finally:
                 if not lease_bound:
                     self._release_non_text_family_lease("vision")
