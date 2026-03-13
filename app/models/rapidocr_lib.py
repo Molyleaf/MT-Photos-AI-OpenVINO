@@ -213,6 +213,7 @@ class RapidOCRMixin:
     rapidocr_model_dir_path: Path
     rapidocr_font_path: str
     _rapidocr_load_lock: Any
+    _rapidocr_infer_lock: Any
     _rapidocr_engine: Optional[RapidOCR]
     _rapidocr_runtime_cfg: Optional[Dict[str, Any]]
     _ocr_opencl_device_name: Optional[str]
@@ -274,14 +275,20 @@ class RapidOCRMixin:
         return self.rapidocr_config_path
 
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
-        base_device = _normalize_non_text_openvino_device(
-            os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE)
+        requested_device = _normalize_non_text_openvino_device(
+            os.environ.get("RAPIDOCR_DEVICE", "CPU")
         )
+        if requested_device != "CPU":
+            LOG.warning(
+                "RapidOCR upstream OpenVINO backend is CPU-only; coercing RAPIDOCR_DEVICE=%s to CPU.",
+                requested_device,
+            )
         config: Dict[str, Any] = {
-            "device_name": base_device,
-            "det_device_name": None,
-            "cls_device_name": None,
-            "rec_device_name": None,
+            "requested_device_name": requested_device,
+            "device_name": "CPU",
+            "det_device_name": "CPU",
+            "cls_device_name": "CPU",
+            "rec_device_name": "CPU",
             "inference_num_threads": _as_int(os.environ.get("RAPIDOCR_INFERENCE_NUM_THREADS"), -1),
             "performance_hint": os.environ.get("RAPIDOCR_PERFORMANCE_HINT", "THROUGHPUT"),
             "performance_num_requests": _as_int(
@@ -309,6 +316,8 @@ class RapidOCRMixin:
         for key in list(config.keys()):
             if key in ov_cfg:
                 config[key] = ov_cfg[key]
+        config["requested_device_name"] = requested_device
+        config["device_name"] = "CPU"
 
         global_cfg = loaded.get("Global", {})
         if "use_cls" in global_cfg:
@@ -319,8 +328,6 @@ class RapidOCRMixin:
             )
 
         det_cfg = loaded.get("Det", {})
-        if "device_name" in det_cfg:
-            config["det_device_name"] = det_cfg.get("device_name")
         if "limit_side_len" in det_cfg:
             config["det_limit_side_len"] = _as_int(
                 det_cfg.get("limit_side_len"), config["det_limit_side_len"]
@@ -332,46 +339,18 @@ class RapidOCRMixin:
             )
 
         rec_cfg = loaded.get("Rec", {})
-        if "device_name" in rec_cfg:
-            config["rec_device_name"] = rec_cfg.get("device_name")
         if "rec_batch_num" in rec_cfg:
             config["rec_batch_num"] = max(
                 1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
             )
 
         cls_cfg = loaded.get("Cls", {})
-        if "device_name" in cls_cfg:
-            config["cls_device_name"] = cls_cfg.get("device_name")
         if "cls_batch_num" in cls_cfg:
             config["cls_batch_num"] = max(
                 1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
             )
 
         env_override_map: Dict[str, Tuple[str, Any]] = {
-            "RAPIDOCR_DEVICE": (
-                "device_name",
-                lambda value, default: _normalize_non_text_openvino_device(
-                    str(value).strip() or default
-                ),
-            ),
-            "RAPIDOCR_DET_DEVICE": (
-                "det_device_name",
-                lambda value, default: _normalize_non_text_openvino_device(
-                    str(value).strip() or default
-                ),
-            ),
-            "RAPIDOCR_CLS_DEVICE": (
-                "cls_device_name",
-                lambda value, default: _normalize_non_text_openvino_device(
-                    str(value).strip() or default
-                ),
-            ),
-            "RAPIDOCR_REC_DEVICE": (
-                "rec_device_name",
-                lambda value, default: _normalize_non_text_openvino_device(
-                    str(value).strip() or default
-                ),
-            ),
             "RAPIDOCR_INFERENCE_NUM_THREADS": (
                 "inference_num_threads",
                 lambda value, default: _as_int(value, default),
@@ -431,43 +410,28 @@ class RapidOCRMixin:
                 continue
             config[cfg_name] = parser(raw_env, config[cfg_name])
 
-        config["device_name"] = _normalize_non_text_openvino_device(
-            config.get("device_name", DEFAULT_NON_TEXT_OV_DEVICE)
-        )
-        for stage_name in ("det", "cls", "rec"):
-            stage_key = f"{stage_name}_device_name"
-            stage_value = config.get(stage_key)
-            if stage_value in (None, ""):
-                stage_value = _default_rapidocr_stage_device(config["device_name"], stage_name)
-            config[stage_key] = _normalize_non_text_openvino_device(stage_value)
+        for env_name in ("RAPIDOCR_DET_DEVICE", "RAPIDOCR_CLS_DEVICE", "RAPIDOCR_REC_DEVICE"):
+            raw_env = os.environ.get(env_name)
+            if raw_env is None or str(raw_env).strip() == "":
+                continue
+            normalized = _normalize_non_text_openvino_device(raw_env)
+            if normalized != "CPU":
+                LOG.warning(
+                    "%s=%s is ignored; RapidOCR upstream OpenVINO backend is CPU-only.",
+                    env_name,
+                    normalized,
+                )
+
+        config["device_name"] = "CPU"
+        config["det_device_name"] = "CPU"
+        config["cls_device_name"] = "CPU"
+        config["rec_device_name"] = "CPU"
         if self.ov_cache_dir is not None:
             config["cache_dir"] = str(self.ov_cache_dir)
-        config["runtime_device_name"] = _resolve_non_text_openvino_runtime_device(
-            str(config["device_name"]),
-            self.core.available_devices,
-            consumer="openvino",
-        )
-        for stage_name in ("det", "cls", "rec"):
-            stage_runtime_key = f"{stage_name}_runtime_device_name"
-            stage_device_key = f"{stage_name}_device_name"
-            config[stage_runtime_key] = _resolve_non_text_openvino_runtime_device(
-                str(config[stage_device_key]),
-                self.core.available_devices,
-                consumer="openvino",
-            )
-        config["preprocess_backends"] = {
-            "det": (
-                "opencl"
-                if _openvino_device_expr_requests_gpu(str(config["det_runtime_device_name"]))
-                else "cpu"
-            ),
-            "cls": "cpu",
-            "rec": (
-                "opencl"
-                if _openvino_device_expr_requests_gpu(str(config["rec_runtime_device_name"]))
-                else "cpu"
-            ),
-        }
+        config["runtime_device_name"] = "CPU"
+        config["det_runtime_device_name"] = "CPU"
+        config["cls_runtime_device_name"] = "CPU"
+        config["rec_runtime_device_name"] = "CPU"
         return config
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
@@ -620,7 +584,7 @@ class RapidOCRMixin:
         engine.text_rec.session = stage_sessions["rec"]
 
     def _instantiate_rapidocr(self, params: Dict[str, Any]) -> RapidOCR:
-        rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "AUTO")).upper()
+        rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "CPU")).upper()
         config_path = self._require_rapidocr_config_path()
         try:
             engine = RapidOCR(config_path=str(config_path), params=params)
@@ -629,7 +593,6 @@ class RapidOCRMixin:
                 f"RapidOCR 初始化失败，无法以 OpenVINO({rapidocr_device}) 配置启动。"
             ) from exc
         self._validate_rapidocr_backend(engine)
-        self._configure_rapidocr_openvino_sessions(engine)
         return engine
 
     @staticmethod
@@ -898,58 +861,19 @@ class RapidOCRMixin:
 
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
-        self._reconfigure_rapidocr_stage_executors(config)
-        self._ensure_ocr_opencl_preprocess(config)
         rapidocr_params = self._build_rapidocr_runtime_params(config)
         self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
-        setattr(self._rapidocr_engine.text_det, "_mt_runtime_device_name", config.get("det_runtime_device_name"))
-        setattr(self._rapidocr_engine.text_cls, "_mt_runtime_device_name", config.get("cls_runtime_device_name"))
-        setattr(self._rapidocr_engine.text_rec, "_mt_runtime_device_name", config.get("rec_runtime_device_name"))
-        setattr(
-            self._rapidocr_engine.text_det,
-            "_mt_preprocess_backend",
-            (config.get("preprocess_backends", {}) or {}).get("det", "cpu"),
-        )
-        setattr(
-            self._rapidocr_engine.text_cls,
-            "_mt_preprocess_backend",
-            (config.get("preprocess_backends", {}) or {}).get("cls", "cpu"),
-        )
-        setattr(
-            self._rapidocr_engine.text_rec,
-            "_mt_preprocess_backend",
-            (config.get("preprocess_backends", {}) or {}).get("rec", "cpu"),
-        )
-        execution_devices = self._collect_rapidocr_execution_devices(self._rapidocr_engine)
-        self._validate_rapidocr_execution_devices(config, execution_devices)
         self._rapidocr_runtime_cfg = dict(config)
-        self._rapidocr_runtime_cfg["execution_devices"] = execution_devices
         if config.get("det_limit_type") == "min":
             LOG.warning(
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
         LOG.info(
-            "RapidOCR ready: config=%s device=%s stage_devices=%s stage_runtime_devices=%s exec_devices=%s preprocess_backends=%s opencl_device=%s hint=%s use_cls=%s max_side_len=%s "
-            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_stage_workers=%s ocr_admission=%s",
+            "RapidOCR ready: config=%s requested_device=%s runtime_device=%s hint=%s use_cls=%s max_side_len=%s "
+            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_admission=%s",
             self.rapidocr_config_path,
+            config.get("requested_device_name"),
             config.get("device_name"),
-            {
-                "det": config.get("det_device_name"),
-                "cls": config.get("cls_device_name"),
-                "rec": config.get("rec_device_name"),
-            },
-            {
-                "det": config.get("det_runtime_device_name"),
-                "cls": config.get("cls_runtime_device_name"),
-                "rec": config.get("rec_runtime_device_name"),
-            },
-            execution_devices or "unknown",
-            config.get("preprocess_backends"),
-            (
-                f"{self._ocr_opencl_device_name} ({self._ocr_opencl_device_vendor})"
-                if self._ocr_opencl_device_name and self._ocr_opencl_device_vendor
-                else "disabled"
-            ),
             config.get("performance_hint"),
             config.get("use_cls"),
             config.get("max_side_len"),
@@ -957,7 +881,6 @@ class RapidOCRMixin:
             config.get("det_limit_side_len"),
             config.get("rec_batch_num"),
             config.get("cls_batch_num"),
-            self._ocr_stage_worker_count,
             self._ocr_admission.capacity,
         )
 
@@ -980,12 +903,10 @@ class RapidOCRMixin:
     def _infer_ocr(self, image: np.ndarray) -> OCRResult:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self._infer_ocr_async(image))
-        raise RuntimeError("Synchronous OCR inference cannot run inside an active event loop.")
+        return self._run_rapidocr_builtin(
+            self._rapidocr_engine,
+            _as_contiguous_bgr_uint8(image, context="OCR"),
+        )
 
     @staticmethod
     def _ocr_result_from_raw(raw_result: Any) -> OCRResult:
@@ -1402,6 +1323,40 @@ class RapidOCRMixin:
             viser=viser,
         )
 
+    def _run_rapidocr_builtin(
+        self,
+        engine: RapidOCR,
+        image: np.ndarray,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> OCRResult:
+        runtime_cfg = self._rapidocr_runtime_cfg or {}
+        self._raise_if_cancelled(cancel_event)
+        total_started_at = time.perf_counter()
+        with self._rapidocr_infer_lock:
+            self._raise_if_cancelled(cancel_event)
+            raw_result = engine(image)
+        total_ms = (time.perf_counter() - total_started_at) * 1000.0
+        slow_threshold_ms = max(
+            1000.0,
+            min(float(self._ocr_execution_timeout_seconds) * 500.0, 5000.0),
+        )
+        if total_ms >= slow_threshold_ms:
+            result_boxes = getattr(raw_result, "boxes", None)
+            box_count = 0 if result_boxes is None else int(len(result_boxes))
+            LOG.warning(
+                "RapidOCR slow request: total=%.1fms runtime_device=%s use_cls=%s max_side_len=%s det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s boxes=%s",
+                total_ms,
+                runtime_cfg.get("runtime_device_name", "CPU"),
+                runtime_cfg.get("use_cls"),
+                runtime_cfg.get("max_side_len"),
+                runtime_cfg.get("det_limit_type"),
+                runtime_cfg.get("det_limit_side_len"),
+                runtime_cfg.get("rec_batch_num"),
+                runtime_cfg.get("cls_batch_num"),
+                box_count,
+            )
+        return self._ocr_result_from_raw(raw_result)
+
     async def _infer_ocr_async(
         self,
         image: np.ndarray,
@@ -1409,121 +1364,14 @@ class RapidOCRMixin:
     ) -> OCRResult:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
-
-        engine = self._rapidocr_engine
-        total_started_at = time.perf_counter()
-        ori_img = _as_contiguous_bgr_uint8(image, context="OCR")
-        det_ms = crop_ms = cls_ms = rec_ms = 0.0
-        self._raise_if_cancelled(cancel_event)
-        stage_started_at = time.perf_counter()
-        img, op_record = await self._run_in_executor(
+        prepared = _as_contiguous_bgr_uint8(image, context="OCR")
+        return await self._run_in_executor(
             self._shared_cpu_executor,
-            self._rapidocr_preprocess_img,
-            engine,
-            ori_img,
+            self._run_rapidocr_builtin,
+            self._rapidocr_engine,
+            prepared,
+            cancel_event,
         )
-        preprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
-        det_res = TextDetOutput()
-        cls_res = TextClsOutput()
-        rec_res = _empty_text_rec_output()
-
-        if engine.use_det:
-            try:
-                self._raise_if_cancelled(cancel_event)
-                stage_started_at = time.perf_counter()
-                img, op_record, det_res = await self._run_in_executor(
-                    self._ocr_det_executor,
-                    self._rapidocr_detect_and_pad,
-                    engine,
-                    img,
-                    op_record,
-                )
-                det_ms = (time.perf_counter() - stage_started_at) * 1000.0
-            except RapidOCRError as exc:
-                LOG.warning(exc)
-                return OCRResult(texts=[], scores=[], boxes=[])
-            if det_res.boxes is None:
-                return OCRResult(texts=[], scores=[], boxes=[])
-            stage_started_at = time.perf_counter()
-            cropped_img_list = await self._rapidocr_crop_regions_async(
-                img,
-                det_res.boxes,
-                cancel_event,
-            )
-            crop_ms = (time.perf_counter() - stage_started_at) * 1000.0
-        else:
-            cropped_img_list = [img]
-
-        if engine.use_cls:
-            try:
-                self._raise_if_cancelled(cancel_event)
-                stage_started_at = time.perf_counter()
-                cls_img_list, cls_res = await self._rapidocr_cls_and_rotate_async(
-                    engine,
-                    cropped_img_list,
-                    cancel_event,
-                )
-                cls_ms = (time.perf_counter() - stage_started_at) * 1000.0
-            except RapidOCRError as exc:
-                LOG.warning(exc)
-                return OCRResult(texts=[], scores=[], boxes=[])
-        else:
-            cls_img_list = cropped_img_list
-
-        if engine.use_rec:
-            try:
-                self._raise_if_cancelled(cancel_event)
-                stage_started_at = time.perf_counter()
-                rec_res = await self._rapidocr_recognize_async(
-                    engine,
-                    cls_img_list,
-                    cancel_event,
-                )
-                rec_ms = (time.perf_counter() - stage_started_at) * 1000.0
-            except RapidOCRError as exc:
-                LOG.warning(exc)
-                return OCRResult(texts=[], scores=[], boxes=[])
-
-        self._raise_if_cancelled(cancel_event)
-        stage_started_at = time.perf_counter()
-        raw_result = await self._run_in_executor(
-            self._shared_cpu_executor,
-            engine.build_final_output,
-            ori_img,
-            det_res,
-            cls_res,
-            rec_res,
-            cropped_img_list,
-            op_record,
-        )
-        assemble_ms = (time.perf_counter() - stage_started_at) * 1000.0
-        total_ms = (time.perf_counter() - total_started_at) * 1000.0
-        slow_threshold_ms = max(
-            1000.0,
-            min(float(self._ocr_execution_timeout_seconds) * 500.0, 5000.0),
-        )
-        if total_ms >= slow_threshold_ms:
-            runtime_cfg = self._rapidocr_runtime_cfg or {}
-            box_count = 0 if det_res.boxes is None else int(len(det_res.boxes))
-            LOG.warning(
-                "RapidOCR slow request: total=%.1fms preprocess=%.1fms det=%.1fms crop=%.1fms cls=%.1fms rec=%.1fms assemble=%.1fms boxes=%s stage_runtime_devices=%s exec_devices=%s preprocess_backends=%s",
-                total_ms,
-                preprocess_ms,
-                det_ms,
-                crop_ms,
-                cls_ms,
-                rec_ms,
-                assemble_ms,
-                box_count,
-                {
-                    "det": runtime_cfg.get("det_runtime_device_name"),
-                    "cls": runtime_cfg.get("cls_runtime_device_name"),
-                    "rec": runtime_cfg.get("rec_runtime_device_name"),
-                },
-                runtime_cfg.get("execution_devices", "unknown"),
-                runtime_cfg.get("preprocess_backends", "unknown"),
-            )
-        return self._ocr_result_from_raw(raw_result)
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
         self._acquire_image_request_slot("OCR")

@@ -32,13 +32,13 @@
 | `RAPIDOCR_OPENVINO_CONFIG_PATH`     | RapidOCR YAML 配置文件路径；服务会将该文件直接作为 `config_path` 传给 `RapidOCR` | `app/config/cfg_openvino_cpu.yaml` |
 | `RAPIDOCR_MODEL_DIR`                | RapidOCR 模型目录                                             | `<repo>/models/rapidocr`           |
 | `RAPIDOCR_FONT_PATH`                | RapidOCR 字体文件路径；空表示不指定                                    | 空                                  |
-| `RAPIDOCR_DEVICE`                   | RapidOCR 全局默认设备；`AUTO/GPU` 默认派生为 `det=GPU`、`cls=CPU`、`rec=CPU`，`CPU` 会让三段都走 CPU，除非被 stage 级环境变量覆盖 | `AUTO`                             |
-| `RAPIDOCR_DET_DEVICE`               | 仅覆盖检测 stage 的 OpenVINO 设备；默认跟随最佳实践 `GPU`                 | 跟随 `RAPIDOCR_DEVICE` 派生         |
-| `RAPIDOCR_CLS_DEVICE`               | 仅覆盖方向分类 stage 的 OpenVINO 设备；默认跟随最佳实践 `CPU`              | 跟随 `RAPIDOCR_DEVICE` 派生         |
-| `RAPIDOCR_REC_DEVICE`               | 仅覆盖识别 stage 的 OpenVINO 设备；默认跟随最佳实践 `CPU`                 | 跟随 `RAPIDOCR_DEVICE` 派生         |
+| `RAPIDOCR_DEVICE`                   | RapidOCR OpenVINO 后端请求设备；当前实现会固定收敛到库内原生 `CPU` 路径，非 `CPU` 值仅记录告警 | `CPU`                              |
+| `RAPIDOCR_DET_DEVICE`               | 保留兼容环境变量；当前库内原生 CPU 路径不会使用该 stage 覆盖                | 未使用                               |
+| `RAPIDOCR_CLS_DEVICE`               | 保留兼容环境变量；当前库内原生 CPU 路径不会使用该 stage 覆盖                | 未使用                               |
+| `RAPIDOCR_REC_DEVICE`               | 保留兼容环境变量；当前库内原生 CPU 路径不会使用该 stage 覆盖                | 未使用                               |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `THROUGHPUT`                       |
-| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | OpenVINO 请求数，同时作为 OCR `det/cls/rec` 三个 stage 执行器的 worker 数基线 | `2`                                |
+| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | RapidOCR OpenVINO CPU 配置项；传给库内 OpenVINO 配置，当前不再驱动自定义 stage executor | `2`                                |
 | `RAPIDOCR_ENABLE_CPU_PINNING`       | 是否启用 CPU 绑核                                               | `true`                             |
 | `RAPIDOCR_NUM_STREAMS`              | OpenVINO stream 数                                             | `2`                                |
 | `RAPIDOCR_ENABLE_HYPER_THREADING`   | 是否启用超线程                                                   | `true`                             |
@@ -49,7 +49,7 @@
 | `RAPIDOCR_DET_LIMIT_TYPE`           | 检测缩放策略；默认 `max`，避免把小图放大到阈值导致时延异常                | `max`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `8`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `8`                                |
-| `OCR_MAX_CONCURRENT_REQUESTS`       | OCR 应用层最大并发请求数；用于限制 executor 积压并与 stage worker 对齐，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
+| `OCR_MAX_CONCURRENT_REQUESTS`       | OCR 应用层最大并发请求数；用于限制积压且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
 | `OCR_PREWARM_ENABLED`               | 是否启用一次性后台 RapidOCR 预热；预热完成后会立即释放 OCR 模型                 | `false`                             |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 一次性后台预热延迟（秒）；仅在 `OCR_PREWARM_ENABLED=true` 时生效      | `1.0`                               |
 | `NON_TEXT_IDLE_RELEASE_SECONDS`     | 60 秒未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace；`<=0` 表示关闭 | `60`                                |
@@ -64,24 +64,19 @@
 
 补充说明：
 
-- 开发机本地验证时，建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。如果你显式设置过 `RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE`，本地验证时也一并改成 `CPU`，避免把开发机是否具备 Intel GPU/OpenCL/ORT OpenVINO EP 依赖混进功能验证结果。
+- 开发机本地验证时，建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。`RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE` 当前仅保留兼容占位，不参与运行时选路。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
 - 为避免 MT-Photos 客户端在积压时主动取消，服务会对 `/clip/img`、`/ocr`、`/represent` 共享一个图片请求名额池；默认值和运行时硬上限都是 `10`，第 `11` 张会立即失败而不是继续挂起等待。
-- RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，且三个 stage 的 worker 数默认对齐 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS`，避免 app 层只喂单路导致 OpenVINO request budget 空转。
-- 单张 `/ocr` 请求内部也会把 `cls/rec` 按 `cls_batch_num/rec_batch_num` 切成子批并发投递到现有 stage worker；因此 worker 数不再只对“多请求并发”生效，大图场景下也能把 GPU request budget 喂起来。
+- RapidOCR 现已回到库内原生 `RapidOCR.__call__` CPU 执行链：服务只负责懒加载、应用层准入和超时控制，不再替换 session、也不再维护自定义 stage 级预处理/批调度。
 - 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器；OCR/Face 的异步路径会先完成模型加载，再进入执行超时窗口。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
-- RapidOCR 默认基线使用 `THROUGHPUT + stage devices(det=GPU / cls=CPU / rec=CPU) + rec/cls batch=8`。`RAPIDOCR_DEVICE=AUTO` 只作为全局默认入口，真正编译时会按 stage 收敛到上述设备，并显式关闭任何 `AUTO` startup/runtime CPU fallback。若 `Det/Cls/Rec` 任一 stage 的 `exec_devices` 不符合请求设备，初始化会直接失败。
-- RapidOCR 的预处理链会按 stage 走不同 backend：`det` 在 GPU 路径上使用 `OpenCV UMat + Intel OpenCL` 做 resize/normalize/blob 生成，`cls/rec` 保持 CPU 本地预处理与识别，减少小批量文本框在 GPU/CPU 间来回搬运。
-- OCR 现在会在应用层做有界准入，并把 `crop/cls/rec` 的任务提交限制在当前 worker 数窗口内；超时后会先发起协作取消，再等待已受理任务退场，避免后台遗留任务长期占住租约和 executor。
-- RapidOCR 初始化和慢请求日志会输出 `stage_devices`、`stage_runtime_devices`、`preprocess_backends` 与 `exec_devices`，便于核对 `det=GPU / cls=CPU / rec=CPU` 是否真正落地。
+- RapidOCR 当前基线为 `OpenVINO + CPU + PP-OCRv5 mobile + use_cls=true`；即使显式传入 `RAPIDOCR_DEVICE=AUTO/GPU` 或 stage 级设备变量，运行时也会告警并强制回到 CPU。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
-- RapidOCR 的 OpenVINO session 会在线程内复用 `InferRequest`；方向分类阶段若发现 OpenVINO 返回条数少于当前批长度，会自动退回单张分类，避免 `IndexError` 并兼容 batch 输出不一致的运行时。
-- RapidOCR 会在慢请求时输出阶段耗时拆分日志（`preprocess/det/crop/cls/rec/assemble`），便于区分是检测、裁剪还是识别阶段拖慢了整体时延。
+- RapidOCR 慢请求日志现输出总耗时和当前 CPU 配置，便于区分是 OCR 本体慢还是排队/模型切换导致的尾延迟。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - 默认还会在连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留常驻 Text-CLIP；如需调整可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。
@@ -173,7 +168,7 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 默认会收敛为 `det=GPU / cls=CPU / rec=CPU`，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
@@ -209,7 +204,7 @@ docker run -d \
   -e INFERENCE_DEVICE=AUTO \
   -e CLIP_INFERENCE_DEVICE=AUTO \
   -e CLIP_IMAGE_BATCH=8 \
-  -e RAPIDOCR_DEVICE=AUTO \
+  -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=AUTO \
   -e OCR_EXEC_TIMEOUT=30 \
   -e NON_TEXT_IDLE_RELEASE_SECONDS=60 \

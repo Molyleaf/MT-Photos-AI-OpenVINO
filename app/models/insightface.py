@@ -252,11 +252,48 @@ class InsightFaceMixin:
             raise RuntimeError("InsightFace detector module missing distance2kps helper.")
         return distance2bbox, distance2kps
 
+    @staticmethod
+    def _normalize_insightface_detector_state(
+        det_model: Any,
+        *,
+        det_size: Tuple[int, int],
+        det_thresh: float,
+        nms_thresh: float = 0.4,
+    ) -> None:
+        init_vars = getattr(det_model, "_init_vars", None)
+        required_attrs = (
+            "input_name",
+            "output_names",
+            "fmc",
+            "_feat_stride_fpn",
+            "_num_anchors",
+            "use_kps",
+            "input_mean",
+            "input_std",
+        )
+        if callable(init_vars) and any(not hasattr(det_model, attr) for attr in required_attrs):
+            init_vars()
+
+        if not hasattr(det_model, "center_cache") or getattr(det_model, "center_cache") is None:
+            det_model.center_cache = {}
+        if getattr(det_model, "det_thresh", None) is None:
+            det_model.det_thresh = float(det_thresh)
+        if getattr(det_model, "nms_thresh", None) is None:
+            det_model.nms_thresh = float(nms_thresh)
+        if getattr(det_model, "input_size", None) is None:
+            det_model.input_size = tuple(int(value) for value in det_size)
+
     def _run_insightface_detector_forward(self, det_model: Any, img: np.ndarray) -> Any:
         preprocess_runner = self._face_det_ppp
         if preprocess_runner is None:
             raise RuntimeError("InsightFace detection PPP runner is not initialized.")
 
+        self._normalize_insightface_detector_state(
+            det_model,
+            det_size=tuple(int(value) for value in getattr(det_model, "input_size", (640, 640))),
+            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
+            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
+        )
         distance2bbox, distance2kps = self._resolve_insightface_detector_helpers(det_model)
         scores_list: List[np.ndarray] = []
         bboxes_list: List[np.ndarray] = []
@@ -325,6 +362,12 @@ class InsightFaceMixin:
         max_num: int = 0,
         metric: str = "default",
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        self._normalize_insightface_detector_state(
+            det_model,
+            det_size=tuple(int(value) for value in getattr(det_model, "input_size", (640, 640))),
+            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
+            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
+        )
         assert det_model.input_size is not None
         input_size = tuple(det_model.input_size)
         image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
@@ -725,8 +768,13 @@ class InsightFaceMixin:
                 provider_options,
             )
             self._enforce_insightface_openvino_provider(face_app, provider_options)
-            face_app.prepare(ctx_id=0, det_size=(640, 640))
+            face_app.prepare(ctx_id=0, det_thresh=0.5, det_size=(640, 640))
             self._enforce_insightface_openvino_provider(face_app, provider_options)
+            self._normalize_insightface_detector_state(
+                getattr(face_app, "det_model"),
+                det_size=(640, 640),
+                det_thresh=float(getattr(face_app, "det_thresh", 0.5) or 0.5),
+            )
             provider_runtime = self._validate_insightface_openvino_provider(
                 face_app,
                 expected_device_type=provider_device,

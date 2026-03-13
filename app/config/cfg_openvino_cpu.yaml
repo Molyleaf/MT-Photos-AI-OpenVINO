@@ -14,9 +14,9 @@ Global:
 
 EngineConfig:
   openvino:
-    # Code-level defaults derive stage devices as det=GPU / cls=CPU / rec=CPU when device_name=AUTO/GPU.
-    # Set RAPIDOCR_DEVICE=CPU (or stage-specific RAPIDOCR_*_DEVICE) to force pure-CPU validation.
-    device_name: "AUTO"
+    # RapidOCR upstream OpenVINO backend currently compiles with device_name=CPU.
+    # Runtime no longer replaces sessions or stage routes; keep this YAML aligned with pure CPU.
+    device_name: "CPU"
     inference_num_threads: -1
     performance_hint: "THROUGHPUT"
     performance_num_requests: 2

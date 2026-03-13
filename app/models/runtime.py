@@ -127,6 +127,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
         self._rapidocr_engine = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
+        self._rapidocr_infer_lock = threading.Lock()
         self._ocr_opencl_device_name: Optional[str] = None
         self._ocr_opencl_device_vendor: Optional[str] = None
         self._face_engine = None
