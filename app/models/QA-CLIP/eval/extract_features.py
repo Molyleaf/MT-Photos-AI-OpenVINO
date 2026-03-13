@@ -8,6 +8,7 @@ import argparse
 import logging
 from pathlib import Path
 import json
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -146,6 +147,8 @@ if __name__ == "__main__":
         convert_weights(model)
 
     # Get data.
+    img_data = None
+    text_data = None
     if args.extract_image_feats:
         print("Preparing image inference dataset.")
         img_data = get_eval_img_dataset(args)
@@ -171,6 +174,7 @@ if __name__ == "__main__":
     # Make inference for texts
     if args.extract_text_feats:
         print('Make inference for texts...')
+        assert text_data is not None
         if args.text_feat_output_path is None:
             args.text_feat_output_path = "{}.txt_feat.jsonl".format(args.text_data[:-6])
         write_cnt = 0
@@ -191,6 +195,7 @@ if __name__ == "__main__":
     # Make inference for images
     if args.extract_image_feats:
         print('Make inference for images...')
+        assert img_data is not None
         if args.image_feat_output_path is None:
             # by default, we store the image features under the same directory with the text features
             args.image_feat_output_path = "{}.img_feat.jsonl".format(args.text_data.replace("_texts.jsonl", "_imgs"))

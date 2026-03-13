@@ -116,7 +116,7 @@ class _NonTextFamilyStateMachine:
         self,
         family: NonTextFamily,
         abort_event: Optional[threading.Event] = None,
-    ) -> bool | None:
+    ) -> bool:
         while True:
             previous_family: Optional[NonTextFamily]
             with self._condition:

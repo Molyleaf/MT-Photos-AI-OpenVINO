@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union, cast
 from itertools import repeat
 import collections.abc
 
@@ -11,18 +11,30 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+import importlib
 import importlib.util
+FlashMHA: Any = None
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
-from clip import _tokenizer
-from clip.configuration_bert import BertConfig
-from clip.modeling_bert import BertModel
+from . import _tokenizer
+from .configuration_bert import BertConfig
+from .modeling_bert import BertModel
 
+CLIPTextModelWithProjection: Any = None
 try:
-    from transformers import CLIPTextModelWithProjection
-except:
+    from transformers import CLIPTextModelWithProjection as _CLIPTextModelWithProjection
+    CLIPTextModelWithProjection = _CLIPTextModelWithProjection
+except ImportError:
     pass
+
+jit_ignore = cast(Any, torch.jit.ignore)
+
+
+def _is_scripting() -> bool:
+    is_scripting = getattr(torch.jit, "is_scripting", None)
+    return bool(is_scripting()) if callable(is_scripting) else False
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -71,7 +83,7 @@ class Bottleneck(nn.Module):
 
 
 class AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: Optional[int] = None):
         super().__init__()
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
@@ -80,7 +92,10 @@ class AttentionPool2d(nn.Module):
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
+        q_proj_bias = cast(torch.Tensor, self.q_proj.bias)
+        k_proj_bias = cast(torch.Tensor, self.k_proj.bias)
+        v_proj_bias = cast(torch.Tensor, self.v_proj.bias)
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
@@ -92,7 +107,7 @@ class AttentionPool2d(nn.Module):
             k_proj_weight=self.k_proj.weight,
             v_proj_weight=self.v_proj.weight,
             in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            in_proj_bias=torch.cat((q_proj_bias, k_proj_bias, v_proj_bias)),
             bias_k=None,
             bias_v=None,
             add_zero_attn=False,
@@ -149,7 +164,7 @@ class ModifiedResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         pass
 
@@ -174,9 +189,9 @@ class ModifiedResNet(nn.Module):
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
+    def forward(self, input: torch.Tensor):
+        orig_type = input.dtype
+        ret = super().forward(input.type(torch.float32))
         return ret.type(orig_type)
 
 
@@ -186,7 +201,7 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, use_flash_attention: bool = False):
+    def __init__(self, d_model: int, n_head: int, attn_mask: Optional[torch.Tensor] = None, use_flash_attention: bool = False):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head) if not use_flash_attention else FlashMHA(d_model, n_head)
@@ -215,7 +230,7 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, use_flash_attention: bool = False):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: Optional[torch.Tensor] = None, use_flash_attention: bool = False):
         super().__init__()
         self.width = width
         self.layers = layers
@@ -223,9 +238,9 @@ class Transformer(nn.Module):
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, use_flash_attention) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
-        if self.grad_checkpointing and not torch.jit.is_scripting():
+        if self.grad_checkpointing and not _is_scripting():
             for r in self.resblocks:
-                x = checkpoint(r, x)
+                x = cast(torch.Tensor, checkpoint(r, x))
             return x        
         return self.resblocks(x)
 
@@ -248,7 +263,7 @@ class VisualTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
 
@@ -258,14 +273,14 @@ class VisualTransformer(nn.Module):
 
         noise = torch.rand(N, L - 1, device=x.device)
         ids_shuffle = torch.argsort(noise, dim=1) + torch.ones(N, L - 1, device=x.device,
-                                                               dtype=int)
+                                                               dtype=torch.long)
         ids_keep = ids_shuffle[:, :len_keep]
 
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
         x0 = x[:, 0, :]
         x0 = x0.reshape(N, 1, D)
-        x_masked_add = torch.cat([x0, x_masked], axis=1)
+        x_masked_add = torch.cat((x0, x_masked), dim=1)
         return x_masked_add
 
     def forward(self, x: torch.Tensor, mask_ratio: float = 0.0):
@@ -381,7 +396,7 @@ class CLIP(nn.Module):
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.bert_config.hidden_size ** -0.5)
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         self.visual.set_grad_checkpointing(enable)
         self.bert.set_grad_checkpointing(enable)
@@ -529,7 +544,7 @@ class CLIPWithTwoTextEncoder(nn.Module):
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.bert_config.hidden_size ** -0.5)
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         self.visual.set_grad_checkpointing(enable)
         self.bert.set_grad_checkpointing(enable)
@@ -684,7 +699,7 @@ class CLIP4SD(nn.Module):
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.bert_config.hidden_size ** -0.5)
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         self.visual.set_grad_checkpointing(enable)
         self.bert.set_grad_checkpointing(enable)
@@ -780,7 +795,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def restore_model(model, clip_state_dict: dict, bert_state_dict: dict, use_flash_attention: bool):
+def restore_model(model, clip_state_dict: Optional[dict[str, Any]], bert_state_dict: Optional[dict[str, Any]], use_flash_attention: bool):
     merged_state_dict = {}
 
     # use clip_state_dict to initialize the image encoder & logit scale
@@ -869,7 +884,7 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
     model = model.module if hasattr(model, 'module') else model
     if old_pos_embed is None or not hasattr(model.visual, 'grid_size'):
         return
-    grid_size = to_2tuple(model.visual.grid_size)
+    grid_size = cast(tuple[int, ...], to_2tuple(model.visual.grid_size))
     extra_tokens = 1
     new_seq_len = grid_size[0] * grid_size[1] + extra_tokens
     if new_seq_len == old_pos_embed.shape[0]:
@@ -879,7 +894,7 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
         pos_emb_tok, pos_emb_img = old_pos_embed[:extra_tokens], old_pos_embed[extra_tokens:]
     else:
         pos_emb_tok, pos_emb_img = None, old_pos_embed
-    old_grid_size = to_2tuple(int(math.sqrt(len(pos_emb_img))))
+    old_grid_size = cast(tuple[int, ...], to_2tuple(int(math.sqrt(len(pos_emb_img)))))
 
     logging.info('Resizing position embedding grid-size from %s to %s', old_grid_size, grid_size)
     pos_emb_img = pos_emb_img.reshape(1, old_grid_size[0], old_grid_size[1], -1).permute(0, 3, 1, 2)
@@ -901,7 +916,7 @@ def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=
 def _ntuple(n):
     def parse(x):
         if isinstance(x, collections.abc.Iterable):
-            return x
+            return tuple(x)
         return tuple(repeat(x, n))
     return parse
 

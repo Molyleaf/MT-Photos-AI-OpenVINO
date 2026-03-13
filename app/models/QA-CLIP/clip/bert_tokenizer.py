@@ -25,6 +25,9 @@ import unicodedata
 import six
 from functools import lru_cache
 import os
+from typing import cast
+
+unicode = str
 
 @lru_cache()
 def default_vocab():
@@ -58,6 +61,9 @@ def validate_case_matches_checkpoint(do_lower_case, init_checkpoint):
     ]
 
     is_bad_config = False
+    actual_flag = ""
+    case_name = ""
+    opposite_flag = ""
     if model_name in lower_models and not do_lower_case:
         is_bad_config = True
         actual_flag = "False"
@@ -91,7 +97,7 @@ def convert_to_unicode(text):
             raise ValueError("Unsupported string type: %s" % (type(text)))
     elif six.PY2:
         if isinstance(text, str):
-            return text.decode("utf-8", "ignore")
+            return cast(bytes, text).decode("utf-8", "ignore")
         elif isinstance(text, unicode):
             return text
         else:
@@ -116,7 +122,7 @@ def printable_text(text):
         if isinstance(text, str):
             return text
         elif isinstance(text, unicode):
-            return text.encode("utf-8")
+            return cast(str, text).encode("utf-8")
         else:
             raise ValueError("Unsupported string type: %s" % (type(text)))
     else:

@@ -3,15 +3,15 @@
 import json
 import os
 from pathlib import Path
-from typing import Union, List
-import urllib
+from typing import Any, List, Optional, Union
+import urllib.request
 
 import torch
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
 from tqdm import tqdm
 
-from clip import _tokenizer
-from clip.model import convert_weights, CLIP, restore_model
+from . import _tokenizer
+from .model import convert_weights, CLIP, restore_model
 
 __all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name"]
 
@@ -72,7 +72,8 @@ def available_models() -> List[str]:
 
 
 def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
-                   download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
+                   download_root: Optional[str] = None, vision_model_name: Optional[str] = None,
+                   text_model_name: Optional[str] = None, input_resolution: Optional[int] = None):
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
         model_name, model_input_resolution = _MODEL_INFO[name]['struct'], _MODEL_INFO[name]['input_resolution']
@@ -95,13 +96,13 @@ def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch
     return model, image_transform(model_input_resolution)
 
 
-def load(model, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", clip_path=None,
-         bert_path=None, use_flash_attention=False):
+def load(model, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
+         clip_path: Optional[str] = None, bert_path: Optional[str] = None, use_flash_attention: bool = False):
     """Load CLIP and BERT model weights
     """
 
-    bert_state_dict = torch.load(bert_path, map_location="cpu") if bert_path else None
-    clip_state_dict = torch.load(clip_path, map_location="cpu") if clip_path else None
+    bert_state_dict: Optional[dict[str, Any]] = torch.load(bert_path, map_location="cpu") if bert_path else None
+    clip_state_dict: Optional[dict[str, Any]] = torch.load(clip_path, map_location="cpu") if clip_path else None
 
     restore_model(model, clip_state_dict, bert_state_dict, use_flash_attention).to(device)
 
@@ -110,7 +111,7 @@ def load(model, device: Union[str, torch.device] = "cuda" if torch.cuda.is_avail
     return model
 
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.LongTensor:
+def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.Tensor:
     """
     Returns the tokenized representation of given input string(s)
     Parameters

@@ -23,18 +23,28 @@ import math
 import os
 import sys
 from io import open
+from typing import Any, cast
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+import importlib
 import importlib.util
+FlashMHA: Any = None
 if importlib.util.find_spec('flash_attn'):
     FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
 from .configuration_bert import BertConfig
 
 logger = logging.getLogger(__name__)
+jit_ignore = cast(Any, torch.jit.ignore)
+unicode = str
+
+
+def _is_scripting() -> bool:
+    is_scripting = getattr(torch.jit, "is_scripting", None)
+    return bool(is_scripting()) if callable(is_scripting) else False
 
 def gelu(x):
     """ Original Implementation of the gelu activation function in Google Bert repo when initially created.
@@ -263,15 +273,18 @@ class BertEncoder(nn.Module):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.grad_checkpointing and not torch.jit.is_scripting():
-                layer_outputs = checkpoint(layer_module, hidden_states, attention_mask, head_mask[i])
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            if self.grad_checkpointing and not _is_scripting():
+                layer_outputs = checkpoint(layer_module, hidden_states, attention_mask, layer_head_mask)
             else:
-                layer_outputs = layer_module(hidden_states, attention_mask, head_mask[i])
+                layer_outputs = layer_module(hidden_states, attention_mask, layer_head_mask)
             if not isinstance(layer_outputs, tuple):
                 layer_outputs = (layer_outputs, )
+            layer_outputs = cast(tuple[torch.Tensor, ...], layer_outputs)
             hidden_states = layer_outputs[0]
 
             if self.output_attentions:
+                assert len(layer_outputs) > 1
                 all_attentions = all_attentions + (layer_outputs[1],)
 
         # Add last layer
@@ -428,7 +441,7 @@ class BertModel(BertPreTrainedModel):
 
         self.apply(self._init_weights)
 
-    @torch.jit.ignore
+    @jit_ignore
     def set_grad_checkpointing(self, enable=True):
         if enable:
             assert not self.config.output_attentions, \

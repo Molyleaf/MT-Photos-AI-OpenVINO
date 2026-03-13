@@ -3,17 +3,22 @@ import logging
 import json
 from dataclasses import dataclass
 from pathlib import Path
+import importlib
+import importlib.util
 from PIL import Image
 import base64
 from io import BytesIO
+from typing import Any
 import torch
-import lmdb
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize, InterpolationMode
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.utils.data.sampler import SequentialSampler
 import torchvision.datasets as datasets
 from clip import tokenize
+
+lmdb: Any | None = None
+if importlib.util.find_spec("lmdb"):
+    lmdb = importlib.import_module("lmdb")
 
 
 def _convert_to_rgb(image):
@@ -54,6 +59,8 @@ class EvalTxtDataset(Dataset):
 class EvalImgDataset(Dataset):
     def __init__(self, lmdb_imgs, resolution=224):
         assert os.path.isdir(lmdb_imgs), "The image LMDB directory {} not exists!".format(lmdb_imgs)
+        if lmdb is None:
+            raise ImportError("lmdb is required to use EvalImgDataset")
 
         logging.debug(f'Loading image LMDB from {lmdb_imgs}.')
 
@@ -97,7 +104,7 @@ class EvalImgDataset(Dataset):
 @dataclass
 class DataInfo:
     dataloader: DataLoader
-    sampler: DistributedSampler
+    sampler: Sampler[Any] | None
 
 
 def get_eval_txt_dataset(args, max_txt_length=24):

@@ -29,9 +29,9 @@ def read_submission(submit_path, reference, k=5):
                 raise Exception('Cannot parse this line into json object: {}'.format(line))
             if "text_id" not in pred_obj:
                 raise Exception('There exists one line not containing text_id: {}'.format(line))
-            if not isinstance(pred_obj['text_id'], int):
-                raise Exception('Found an invalid text_id {}, it should be an integer (not string), please check your schema'.format(qid))
             qid = pred_obj["text_id"]
+            if not isinstance(qid, int):
+                raise Exception('Found an invalid text_id {}, it should be an integer (not string), please check your schema'.format(qid))
             if "image_ids" not in pred_obj:
                 raise Exception('There exists one line not containing the predicted image_ids: {}'.format(line))
             image_ids = pred_obj["image_ids"]
