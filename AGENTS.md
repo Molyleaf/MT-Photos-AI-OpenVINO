@@ -80,6 +80,7 @@
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
 - 运行基线：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
 - OpenVINO 参数基线：`device_name=CPU`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
+- `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 当前除透传给 RapidOCR/OpenVINO 外，还作为 OCR 多实例池与应用层执行器默认 worker 数基线。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；但设备相关项最终仍必须收敛到 `CPU`。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
 - 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
@@ -130,6 +131,7 @@
 - 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
   - 关闭时释放全部模型
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
+- `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
 - Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
@@ -276,6 +278,7 @@
 - `python -m compileall app`
 - `python -m compileall convert`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
+- 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
 - 关键端点冒烟：`/check`、`/clip/txt`、`/ocr`、`/represent`
 
 ---
@@ -360,6 +363,9 @@ services:
       - INFERENCE_EXEC_TIMEOUT=30
       - OCR_EXEC_TIMEOUT=30
       - NON_TEXT_IDLE_RELEASE_SECONDS=60
+      - PORT=8060
+      - WEB_CONCURRENCY=1
+      - LOG_LEVEL=WARNING
 ```
 
 说明：
@@ -367,6 +373,8 @@ services:
 - `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
+- `PORT` 当前会同时影响 Docker 入口命令与容器健康检查；若修改它，`docker-compose` 里的 `ports:` 映射也必须同步修改。
+- `WEB_CONCURRENCY` 当前只由 Docker 入口命令读取；手动执行 `uvicorn server:app` 时需改用 `--workers`。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
 
 #### B. 启动与设备可见性判定

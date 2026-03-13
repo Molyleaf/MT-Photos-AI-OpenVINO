@@ -13,14 +13,39 @@ _LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
 _LOG_NAMESPACE = "mt_photos_ai"
 _LOG_FORMAT = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 _APP_LOG_HANDLER_FLAG = "_mt_photos_ai_handler"
+_KNOWN_LOGGER_NAMES = (
+    _LOG_NAMESPACE,
+    f"{_LOG_NAMESPACE}.server",
+    f"{_LOG_NAMESPACE}.models",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "rapidocr",
+    "rapidocr.utils.log",
+)
+
+
+def _resolve_log_level() -> tuple[str, int]:
+    configured_name = str(os.environ.get("LOG_LEVEL", "WARNING")).strip().upper() or "WARNING"
+    resolved_level = getattr(logging, configured_name, logging.WARNING)
+    resolved_name = logging.getLevelName(resolved_level)
+    if not isinstance(resolved_name, str):
+        resolved_name = "WARNING"
+        resolved_level = logging.WARNING
+    return resolved_name, int(resolved_level)
+
+
+def _synchronize_known_logger_levels(log_level: int) -> None:
+    for logger_name in _KNOWN_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(log_level)
 
 
 def _configure_application_logging() -> None:
-    log_level_name = os.environ.get("LOG_LEVEL", "WARNING").upper()
-    log_level = getattr(logging, log_level_name, logging.WARNING)
+    _, log_level = _resolve_log_level()
     namespace_logger = logging.getLogger(_LOG_NAMESPACE)
     namespace_logger.setLevel(log_level)
     namespace_logger.propagate = False
+    _synchronize_known_logger_levels(log_level)
 
     configured_handlers = [
         handler
@@ -30,6 +55,7 @@ def _configure_application_logging() -> None:
     if configured_handlers:
         for handler in configured_handlers:
             handler.setLevel(log_level)
+            handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         return
 
     formatter = logging.Formatter(_LOG_FORMAT)
@@ -189,6 +215,7 @@ def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Opti
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global models_instance
+    _configure_application_logging()
     _startup_self_check_dri()
     LOGGER.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
     models_instance = AIModels()
@@ -381,13 +408,13 @@ if __name__ == "__main__":
     import uvicorn
     _configure_standalone_logging()
     port = int(os.environ.get("PORT", 8060))
-    log_level = os.environ.get("LOG_LEVEL", "warning").lower()
+    log_level, _ = _resolve_log_level()
 
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
         port=port,
         reload=False,
-        log_level=log_level,
+        log_level=log_level.lower(),
         access_log=False
     )

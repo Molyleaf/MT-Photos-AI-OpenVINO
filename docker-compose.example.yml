@@ -7,7 +7,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "8060:8060"
+      - "${PORT:-8060}:${PORT:-8060}"
     group_add:
       # Debian 默认通常是 video=44、render=109。
       # 如果宿主机 GID 不同，直接修改下面两个值。
@@ -44,6 +44,8 @@ services:
       RAPIDOCR_CLS_BATCH_NUM: "8"
       INSIGHTFACE_OV_DEVICE: "AUTO"
       OPENCV_OPENCL_DEVICE: "Intel:GPU:0"
+      PORT: "8060"
+      WEB_CONCURRENCY: "1"
       LOG_LEVEL: "WARNING"
     devices:
       # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。

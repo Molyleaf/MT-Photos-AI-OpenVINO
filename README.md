@@ -39,7 +39,7 @@
 | `RAPIDOCR_REC_DEVICE`               | 保留兼容环境变量；当前库内原生 CPU 路径不会使用该 stage 覆盖                | 未使用                               |
 | `RAPIDOCR_INFERENCE_NUM_THREADS`    | RapidOCR 推理线程数                                            | `-1`                               |
 | `RAPIDOCR_PERFORMANCE_HINT`         | OpenVINO 性能提示，如 `LATENCY` / `THROUGHPUT`                  | `THROUGHPUT`                       |
-| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | RapidOCR OpenVINO CPU 配置项；传给库内 OpenVINO 配置，当前不再驱动自定义 stage executor | `2`                                |
+| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | RapidOCR OpenVINO CPU 配置项；同时作为 OCR 多实例池和执行器默认 worker 数的基线 | `2`                                |
 | `RAPIDOCR_ENABLE_CPU_PINNING`       | 是否启用 CPU 绑核                                               | `true`                             |
 | `RAPIDOCR_NUM_STREAMS`              | OpenVINO stream 数                                             | `2`                                |
 | `RAPIDOCR_ENABLE_HYPER_THREADING`   | 是否启用超线程                                                   | `true`                             |
@@ -59,15 +59,21 @@
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `INSIGHTFACE_MAX_WORKERS`           | `/represent` 应用层 worker 数；默认允许有限并发，避免单 worker 头阻塞        | `2`                                |
 | `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
-| `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
-| `PORT`                              | 服务端口                                                      | `8060`                             |
-| `LOG_LEVEL`                         | `mt_photos_ai.*` 应用/模型日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` | `WARNING`                          |
+| `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`；该变量由 OpenCV 运行时直接读取 | OpenCV 默认设备                        |
+| `PORT`                              | 服务端口；对 Docker 镜像入口、容器健康检查和 `python server.py` 生效 | `8060`                             |
+| `WEB_CONCURRENCY`                   | 仅 Docker 镜像入口读取的 worker 数                               | `1`                                |
+| `LOG_LEVEL`                         | 日志级别：作用于 `mt_photos_ai.*`、`uvicorn.*` 和 RapidOCR logger | `WARNING`                          |
 
 补充说明：
 
 - 开发机本地验证时，建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。`RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE` 当前仅保留兼容占位，不参与运行时选路。
+- `LOG_LEVEL` 会在应用导入和 lifespan 启动阶段同步到 `mt_photos_ai.*`、`uvicorn.*` 和 RapidOCR logger；Docker 镜像入口也会把它传给 `uvicorn --log-level`。如果你手动执行 `uvicorn server:app`，最早期的 uvicorn bootstrap 日志仍以 CLI `--log-level` 为准。
 - 服务会在 `uvicorn server:app` 和 `python server.py` 两种启动路径下都把 `mt_photos_ai.*` 日志输出到控制台；Windows 直接运行时还会追加写入 `<repo>/server.log`。
 - 如需看到启动自检、模型族切换和 `/restart` 释放日志，请显式设置 `LOG_LEVEL=INFO`。
+- `PORT` 当前对 Docker 镜像入口、容器健康检查和 `python server.py` 生效；如果手动执行 `uvicorn server:app`，请显式传 `--port`。
+- `WEB_CONCURRENCY` 仅被 Docker 镜像入口读取；手动执行 `uvicorn server:app` 时请显式传 `--workers`。
+- `CLIP_IMAGE_BATCH_SIZE` 仍作为兼容别名被读取；仅在未设置 `CLIP_IMAGE_BATCH` 时才会生效。
+- `RAPIDOCR_DET_DEVICE` / `RAPIDOCR_CLS_DEVICE` / `RAPIDOCR_REC_DEVICE` 当前只用于兼容告警，不参与实际 stage 选路。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
@@ -115,14 +121,17 @@ $env:CLIP_INFERENCE_DEVICE="CPU"
 $env:CLIP_IMAGE_BATCH="8"
 $env:RAPIDOCR_DEVICE="CPU"
 $env:INSIGHTFACE_OV_DEVICE="CPU"
+$env:LOG_LEVEL="INFO"
 ```
 
 4. 启动服务：
 
 ```powershell
 cd app
-uvicorn server:app --host 0.0.0.0 --port 8060
+python server.py
 ```
+
+如需手动执行 `uvicorn server:app`，请显式传入 `--port` / `--log-level`，例如 `uvicorn server:app --host 0.0.0.0 --port 8060 --log-level info`。
 
 ## Debian/Linux Docker 部署
 
@@ -176,6 +185,7 @@ cp docker-compose.example.yml docker-compose.yml
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
+- 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；如需修改 worker 数，请调整 `WEB_CONCURRENCY`
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 
@@ -214,8 +224,13 @@ docker run -d \
   -e INSIGHTFACE_OV_DEVICE=AUTO \
   -e OCR_EXEC_TIMEOUT=30 \
   -e NON_TEXT_IDLE_RELEASE_SECONDS=60 \
+  -e PORT=8060 \
+  -e WEB_CONCURRENCY=1 \
+  -e LOG_LEVEL=WARNING \
   mt-photos-ai-openvino
 ```
+
+如需修改 `PORT`，请同步调整 `-p <host_port>:<container_port>`。
 
 ### 容器内设备检查
 
