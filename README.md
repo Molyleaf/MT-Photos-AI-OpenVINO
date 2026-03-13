@@ -77,6 +77,8 @@
 - RapidOCR 当前基线为 `OpenVINO + CPU + PP-OCRv5 mobile + use_cls=true`；即使显式传入 `RAPIDOCR_DEVICE=AUTO/GPU` 或 stage 级设备变量，运行时也会告警并强制回到 CPU。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - RapidOCR 慢请求日志现输出总耗时和当前 CPU 配置，便于区分是 OCR 本体慢还是排队/模型切换导致的尾延迟。
+- OCR 异步执行会通过有界 `RapidOCR` 多实例池并发调用库内原生 `RapidOCR.__call__`；每个 worker 独占一个实例，避免共享 OpenVINO `InferRequest` 导致串行化或线程安全问题。并发上限仍受 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 和 `OCR_MAX_CONCURRENT_REQUESTS` 控制。
+- 对于确实不含文字的图片，`/ocr` 会正常返回空结果；服务会过滤 RapidOCR 自身 `"The text detection result is empty"` 的预期 warning，避免日志刷屏。
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - 默认还会在连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留常驻 Text-CLIP；如需调整可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。

@@ -1,12 +1,15 @@
 import asyncio
+import logging
 import os
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from queue import LifoQueue
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -16,6 +19,7 @@ from rapidocr import RapidOCR
 from rapidocr.ch_ppocr_rec.main import LangRec, VisRes, reorder_bidi_for_display
 from rapidocr.inference_engine.base import InferSession
 from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecOutput
+from rapidocr.utils.log import logger as RAPIDOCR_LOGGER
 from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
 
@@ -71,6 +75,11 @@ _OV_AUTO_RUNTIME_FALLBACK_KEY = str(
 
 _TextClsResult = Tuple[str, float]
 _TextRecWordResult = Tuple[str, float, Optional[List[List[int]]]]
+
+
+class _SuppressExpectedRapidOCRNoTextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().strip() != "The text detection result is empty"
 
 
 def _empty_text_rec_output() -> TextRecOutput:
@@ -213,8 +222,9 @@ class RapidOCRMixin:
     rapidocr_model_dir_path: Path
     rapidocr_font_path: str
     _rapidocr_load_lock: Any
-    _rapidocr_infer_lock: Any
     _rapidocr_engine: Optional[RapidOCR]
+    _rapidocr_engines: Optional[Tuple[RapidOCR, ...]]
+    _rapidocr_engine_pool: Optional[LifoQueue]
     _rapidocr_runtime_cfg: Optional[Dict[str, Any]]
     _ocr_opencl_device_name: Optional[str]
     _ocr_opencl_device_vendor: Optional[str]
@@ -273,6 +283,17 @@ class RapidOCRMixin:
                 f"Configured path: {self.rapidocr_config_path}"
             )
         return self.rapidocr_config_path
+
+    @staticmethod
+    def _configure_rapidocr_logger() -> None:
+        if getattr(RAPIDOCR_LOGGER, "_mt_expected_no_text_filter", None) is not None:
+            return
+
+        message_filter = _SuppressExpectedRapidOCRNoTextFilter()
+        RAPIDOCR_LOGGER.addFilter(message_filter)
+        for handler in RAPIDOCR_LOGGER.handlers:
+            handler.addFilter(message_filter)
+        setattr(RAPIDOCR_LOGGER, "_mt_expected_no_text_filter", message_filter)
 
     def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
         requested_device = _normalize_non_text_openvino_device(
@@ -586,6 +607,7 @@ class RapidOCRMixin:
     def _instantiate_rapidocr(self, params: Dict[str, Any]) -> RapidOCR:
         rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "CPU")).upper()
         config_path = self._require_rapidocr_config_path()
+        self._configure_rapidocr_logger()
         try:
             engine = RapidOCR(config_path=str(config_path), params=params)
         except Exception as exc:
@@ -820,7 +842,8 @@ class RapidOCRMixin:
         return img, op_record
 
     def _warmup_rapidocr_locked(self) -> None:
-        if self._rapidocr_engine is None:
+        engines = self._rapidocr_engines
+        if not engines:
             raise RuntimeError("RapidOCR model is not loaded.")
         runtime_cfg = self._rapidocr_runtime_cfg or {}
         warmup_side = max(
@@ -857,20 +880,32 @@ class RapidOCRMixin:
             thickness,
             cv2.LINE_AA,
         )
-        self._infer_ocr(warmup_image)
+        for engine in engines:
+            self._run_rapidocr_builtin(engine, warmup_image)
 
     def _load_rapidocr_locked(self) -> None:
         config = self._load_rapidocr_openvino_config()
         rapidocr_params = self._build_rapidocr_runtime_params(config)
-        self._rapidocr_engine = self._instantiate_rapidocr(rapidocr_params)
-        self._rapidocr_runtime_cfg = dict(config)
+        engine_pool_size = max(1, self._ocr_stage_worker_count)
+        engines = tuple(
+            self._instantiate_rapidocr(dict(rapidocr_params)) for _ in range(engine_pool_size)
+        )
+        engine_pool: LifoQueue = LifoQueue(maxsize=len(engines))
+        for engine in engines:
+            engine_pool.put_nowait(engine)
+        runtime_cfg = dict(config)
+        runtime_cfg["engine_pool_size"] = len(engines)
+        self._rapidocr_engine = engines[0]
+        self._rapidocr_engines = engines
+        self._rapidocr_engine_pool = engine_pool
+        self._rapidocr_runtime_cfg = runtime_cfg
         if config.get("det_limit_type") == "min":
             LOG.warning(
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
         LOG.info(
             "RapidOCR ready: config=%s requested_device=%s runtime_device=%s hint=%s use_cls=%s max_side_len=%s "
-            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_admission=%s",
+            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_admission=%s engine_pool=%s",
             self.rapidocr_config_path,
             config.get("requested_device_name"),
             config.get("device_name"),
@@ -882,10 +917,13 @@ class RapidOCRMixin:
             config.get("rec_batch_num"),
             config.get("cls_batch_num"),
             self._ocr_admission.capacity,
+            len(engines),
         )
 
     def _unload_rapidocr_model_locked(self) -> None:
         self._rapidocr_engine = None
+        self._rapidocr_engines = None
+        self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg = None
         self._ocr_opencl_device_name = None
         self._ocr_opencl_device_vendor = None
@@ -900,13 +938,30 @@ class RapidOCRMixin:
                 return
             self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
 
-    def _infer_ocr(self, image: np.ndarray) -> OCRResult:
-        if self._rapidocr_engine is None:
+    @contextmanager
+    def _borrow_rapidocr_engine(self) -> Iterator[RapidOCR]:
+        pool = self._rapidocr_engine_pool
+        if pool is None:
+            raise RuntimeError("RapidOCR model pool is not loaded.")
+        engine = pool.get(block=True)
+        try:
+            yield cast(RapidOCR, engine)
+        finally:
+            pool.put_nowait(engine)
+
+    def _run_rapidocr_with_pooled_engine(
+        self,
+        image: np.ndarray,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> OCRResult:
+        if self._rapidocr_engine_pool is None:
             raise RuntimeError("RapidOCR model is not loaded.")
-        return self._run_rapidocr_builtin(
-            self._rapidocr_engine,
-            _as_contiguous_bgr_uint8(image, context="OCR"),
-        )
+        prepared = _as_contiguous_bgr_uint8(image, context="OCR")
+        with self._borrow_rapidocr_engine() as engine:
+            return self._run_rapidocr_builtin(engine, prepared, cancel_event=cancel_event)
+
+    def _infer_ocr(self, image: np.ndarray) -> OCRResult:
+        return self._run_rapidocr_with_pooled_engine(image)
 
     @staticmethod
     def _ocr_result_from_raw(raw_result: Any) -> OCRResult:
@@ -1332,9 +1387,8 @@ class RapidOCRMixin:
         runtime_cfg = self._rapidocr_runtime_cfg or {}
         self._raise_if_cancelled(cancel_event)
         total_started_at = time.perf_counter()
-        with self._rapidocr_infer_lock:
-            self._raise_if_cancelled(cancel_event)
-            raw_result = engine(image)
+        self._raise_if_cancelled(cancel_event)
+        raw_result = engine(image)
         total_ms = (time.perf_counter() - total_started_at) * 1000.0
         slow_threshold_ms = max(
             1000.0,
@@ -1362,14 +1416,12 @@ class RapidOCRMixin:
         image: np.ndarray,
         cancel_event: Optional[threading.Event] = None,
     ) -> OCRResult:
-        if self._rapidocr_engine is None:
+        if self._rapidocr_engine_pool is None:
             raise RuntimeError("RapidOCR model is not loaded.")
-        prepared = _as_contiguous_bgr_uint8(image, context="OCR")
         return await self._run_in_executor(
-            self._shared_cpu_executor,
-            self._run_rapidocr_builtin,
-            self._rapidocr_engine,
-            prepared,
+            self._ocr_det_executor,
+            self._run_rapidocr_with_pooled_engine,
+            image,
             cancel_event,
         )
 

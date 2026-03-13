@@ -434,22 +434,29 @@ class InsightFaceMixin:
             _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
             for item in aligned_faces
         ]
-        try:
+        output_shape = getattr(rec_model, "output_shape", None)
+        static_single_output_batch = (
+            isinstance(output_shape, (list, tuple))
+            and len(output_shape) >= 1
+            and isinstance(output_shape[0], int)
+            and int(output_shape[0]) == 1
+        )
+        if not static_single_output_batch:
             batch = np.stack(prepared, axis=0)
             blob = preprocess_runner.run(batch)
             return np.asarray(
                 rec_model.session.run(rec_model.output_names, {rec_model.input_name: blob})[0]
             )
-        except ValueError:
-            features: List[np.ndarray] = []
-            for item in prepared:
-                blob = preprocess_runner.run(item[np.newaxis, ...])
-                single = rec_model.session.run(
-                    rec_model.output_names,
-                    {rec_model.input_name: blob},
-                )[0]
-                features.append(np.asarray(single))
-            return np.concatenate(features, axis=0) if features else np.empty((0, 0), dtype=np.float32)
+
+        features: List[np.ndarray] = []
+        for item in prepared:
+            blob = preprocess_runner.run(item[np.newaxis, ...])
+            single = rec_model.session.run(
+                rec_model.output_names,
+                {rec_model.input_name: blob},
+            )[0]
+            features.append(np.asarray(single))
+        return np.concatenate(features, axis=0) if features else np.empty((0, 0), dtype=np.float32)
 
     def _attach_insightface_preprocess(self, face_app: FaceAnalysis, device_name: str) -> None:
         det_model = getattr(face_app, "det_model", None)

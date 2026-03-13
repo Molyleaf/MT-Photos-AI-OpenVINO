@@ -126,8 +126,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
         )
         self._rapidocr_engine = None
+        self._rapidocr_engines = None
+        self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
-        self._rapidocr_infer_lock = threading.Lock()
         self._ocr_opencl_device_name: Optional[str] = None
         self._ocr_opencl_device_vendor: Optional[str] = None
         self._face_engine = None

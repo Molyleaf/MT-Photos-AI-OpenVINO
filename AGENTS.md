@@ -88,6 +88,7 @@
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
 - RapidOCR 与 OpenVINO 的衔接必须直接走库原生实现；严禁 monkey patch 第三方类/模块，也禁止继续替换 `text_det/text_cls/text_rec.session` 或自定义 stage session 包装。
 - OCR 运行链必须直接委托 `RapidOCR.__call__` / 库内 `run_ocr_steps`，不要再维护仓库内自定义 det/cls/rec 预处理、批调度和输出拼装分支。
+- OCR 并发必须通过**有界 RapidOCR 多实例池**实现；每个 worker 独占一个库原生 `RapidOCR` 实例，禁止多个线程共享同一个 OpenVINO `InferRequest`/session 对象后再用全局锁硬串行。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
 - OCR 执行超时允许通过 `OCR_EXEC_TIMEOUT` 单独覆盖；默认不得低于 `30s`，且异步路径中模型加载/切换等待不得挤占 OCR 纯执行超时窗口。
 - OCR 必须提供应用层有界准入；执行超时后必须先触发协作取消，再等待已受理任务退场，禁止把超时任务脱离调用方继续在后台无界堆积。
@@ -342,15 +343,18 @@
 - 修复 InsightFace 五点对齐弃用 API warning：本地重写相似变换矩阵估计，保持 OpenCL `warpAffine` 路径与输出语义不变。
 - 收敛非文本模型路径：Vision-CLIP / OCR / InsightFace 保持各自独立执行路径，但模型准入改为单活租约切换；文本 CLIP 仍常驻。
 - 收敛 RapidOCR 调用链：OCR 执行改为直接走 `RapidOCR.__call__` 与库内 `run_ocr_steps`，不再替换 stage session，也不再维护仓库内自定义 det/cls/rec 预处理与拼装分支。
+- 收敛 RapidOCR 并发路径：OCR 改为按 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 预建有界 `RapidOCR` 多实例池，每个 worker 独占一个库原生实例，避免共享 `InferRequest` 被全局锁串行后吞吐下降。
 - 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
 - 收敛 OpenVINO 同步推理调用：InsightFace PPP runner 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
 - 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
 - 修复 InsightFace 旧版本兼容问题：当构造阶段不支持 `providers` / `provider_options` / `allowed_modules` 参数时，运行时按兼容顺序重试实例化，再显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
 - 收敛 OCR 异步超时语义：OCR 的模型加载与租约切换不再占用执行超时窗口，并新增 `OCR_EXEC_TIMEOUT` 作为 OCR 专属执行超时覆盖；慢请求日志改为输出库内原生 CPU 路径的总耗时与关键配置。
+- 收敛 RapidOCR 无字图日志：对于确实不含文字的图片，服务会过滤 RapidOCR 自身 `"The text detection result is empty"` 预期 warning，保持 `/ocr` 返回空结果但不刷屏。
 - 收敛空闲内存兜底：默认连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留 Text-CLIP 常驻；业务端可通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖或关闭。
 - 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
 - 收敛 InsightFace 执行链路：`FaceAnalysis` 仅保留模型发现与 provider 初始化，检测/对齐/识别改为仓库内显式调用 PPP/OpenCL 路径，不再 monkey patch 第三方模块或对象方法。
 - 修复 InsightFace 检测参数兼容性：加载后会显式补齐 `SCRFD.det_thresh/nms_thresh/input_size/center_cache` 等运行时属性，并在 `FaceAnalysis.prepare()` 时显式传入 `det_thresh=0.5`，兼容旧版本对象缺字段场景。
+- 修复 InsightFace 识别输出 shape warning：当识别模型元数据仍声明静态 batch=`1` 时，运行时自动退回逐张识别，避免 ORT `VerifyOutputSizes` 对 `{1,512}` vs `{N,512}` 的重复告警。
 - 收敛 `/represent` 吞吐与 backlog：默认 worker 提升为有限并发，并新增 `INSIGHTFACE_MAX_WORKERS` / `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` 应用层限流；超时后先触发协作取消，避免后台线程脱离调用方继续堆积。
 - 修复图片请求总量控制：`/clip/img`、`/ocr`、`/represent` 现共享应用层图片名额池，默认且硬上限均为 `10`；超出时立即拒绝，避免 MT-Photos 客户端因积压过深触发超时取消。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
