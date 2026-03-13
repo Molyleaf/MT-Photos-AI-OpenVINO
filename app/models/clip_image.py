@@ -38,6 +38,8 @@ class ClipImageMixin:
     _clip_vision_host_tensor_enabled: bool
 
     if TYPE_CHECKING:
+        def _acquire_image_request_slot(self, label: str) -> None: ...
+        def _release_image_request_slot(self) -> None: ...
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
         def _build_openvino_preprocess_runner(self, **kwargs: Any) -> Any: ...
         def _safe_set_result(self, future: Future[Any], value: Any) -> None: ...
@@ -48,6 +50,10 @@ class ClipImageMixin:
         def _bind_non_text_lease_to_future(
             self,
             family: str,
+            future: Future[Any] | asyncio.Future[Any],
+        ) -> None: ...
+        def _bind_image_request_slot_to_future(
+            self,
             future: Future[Any] | asyncio.Future[Any],
         ) -> None: ...
         def _acquire_non_text_family_lease(self, family: str) -> bool: ...
@@ -344,35 +350,51 @@ class ClipImageMixin:
     def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
         _ = filename
         lease_bound = False
-        self._acquire_non_text_family_lease("vision")
+        image_slot_bound = False
+        self._acquire_image_request_slot("CLIP")
         try:
-            self._ensure_clip_vision_loaded()
-            payload = self._preprocess_clip_image_tensor(image)
-            task = self._submit_task(kind="clip_img", payload=payload)
-            self._bind_non_text_lease_to_future("vision", task.future)
-            lease_bound = True
-            return self._wait_task(task)
+            self._acquire_non_text_family_lease("vision")
+            try:
+                self._ensure_clip_vision_loaded()
+                payload = self._preprocess_clip_image_tensor(image)
+                task = self._submit_task(kind="clip_img", payload=payload)
+                self._bind_non_text_lease_to_future("vision", task.future)
+                self._bind_image_request_slot_to_future(task.future)
+                lease_bound = True
+                image_slot_bound = True
+                return self._wait_task(task)
+            finally:
+                if not lease_bound:
+                    self._release_non_text_family_lease("vision")
         finally:
-            if not lease_bound:
-                self._release_non_text_family_lease("vision")
+            if not image_slot_bound:
+                self._release_image_request_slot()
 
     async def get_image_embedding_async(
         self, image: np.ndarray, filename: str = "unknown"
     ) -> List[float]:
         _ = filename
         lease_bound = False
-        await self._acquire_non_text_family_lease_async("vision")
+        image_slot_bound = False
+        self._acquire_image_request_slot("CLIP")
         try:
-            await self._run_control(self._ensure_clip_vision_loaded)
-            payload = await self._run_in_executor(
-                self._shared_cpu_executor,
-                self._preprocess_clip_image_tensor,
-                image,
-            )
-            task = self._submit_task(kind="clip_img", payload=payload)
-            self._bind_non_text_lease_to_future("vision", task.future)
-            lease_bound = True
-            return await self._await_task(task)
+            await self._acquire_non_text_family_lease_async("vision")
+            try:
+                await self._run_control(self._ensure_clip_vision_loaded)
+                payload = await self._run_in_executor(
+                    self._shared_cpu_executor,
+                    self._preprocess_clip_image_tensor,
+                    image,
+                )
+                task = self._submit_task(kind="clip_img", payload=payload)
+                self._bind_non_text_lease_to_future("vision", task.future)
+                self._bind_image_request_slot_to_future(task.future)
+                lease_bound = True
+                image_slot_bound = True
+                return await self._await_task(task)
+            finally:
+                if not lease_bound:
+                    self._release_non_text_family_lease("vision")
         finally:
-            if not lease_bound:
-                self._release_non_text_family_lease("vision")
+            if not image_slot_bound:
+                self._release_image_request_slot()

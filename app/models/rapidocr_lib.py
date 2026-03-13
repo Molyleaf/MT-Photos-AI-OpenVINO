@@ -226,6 +226,8 @@ class RapidOCRMixin:
     _ocr_execution_timeout_seconds: int
 
     if TYPE_CHECKING:
+        def _acquire_image_request_slot(self, label: str) -> None: ...
+        def _release_image_request_slot(self) -> None: ...
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
         def _acquire_non_text_family_lease(self, family: str) -> bool: ...
         async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
@@ -1524,34 +1526,42 @@ class RapidOCRMixin:
         return self._ocr_result_from_raw(raw_result)
 
     def get_ocr_results(self, image: np.ndarray) -> OCRResult:
-        self._acquire_non_text_family_lease("ocr")
+        self._acquire_image_request_slot("OCR")
         try:
-            self._ensure_rapidocr_loaded()
-            self._acquire_admission(self._ocr_admission, "OCR")
+            self._acquire_non_text_family_lease("ocr")
             try:
-                return self._infer_ocr(image)
+                self._ensure_rapidocr_loaded()
+                self._acquire_admission(self._ocr_admission, "OCR")
+                try:
+                    return self._infer_ocr(image)
+                finally:
+                    self._ocr_admission.release()
             finally:
-                self._ocr_admission.release()
+                self._release_non_text_family_lease("ocr")
         finally:
-            self._release_non_text_family_lease("ocr")
+            self._release_image_request_slot()
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        await self._acquire_non_text_family_lease_async("ocr")
+        self._acquire_image_request_slot("OCR")
         cancel_event = threading.Event()
         try:
-            await self._run_control(self._ensure_rapidocr_loaded)
-            await self._acquire_admission_async(self._ocr_admission, "OCR")
+            await self._acquire_non_text_family_lease_async("ocr")
             try:
-                task: asyncio.Task[OCRResult] = asyncio.create_task(
-                    self._infer_ocr_async(image, cancel_event=cancel_event)
-                )
-                return await self._await_with_timeout_and_cooperative_cancel(
-                    task,
-                    cancel_event=cancel_event,
-                    timeout_seconds=self._ocr_execution_timeout_seconds,
-                    task_name="OCR task",
-                )
+                await self._run_control(self._ensure_rapidocr_loaded)
+                await self._acquire_admission_async(self._ocr_admission, "OCR")
+                try:
+                    task: asyncio.Task[OCRResult] = asyncio.create_task(
+                        self._infer_ocr_async(image, cancel_event=cancel_event)
+                    )
+                    return await self._await_with_timeout_and_cooperative_cancel(
+                        task,
+                        cancel_event=cancel_event,
+                        timeout_seconds=self._ocr_execution_timeout_seconds,
+                        task_name="OCR task",
+                    )
+                finally:
+                    self._ocr_admission.release()
             finally:
-                self._ocr_admission.release()
+                self._release_non_text_family_lease("ocr")
         finally:
-            self._release_non_text_family_lease("ocr")
+            self._release_image_request_slot()

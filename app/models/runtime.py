@@ -33,6 +33,7 @@ from .constants import (
     CLIP_INFERENCE_DEVICE,
     EXEC_TIMEOUT_SECONDS,
     LOG,
+    MAX_PENDING_IMAGE_REQUESTS,
     PROJECT_ROOT,
     QUEUE_MAX_SIZE,
     QUEUE_TIMEOUT_SECONDS,
@@ -131,6 +132,18 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_engine = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
+        self._queue_capacity = min(MAX_PENDING_IMAGE_REQUESTS, configured_queue_capacity)
+        if configured_queue_capacity > self._queue_capacity:
+            LOG.warning(
+                "INFERENCE_QUEUE_MAX_SIZE=%s exceeds MT-Photos safe limit %s; capping to %s.",
+                configured_queue_capacity,
+                MAX_PENDING_IMAGE_REQUESTS,
+                self._queue_capacity,
+            )
+        self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
+        self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
+        self._image_admission = _AdmissionController("image", self._queue_capacity)
         self._shared_cpu_executor = ThreadPoolExecutor(
             max_workers=max(2, min(8, os.cpu_count() or 4)),
             thread_name_prefix="ai-cpu",
@@ -167,9 +180,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
         self._condition = threading.Condition()
         self._normal_queue: Deque[_InferenceTask] = deque()
-        self._queue_capacity = max(1, QUEUE_MAX_SIZE)
-        self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
-        self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
         self._ocr_execution_timeout_seconds = max(
             1,
             _as_int(
@@ -218,10 +228,11 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._start_idle_release_monitor()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
+            self._image_admission.capacity,
             self._queue_capacity,
             self._queue_timeout_seconds,
             self._execution_timeout_seconds,
@@ -258,6 +269,16 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             default_capacity,
         )
         return max(1, min(self._queue_capacity, configured))
+
+    def _acquire_image_request_slot(self, label: str) -> None:
+        if self._image_admission.acquire(timeout=0.0):
+            return
+        raise RuntimeError(
+            f"{label} 图片请求总量已满（上限 {self._image_admission.capacity}），请稍后重试"
+        )
+
+    def _release_image_request_slot(self) -> None:
+        self._image_admission.release()
 
     def _start_background_prewarm(self) -> None:
         if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False):
@@ -552,6 +573,12 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         future: Future[Any] | asyncio.Future[Any],
     ) -> None:
         future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
+
+    def _bind_image_request_slot_to_future(
+        self,
+        future: Future[Any] | asyncio.Future[Any],
+    ) -> None:
+        future.add_done_callback(lambda _future: self._release_image_request_slot())
 
     def _has_loaded_non_text_models_locked(self) -> bool:
         return bool(

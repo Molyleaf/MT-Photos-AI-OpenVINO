@@ -150,6 +150,8 @@ class InsightFaceMixin:
     _execution_timeout_seconds: int
 
     if TYPE_CHECKING:
+        def _acquire_image_request_slot(self, label: str) -> None: ...
+        def _release_image_request_slot(self) -> None: ...
         def _build_openvino_preprocess_runner(
             self,
             runner_name: str,
@@ -834,37 +836,45 @@ class InsightFaceMixin:
         return results
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
-        self._acquire_non_text_family_lease("face")
+        self._acquire_image_request_slot("InsightFace")
         try:
-            self._ensure_face_loaded()
-            self._acquire_admission(self._face_admission, "InsightFace")
+            self._acquire_non_text_family_lease("face")
             try:
-                return self._infer_face(image)
+                self._ensure_face_loaded()
+                self._acquire_admission(self._face_admission, "InsightFace")
+                try:
+                    return self._infer_face(image)
+                finally:
+                    self._face_admission.release()
             finally:
-                self._face_admission.release()
+                self._release_non_text_family_lease("face")
         finally:
-            self._release_non_text_family_lease("face")
+            self._release_image_request_slot()
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        await self._acquire_non_text_family_lease_async("face")
+        self._acquire_image_request_slot("InsightFace")
         cancel_event = threading.Event()
         try:
-            await self._run_control(self._ensure_face_loaded)
-            await self._acquire_admission_async(self._face_admission, "InsightFace")
+            await self._acquire_non_text_family_lease_async("face")
             try:
-                future = self._run_in_executor(
-                    self._face_executor,
-                    self._infer_face,
-                    image,
-                    cancel_event,
-                )
-                return await self._await_with_timeout_and_cooperative_cancel(
-                    future,
-                    cancel_event=cancel_event,
-                    timeout_seconds=self._execution_timeout_seconds,
-                    task_name="Face task",
-                )
+                await self._run_control(self._ensure_face_loaded)
+                await self._acquire_admission_async(self._face_admission, "InsightFace")
+                try:
+                    future = self._run_in_executor(
+                        self._face_executor,
+                        self._infer_face,
+                        image,
+                        cancel_event,
+                    )
+                    return await self._await_with_timeout_and_cooperative_cancel(
+                        future,
+                        cancel_event=cancel_event,
+                        timeout_seconds=self._execution_timeout_seconds,
+                        task_name="Face task",
+                    )
+                finally:
+                    self._face_admission.release()
             finally:
-                self._face_admission.release()
+                self._release_non_text_family_lease("face")
         finally:
-            self._release_non_text_family_lease("face")
+            self._release_image_request_slot()

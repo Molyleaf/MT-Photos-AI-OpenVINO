@@ -21,7 +21,7 @@
 | `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO`                 | `AUTO`                             |
 | `CLIP_INFERENCE_DEVICE`             | 仅覆盖 QA-CLIP 设备；请求 `AUTO/GPU` 时需保证 GPU 可用，且会强制初始化 GPU Remote Context | 跟随 `INFERENCE_DEVICE`              |
 | `MODEL_PATH`                        | 模型根目录路径                                                   | `<repo>/models`                    |
-| `INFERENCE_QUEUE_MAX_SIZE`          | 推理队列长度                                                    | `64`                               |
+| `INFERENCE_QUEUE_MAX_SIZE`          | 跨 `/clip/img`、`/ocr`、`/represent` 共享的图片请求总名额（排队+执行）；运行时硬上限 `10`，超出会立即拒绝 | `10`                               |
 | `INFERENCE_TASK_TIMEOUT`            | 兼容旧配置的总超时基线；未显式设置新变量时用作排队超时默认值，并为执行超时提供下限 | `10`                               |
 | `INFERENCE_QUEUE_TIMEOUT`           | 非文本任务排队超时（秒）                                               | 跟随 `INFERENCE_TASK_TIMEOUT`       |
 | `INFERENCE_EXEC_TIMEOUT`            | 非文本任务执行超时（秒）；默认至少 `30` 秒                              | `max(30, INFERENCE_TASK_TIMEOUT)`  |
@@ -49,7 +49,7 @@
 | `RAPIDOCR_DET_LIMIT_TYPE`           | 检测缩放策略；默认 `max`，避免把小图放大到阈值导致时延异常                | `max`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `8`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `8`                                |
-| `OCR_MAX_CONCURRENT_REQUESTS`       | OCR 应用层最大并发请求数；用于限制 executor 积压并与 stage worker 对齐      | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
+| `OCR_MAX_CONCURRENT_REQUESTS`       | OCR 应用层最大并发请求数；用于限制 executor 积压并与 stage worker 对齐，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
 | `OCR_PREWARM_ENABLED`               | 是否启用一次性后台 RapidOCR 预热；预热完成后会立即释放 OCR 模型                 | `false`                             |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 一次性后台预热延迟（秒）；仅在 `OCR_PREWARM_ENABLED=true` 时生效      | `1.0`                               |
 | `NON_TEXT_IDLE_RELEASE_SECONDS`     | 60 秒未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace；`<=0` 表示关闭 | `60`                                |
@@ -57,7 +57,7 @@
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `INSIGHTFACE_MAX_WORKERS`           | `/represent` 应用层 worker 数；默认允许有限并发，避免单 worker 头阻塞        | `2`                                |
-| `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压                 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
+| `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口                                                      | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`  | `WARNING`                          |
@@ -70,6 +70,7 @@
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
+- 为避免 MT-Photos 客户端在积压时主动取消，服务会对 `/clip/img`、`/ocr`、`/represent` 共享一个图片请求名额池；默认值和运行时硬上限都是 `10`，第 `11` 张会立即失败而不是继续挂起等待。
 - RapidOCR 不再走全局单 worker 串行队列；检测、方向分类和识别阶段会分别进入独立执行通道，且三个 stage 的 worker 数默认对齐 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS`，避免 app 层只喂单路导致 OpenVINO request budget 空转。
 - 单张 `/ocr` 请求内部也会把 `cls/rec` 按 `cls_batch_num/rec_batch_num` 切成子批并发投递到现有 stage worker；因此 worker 数不再只对“多请求并发”生效，大图场景下也能把 GPU request budget 喂起来。
 - 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器；OCR/Face 的异步路径会先完成模型加载，再进入执行超时窗口。
@@ -173,6 +174,7 @@ cp docker-compose.example.yml docker-compose.yml
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 默认会收敛为 `det=GPU / cls=CPU / rec=CPU`，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
+- `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 

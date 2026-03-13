@@ -203,6 +203,7 @@
 7. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
 8. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
 9. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
+10. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
 ---
 
@@ -362,6 +363,7 @@
 - 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
 - 收敛 InsightFace 执行链路：`FaceAnalysis` 仅保留模型发现与 provider 初始化，检测/对齐/识别改为仓库内显式调用 PPP/OpenCL 路径，不再 monkey patch 第三方模块或对象方法。
 - 收敛 `/represent` 吞吐与 backlog：默认 worker 提升为有限并发，并新增 `INSIGHTFACE_MAX_WORKERS` / `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` 应用层限流；超时后先触发协作取消，避免后台线程脱离调用方继续堆积。
+- 修复图片请求总量控制：`/clip/img`、`/ocr`、`/represent` 现共享应用层图片名额池，默认且硬上限均为 `10`；超出时立即拒绝，避免 MT-Photos 客户端因积压过深触发超时取消。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
 - 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
 - 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。
@@ -386,7 +388,7 @@ services:
       - INSIGHTFACE_OV_DEVICE=AUTO
       - OPENCV_OPENCL_DEVICE=Intel:GPU:0
       - CLIP_IMAGE_BATCH=8
-      - INFERENCE_QUEUE_MAX_SIZE=64
+      - INFERENCE_QUEUE_MAX_SIZE=10
       - INFERENCE_TASK_TIMEOUT=10
       - INFERENCE_EXEC_TIMEOUT=30
       - OCR_EXEC_TIMEOUT=30
@@ -395,6 +397,7 @@ services:
 
 说明：
 - `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，RapidOCR 默认收敛为 `Det=GPU / Cls=CPU / Rec=CPU`，并仅在 det 预处理阶段启用 `OpenCV UMat + Intel OpenCL`；InsightFace EP/PPP 收敛到 `GPU`。
+- `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
