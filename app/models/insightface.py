@@ -4,9 +4,7 @@ import json
 import os
 import shutil
 import sys
-import types
-from concurrent.futures import Future, ThreadPoolExecutor
-from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -25,6 +23,8 @@ else:
     RepresentResult = _schemas.RepresentResult
 
 from .common import (
+    _AdmissionController,
+    _InferenceCancelled,
     _OpenVinoPreprocessRunner,
     _as_bool,
     _as_contiguous_bgr_uint8,
@@ -145,6 +145,7 @@ class InsightFaceMixin:
     _face_rec_ppp: Optional[_OpenVinoPreprocessRunner]
     _face_load_lock: Any
     _face_executor: ThreadPoolExecutor
+    _face_admission: _AdmissionController
     _execution_timeout_seconds: int
 
     if TYPE_CHECKING:
@@ -159,20 +160,29 @@ class InsightFaceMixin:
         ) -> _OpenVinoPreprocessRunner: ...
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
         def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
         def _release_non_text_family_lease(self, family: str) -> None: ...
+        def _acquire_admission(self, admission: _AdmissionController, label: str) -> None: ...
+        async def _acquire_admission_async(
+            self,
+            admission: _AdmissionController,
+            label: str,
+        ) -> None: ...
+        def _run_control(self, func: Any, *args: Any) -> asyncio.Future[Any]: ...
         @staticmethod
         def _run_in_executor(
             executor: ThreadPoolExecutor,
             func: Any,
             *args: Any,
         ) -> asyncio.Future[Any]: ...
-        def _bind_non_text_lease_to_future(
+        async def _await_with_timeout_and_cooperative_cancel(
             self,
-            family: str,
-            future: Future[Any] | asyncio.Future[Any],
-        ) -> None: ...
-        @staticmethod
-        def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
+            awaitable: asyncio.Future[Any] | asyncio.Task[Any],
+            *,
+            cancel_event: threading.Event,
+            timeout_seconds: float,
+            task_name: str,
+        ) -> Any: ...
 
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:
@@ -184,71 +194,48 @@ class InsightFaceMixin:
         )
 
     @staticmethod
-    def _patch_insightface_norm_crop_opencl() -> None:
-        from insightface.utils import face_align
-
-        if getattr(face_align, "_mt_opencl_norm_crop_patch", False):
-            return
-
-        def _estimate_norm_no_warning(
-            landmark: np.ndarray,
-            image_size: int = 112,
-            mode: str = "arcface",
-        ) -> np.ndarray:
-            _ = mode
-            return _estimate_insightface_norm_matrix(
-                landmark=landmark,
-                image_size=int(image_size),
+    def _align_face_opencl(
+        img: np.ndarray,
+        landmark: np.ndarray,
+        image_size: int,
+    ) -> np.ndarray:
+        matrix = _estimate_insightface_norm_matrix(landmark=landmark, image_size=int(image_size))
+        if matrix.shape != (2, 3):
+            raise RuntimeError(
+                "InsightFace estimate_norm returned invalid affine matrix shape: "
+                f"{matrix.shape}"
             )
+        source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
 
-        def _norm_crop_opencl(
-            img: np.ndarray,
-            landmark: np.ndarray,
-            image_size: int = 112,
-            mode: str = "arcface",
-        ) -> np.ndarray:
-            matrix = _estimate_norm_no_warning(landmark, image_size, mode)
-            if matrix.shape != (2, 3):
-                raise RuntimeError(
-                    "InsightFace estimate_norm returned invalid affine matrix shape: "
-                    f"{matrix.shape}"
-                )
-            source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
-
-            if not cv2.ocl.useOpenCL():
-                raise RuntimeError(
-                    "OpenCV OpenCL was disabled during InsightFace alignment. "
-                    "No silent fallback is allowed."
-                )
-            try:
-                warped_umat = cv2.warpAffine(
-                    _to_opencv_umat(source),
-                    matrix,
-                    (int(image_size), int(image_size)),
-                    borderValue=0.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "OpenCV OpenCL warpAffine failed in InsightFace alignment. "
-                    "No silent fallback is allowed."
-                ) from exc
-
-            if isinstance(warped_umat, cv2.UMat):
-                return _as_contiguous_bgr_uint8(warped_umat.get(), context="InsightFace alignment")
-            return _as_contiguous_bgr_uint8(
-                np.asarray(warped_umat),
-                context="InsightFace alignment",
+        if not cv2.ocl.useOpenCL():
+            raise RuntimeError(
+                "OpenCV OpenCL was disabled during InsightFace alignment. "
+                "No silent fallback is allowed."
             )
+        try:
+            warped_umat = cv2.warpAffine(
+                _to_opencv_umat(source),
+                matrix,
+                (int(image_size), int(image_size)),
+                borderValue=0.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenCV OpenCL warpAffine failed in InsightFace alignment. "
+                "No silent fallback is allowed."
+            ) from exc
 
-        face_align.estimate_norm = _estimate_norm_no_warning
-        face_align.norm_crop = _norm_crop_opencl
-        face_align._mt_opencl_norm_crop_patch = True
+        if isinstance(warped_umat, cv2.UMat):
+            return _as_contiguous_bgr_uint8(warped_umat.get(), context="InsightFace alignment")
+        return _as_contiguous_bgr_uint8(
+            np.asarray(warped_umat),
+            context="InsightFace alignment",
+        )
 
-    def _patch_face_detector_forward(
-        self,
+    @staticmethod
+    def _resolve_insightface_detector_helpers(
         det_model: Any,
-        preprocess_runner: _OpenVinoPreprocessRunner,
-    ) -> None:
+    ) -> Tuple[Any, Optional[Any]]:
         module = sys.modules.get(det_model.__class__.__module__)
         if module is None:
             raise RuntimeError(
@@ -260,103 +247,163 @@ class InsightFaceMixin:
             raise RuntimeError("InsightFace detector module missing distance2bbox helper.")
         if getattr(det_model, "use_kps", False) and distance2kps is None:
             raise RuntimeError("InsightFace detector module missing distance2kps helper.")
+        return distance2bbox, distance2kps
 
-        def _forward_with_ppp(model_self: Any, img: np.ndarray, threshold: float) -> Any:
-            scores_list: List[np.ndarray] = []
-            bboxes_list: List[np.ndarray] = []
-            kpss_list: List[np.ndarray] = []
+    def _run_insightface_detector_forward(self, det_model: Any, img: np.ndarray) -> Any:
+        preprocess_runner = self._face_det_ppp
+        if preprocess_runner is None:
+            raise RuntimeError("InsightFace detection PPP runner is not initialized.")
 
-            image_bgr = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace detector")
-            blob = preprocess_runner.run(image_bgr[np.newaxis, ...])
-            net_outs = model_self.session.run(model_self.output_names, {model_self.input_name: blob})
+        distance2bbox, distance2kps = self._resolve_insightface_detector_helpers(det_model)
+        scores_list: List[np.ndarray] = []
+        bboxes_list: List[np.ndarray] = []
+        kpss_list: List[np.ndarray] = []
 
-            input_height = int(blob.shape[2])
-            input_width = int(blob.shape[3])
-            fmc = model_self.fmc
-            batched_output = bool(getattr(model_self, "batched", False))
+        image_bgr = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace detector")
+        blob = preprocess_runner.run(image_bgr[np.newaxis, ...])
+        net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: blob})
 
-            for idx, stride in enumerate(model_self._feat_stride_fpn):
-                kps_preds: Optional[np.ndarray] = None
-                if batched_output:
-                    scores = net_outs[idx][0]
-                    bbox_preds = net_outs[idx + fmc][0] * stride
-                    if model_self.use_kps:
-                        kps_preds = net_outs[idx + fmc * 2][0] * stride
-                else:
-                    scores = net_outs[idx]
-                    bbox_preds = net_outs[idx + fmc] * stride
-                    if model_self.use_kps:
-                        kps_preds = net_outs[idx + fmc * 2] * stride
+        input_height = int(blob.shape[2])
+        input_width = int(blob.shape[3])
+        fmc = det_model.fmc
+        batched_output = bool(getattr(det_model, "batched", False))
 
-                height = input_height // stride
-                width = input_width // stride
-                key = (height, width, stride)
-                if key in model_self.center_cache:
-                    anchor_centers = model_self.center_cache[key]
-                else:
-                    anchor_centers = np.stack(
-                        np.mgrid[:height, :width][::-1], axis=-1
-                    ).astype(np.float32)
-                    anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-                    if model_self._num_anchors > 1:
-                        anchor_centers = np.stack([anchor_centers] * model_self._num_anchors, axis=1)
-                        anchor_centers = anchor_centers.reshape((-1, 2))
-                    if len(model_self.center_cache) < 100:
-                        model_self.center_cache[key] = anchor_centers
+        for idx, stride in enumerate(det_model._feat_stride_fpn):
+            kps_preds: Optional[np.ndarray] = None
+            if batched_output:
+                scores = net_outs[idx][0]
+                bbox_preds = net_outs[idx + fmc][0] * stride
+                if det_model.use_kps:
+                    kps_preds = net_outs[idx + fmc * 2][0] * stride
+            else:
+                scores = net_outs[idx]
+                bbox_preds = net_outs[idx + fmc] * stride
+                if det_model.use_kps:
+                    kps_preds = net_outs[idx + fmc * 2] * stride
 
-                pos_inds = np.where(scores >= threshold)[0]
-                bboxes = distance2bbox(anchor_centers, bbox_preds)
-                pos_scores = scores[pos_inds]
-                pos_bboxes = bboxes[pos_inds]
-                scores_list.append(pos_scores)
-                bboxes_list.append(pos_bboxes)
+            height = input_height // stride
+            width = input_width // stride
+            key = (height, width, stride)
+            if key in det_model.center_cache:
+                anchor_centers = det_model.center_cache[key]
+            else:
+                anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+                anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+                if det_model._num_anchors > 1:
+                    anchor_centers = np.stack([anchor_centers] * det_model._num_anchors, axis=1)
+                    anchor_centers = anchor_centers.reshape((-1, 2))
+                if len(det_model.center_cache) < 100:
+                    det_model.center_cache[key] = anchor_centers
 
-                if model_self.use_kps:
-                    if kps_preds is None:
-                        raise RuntimeError(
-                            "InsightFace detector returned no keypoint predictions "
-                            "for a keypoint-enabled model."
-                        )
-                    kpss = distance2kps(anchor_centers, kps_preds)
-                    kpss = kpss.reshape((kpss.shape[0], -1, 2))
-                    pos_kpss = kpss[pos_inds]
-                    kpss_list.append(pos_kpss)
+            pos_inds = np.where(scores >= det_model.det_thresh)[0]
+            bboxes = distance2bbox(anchor_centers, bbox_preds)
+            pos_scores = scores[pos_inds]
+            pos_bboxes = bboxes[pos_inds]
+            scores_list.append(pos_scores)
+            bboxes_list.append(pos_bboxes)
 
-            return scores_list, bboxes_list, kpss_list
+            if det_model.use_kps:
+                if kps_preds is None or distance2kps is None:
+                    raise RuntimeError(
+                        "InsightFace detector returned no keypoint predictions "
+                        "for a keypoint-enabled model."
+                    )
+                kpss = distance2kps(anchor_centers, kps_preds)
+                kpss = kpss.reshape((kpss.shape[0], -1, 2))
+                pos_kpss = kpss[pos_inds]
+                kpss_list.append(pos_kpss)
 
-        det_model.forward = types.MethodType(_forward_with_ppp, det_model)
+        return scores_list, bboxes_list, kpss_list
 
-    @staticmethod
-    def _patch_face_recognition_get_feat(
-        rec_model: Any,
-        preprocess_runner: _OpenVinoPreprocessRunner,
-    ) -> None:
-        def _get_feat_with_ppp(model_self: Any, imgs: Any) -> np.ndarray:
-            if not isinstance(imgs, list):
-                imgs = [imgs]
-            if not imgs:
-                return np.empty((0, 0), dtype=np.float32)
+    def _detect_faces(
+        self,
+        det_model: Any,
+        img: np.ndarray,
+        max_num: int = 0,
+        metric: str = "default",
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        assert det_model.input_size is not None
+        input_size = tuple(det_model.input_size)
+        image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
+        im_ratio = float(image.shape[0]) / float(image.shape[1])
+        model_ratio = float(input_size[1]) / float(input_size[0])
+        if im_ratio > model_ratio:
+            new_height = input_size[1]
+            new_width = int(new_height / im_ratio)
+        else:
+            new_width = input_size[0]
+            new_height = int(new_width * im_ratio)
+        det_scale = float(new_height) / float(image.shape[0])
+        resized_img = cv2.resize(image, (new_width, new_height))
+        det_img = np.zeros((input_size[1], input_size[0], 3), dtype=np.uint8)
+        det_img[:new_height, :new_width, :] = resized_img
 
-            prepared = [
-                _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
-                for item in imgs
-            ]
-            try:
-                batch = np.stack(prepared, axis=0)
-                blob = preprocess_runner.run(batch)
-                return model_self.session.run(model_self.output_names, {model_self.input_name: blob})[0]
-            except ValueError:
-                features: List[np.ndarray] = []
-                for item in prepared:
-                    blob = preprocess_runner.run(item[np.newaxis, ...])
-                    single = model_self.session.run(
-                        model_self.output_names,
-                        {model_self.input_name: blob},
-                    )[0]
-                    features.append(np.asarray(single))
-                return np.concatenate(features, axis=0)
+        scores_list, bboxes_list, kpss_list = self._run_insightface_detector_forward(det_model, det_img)
+        if not scores_list:
+            return np.empty((0, 5), dtype=np.float32), None
 
-        rec_model.get_feat = types.MethodType(_get_feat_with_ppp, rec_model)
+        scores = np.vstack(scores_list)
+        scores_ravel = scores.ravel()
+        if scores_ravel.size == 0:
+            return np.empty((0, 5), dtype=np.float32), None
+
+        order = scores_ravel.argsort()[::-1]
+        bboxes = np.vstack(bboxes_list) / det_scale
+        if det_model.use_kps and kpss_list:
+            kpss = np.vstack(kpss_list) / det_scale
+        else:
+            kpss = None
+        pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
+        pre_det = pre_det[order, :]
+        keep = det_model.nms(pre_det)
+        det = pre_det[keep, :]
+        if kpss is not None:
+            kpss = kpss[order, :, :]
+            kpss = kpss[keep, :, :]
+        if max_num > 0 and det.shape[0] > max_num:
+            area = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
+            img_center = image.shape[0] // 2, image.shape[1] // 2
+            offsets = np.vstack(
+                [
+                    (det[:, 0] + det[:, 2]) / 2 - img_center[1],
+                    (det[:, 1] + det[:, 3]) / 2 - img_center[0],
+                ]
+            )
+            offset_dist_squared = np.sum(np.power(offsets, 2.0), 0)
+            values = area if metric == "max" else area - offset_dist_squared * 2.0
+            bindex = np.argsort(values)[::-1][:max_num]
+            det = det[bindex, :]
+            if kpss is not None:
+                kpss = kpss[bindex, :]
+        return det, kpss
+
+    def _get_face_embeddings(self, rec_model: Any, aligned_faces: List[np.ndarray]) -> np.ndarray:
+        preprocess_runner = self._face_rec_ppp
+        if preprocess_runner is None:
+            raise RuntimeError("InsightFace recognition PPP runner is not initialized.")
+        if not aligned_faces:
+            return np.empty((0, 0), dtype=np.float32)
+
+        prepared = [
+            _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
+            for item in aligned_faces
+        ]
+        try:
+            batch = np.stack(prepared, axis=0)
+            blob = preprocess_runner.run(batch)
+            return np.asarray(
+                rec_model.session.run(rec_model.output_names, {rec_model.input_name: blob})[0]
+            )
+        except ValueError:
+            features: List[np.ndarray] = []
+            for item in prepared:
+                blob = preprocess_runner.run(item[np.newaxis, ...])
+                single = rec_model.session.run(
+                    rec_model.output_names,
+                    {rec_model.input_name: blob},
+                )[0]
+                features.append(np.asarray(single))
+            return np.concatenate(features, axis=0) if features else np.empty((0, 0), dtype=np.float32)
 
     def _attach_insightface_preprocess(self, face_app: FaceAnalysis, device_name: str) -> None:
         det_model = getattr(face_app, "det_model", None)
@@ -384,11 +431,8 @@ class InsightFaceMixin:
             std_values=_to_channel_triplet(getattr(rec_model, "input_std", 127.5)),
         )
 
-        self._patch_face_detector_forward(det_model, self._face_det_ppp)
-        self._patch_face_recognition_get_feat(rec_model, self._face_rec_ppp)
         self._enable_insightface_opencl_alignment()
-        self._patch_insightface_norm_crop_opencl()
-        LOG.info("InsightFace preprocessing patched: OpenCV(OpenCL align) + OpenVINO PPP.")
+        LOG.info("InsightFace preprocessing configured: OpenCV(OpenCL align) + OpenVINO PPP.")
 
     def _resolve_insightface_root(self) -> Path:
         candidate_roots = (self.insightface_model_root, self.insightface_root)
@@ -695,13 +739,15 @@ class InsightFaceMixin:
             }
             self._face_engine = face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s face_workers=%s face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 provider_options,
                 provider_runtime,
                 ppp_execution_devices,
+                getattr(self._face_executor, "_max_workers", "unknown"),
+                self._face_admission.capacity,
                 root_for_runtime,
             )
         except Exception as exc:
@@ -713,29 +759,75 @@ class InsightFaceMixin:
                 "No silent fallback is allowed."
             ) from exc
 
-    def _infer_face(self, image: np.ndarray) -> List[RepresentResult]:
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: Optional[threading.Event]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _InferenceCancelled("Face task cancelled")
+
+    def _infer_face(
+        self,
+        image: np.ndarray,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[RepresentResult]:
         if self._face_engine is None:
             raise RuntimeError("Face model is not loaded.")
 
+        det_model = getattr(self._face_engine, "det_model", None)
+        rec_model = getattr(self._face_engine, "models", {}).get("recognition")
+        if det_model is None or rec_model is None:
+            raise RuntimeError("InsightFace detection/recognition model not found.")
+
         face_input = _as_contiguous_bgr_uint8(image, context="InsightFace")
-        faces = self._face_engine.get(face_input)
-        if not faces:
+        self._raise_if_cancelled(cancel_event)
+        detections, kpss = self._detect_faces(det_model, face_input, max_num=0, metric="default")
+        if detections.shape[0] == 0:
             return []
 
+        rec_image_size = int(rec_model.input_size[0])
+        aligned_faces: List[np.ndarray] = []
+        face_meta: List[Tuple[np.ndarray, float]] = []
+        for index in range(detections.shape[0]):
+            self._raise_if_cancelled(cancel_event)
+            bbox = np.asarray(detections[index, 0:4], dtype=np.float32)
+            det_score = float(detections[index, 4])
+            if kpss is None:
+                raise RuntimeError(
+                    "InsightFace detection returned no landmarks for recognition. "
+                    "No silent fallback is allowed."
+                )
+            aligned_faces.append(
+                self._align_face_opencl(face_input, np.asarray(kpss[index]), rec_image_size)
+            )
+            face_meta.append((bbox, det_score))
+
+        self._raise_if_cancelled(cancel_event)
+        embeddings = self._get_face_embeddings(rec_model, aligned_faces)
+        if embeddings.shape[0] != len(face_meta):
+            raise RuntimeError(
+                "InsightFace recognition output mismatch: "
+                f"expected={len(face_meta)} got={embeddings.shape[0]}"
+            )
+
         results: List[RepresentResult] = []
-        for face in faces:
-            bbox = np.array(face.bbox).astype(int)
+        for index, (bbox, det_score) in enumerate(face_meta):
+            self._raise_if_cancelled(cancel_event)
+            embedding = np.asarray(embeddings[index], dtype=np.float32).reshape(-1)
+            embedding_norm = float(np.linalg.norm(embedding))
+            if embedding_norm <= 0.0:
+                raise RuntimeError("InsightFace recognition produced zero-norm embedding.")
+            normed_embedding = embedding / embedding_norm
+            bbox = np.array(bbox).astype(int)
             x1, y1, x2, y2 = bbox
             results.append(
                 RepresentResult(
-                    embedding=[float(value) for value in face.normed_embedding],
+                    embedding=[float(value) for value in normed_embedding],
                     facial_area=FacialArea(
                         x=int(x1),
                         y=int(y1),
                         w=int(x2 - x1),
                         h=int(y2 - y1),
                     ),
-                    face_confidence=float(face.det_score),
+                    face_confidence=float(det_score),
                 )
             )
         return results
@@ -744,33 +836,34 @@ class InsightFaceMixin:
         self._acquire_non_text_family_lease("face")
         try:
             self._ensure_face_loaded()
-            return self._infer_face(image)
+            self._acquire_admission(self._face_admission, "InsightFace")
+            try:
+                return self._infer_face(image)
+            finally:
+                self._face_admission.release()
         finally:
             self._release_non_text_family_lease("face")
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        lease_bound = False
-        await asyncio.to_thread(self._acquire_non_text_family_lease, "face")
+        await self._acquire_non_text_family_lease_async("face")
+        cancel_event = threading.Event()
         try:
-            await asyncio.to_thread(self._ensure_face_loaded)
-            future = self._run_in_executor(self._face_executor, self._infer_face, image)
-            self._bind_non_text_lease_to_future("face", future)
-            lease_bound = True
+            await self._run_control(self._ensure_face_loaded)
+            await self._acquire_admission_async(self._face_admission, "InsightFace")
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(future),
-                    timeout=self._execution_timeout_seconds,
+                future = self._run_in_executor(
+                    self._face_executor,
+                    self._infer_face,
+                    image,
+                    cancel_event,
                 )
-            except asyncio.TimeoutError as exc:
-                future.add_done_callback(
-                    partial(self._log_detached_async_task_failure, task_name="Face task")
+                return await self._await_with_timeout_and_cooperative_cancel(
+                    future,
+                    cancel_event=cancel_event,
+                    timeout_seconds=self._execution_timeout_seconds,
+                    task_name="Face task",
                 )
-                raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
-            except asyncio.CancelledError:
-                future.add_done_callback(
-                    partial(self._log_detached_async_task_failure, task_name="Face task")
-                )
-                raise
+            finally:
+                self._face_admission.release()
         finally:
-            if not lease_bound:
-                self._release_non_text_family_lease("face")
+            self._release_non_text_family_lease("face")

@@ -2,7 +2,7 @@ import asyncio
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -51,7 +51,13 @@ class ClipImageMixin:
             future: Future[Any] | asyncio.Future[Any],
         ) -> None: ...
         def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
         def _release_non_text_family_lease(self, family: str) -> None: ...
+        def _run_control(
+            self,
+            func: Callable[..., Any],
+            *args: Any,
+        ) -> asyncio.Future[Any]: ...
         @staticmethod
         def _run_in_executor(
             executor: ThreadPoolExecutor,
@@ -355,9 +361,9 @@ class ClipImageMixin:
     ) -> List[float]:
         _ = filename
         lease_bound = False
-        await asyncio.to_thread(self._acquire_non_text_family_lease, "vision")
+        await self._acquire_non_text_family_lease_async("vision")
         try:
-            await asyncio.to_thread(self._ensure_clip_vision_loaded)
+            await self._run_control(self._ensure_clip_vision_loaded)
             payload = await self._run_in_executor(
                 self._shared_cpu_executor,
                 self._preprocess_clip_image_tensor,

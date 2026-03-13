@@ -1,3 +1,4 @@
+import asyncio
 import os
 import socketserver
 import threading
@@ -467,6 +468,65 @@ class _OpenVinoPreprocessRunner:
             raise RuntimeError(
                 f"{self.runner_name} PPP output dtype mismatch: expected=float32 got={output.dtype}"
             )
+
+
+class _InferenceCancelled(RuntimeError):
+    pass
+
+
+class _AdmissionController:
+    def __init__(self, name: str, capacity: int) -> None:
+        self.name = str(name)
+        self._capacity = max(1, int(capacity))
+        self._active = 0
+        self._condition = threading.Condition()
+
+    @property
+    def capacity(self) -> int:
+        with self._condition:
+            return self._capacity
+
+    def resize(self, capacity: int) -> None:
+        with self._condition:
+            self._capacity = max(1, int(capacity))
+            self._condition.notify_all()
+
+    def acquire(self, timeout: Optional[float]) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while self._active >= self._capacity:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    self._condition.wait(timeout=remaining)
+                else:
+                    self._condition.wait()
+            self._active += 1
+            return True
+
+    async def acquire_async(self, timeout: Optional[float]) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._condition:
+                if self._active < self._capacity:
+                    self._active += 1
+                    return True
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                await asyncio.sleep(min(PROCESS_LOCK_POLL_SECONDS, remaining))
+            else:
+                await asyncio.sleep(PROCESS_LOCK_POLL_SECONDS)
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active <= 0:
+                return
+            self._active -= 1
+            self._condition.notify_all()
 
 
 class _TextClipRpcServer(socketserver.TCPServer):

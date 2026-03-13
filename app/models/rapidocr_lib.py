@@ -4,7 +4,6 @@ import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
@@ -15,6 +14,7 @@ import openvino as ov
 import yaml
 from rapidocr import RapidOCR
 from rapidocr.ch_ppocr_rec.main import LangRec, VisRes, reorder_bidi_for_display
+from rapidocr.inference_engine.base import InferSession
 from rapidocr.main import RapidOCRError, TextClsOutput, TextDetOutput, TextRecOutput
 from rapidocr.utils.process_img import apply_vertical_padding, get_rotate_crop_image
 from rapidocr.utils.typings import EngineType
@@ -29,6 +29,8 @@ else:
     OCRResult = _schemas.OCRResult
 
 from .common import (
+    _AdmissionController,
+    _InferenceCancelled,
     _as_bool,
     _as_contiguous_bgr_uint8,
     _as_int,
@@ -81,70 +83,21 @@ def _empty_text_rec_output() -> TextRecOutput:
     )
 
 
-def _patch_rapidocr_openvino_multi_output() -> None:
-    try:
-        from rapidocr.inference_engine.openvino.main import OpenVINOError, OpenVINOInferSession
-    except Exception:
-        return
+class _RapidOCROpenVINOInferSession(InferSession):
+    def __init__(self, cfg: Any):
+        from rapidocr.inference_engine.openvino.main import CPUConfig, Core, OpenVINOError
 
-    if getattr(OpenVINOInferSession, "_mt_multi_output_patch", False):
-        return
-
-    def _get_thread_local_request(self: Any, compiled_model: ov.CompiledModel) -> ov.InferRequest:
-        request_local = getattr(self, "_mt_request_local", None)
-        if request_local is None:
-            request_local = threading.local()
-            self._mt_request_local = request_local
-
-        request = getattr(request_local, "request", None)
-        if request is None:
-            request = compiled_model.create_infer_request()
-            request_local.request = request
-        return request
-
-    def _patched_call(self: Any, input_content: np.ndarray) -> Any:
-        try:
-            prepared = np.ascontiguousarray(input_content)
-            compiled_model = getattr(self, "_mt_compiled_model", None)
-            if compiled_model is None:
-                session = getattr(self, "session", None)
-                get_compiled_model = getattr(session, "get_compiled_model", None)
-                if callable(get_compiled_model):
-                    compiled_model = get_compiled_model()
-                    self._mt_compiled_model = compiled_model
-            if compiled_model is None:
-                self.session.infer(inputs=[prepared])
-                return np.asarray(self.session.get_output_tensor().data)
-
-            infer_request = _get_thread_local_request(self, compiled_model)
-            infer_request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
-            infer_request.infer()
-            return np.asarray(infer_request.get_output_tensor(0).data)
-        except Exception as exc:
-            error_info = traceback.format_exc()
-            raise OpenVINOError(error_info) from exc
-
-    OpenVINOInferSession.__call__ = _patched_call  # type: ignore[assignment]
-    OpenVINOInferSession._mt_multi_output_patch = True  # type: ignore[attr-defined]
-
-
-def _patch_rapidocr_openvino_device_selection() -> None:
-    try:
-        from rapidocr.inference_engine.openvino.main import CPUConfig, Core, OpenVINOInferSession
-    except Exception:
-        return
-
-    if getattr(OpenVINOInferSession, "_mt_device_patch", False):
-        return
-
-    def _patched_init(self: Any, cfg: Any) -> None:
+        self._openvino_error_cls = OpenVINOError
         engine_cfg = cfg.get("engine_cfg", {}) or {}
         stage_device = cfg.get("device_name", None)
         configured_device = _normalize_non_text_openvino_device(
             str(
                 stage_device
                 if stage_device not in (None, "")
-                else engine_cfg.get("device_name", os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE))
+                else engine_cfg.get(
+                    "device_name",
+                    os.environ.get("RAPIDOCR_DEVICE", INFERENCE_DEVICE),
+                )
             )
         )
         core = Core()
@@ -209,12 +162,48 @@ def _patch_rapidocr_openvino_device_selection() -> None:
         self._mt_configured_device_name = configured_device
         self._mt_execution_devices = tuple(_get_compiled_model_execution_devices(compiled_model))
 
-    OpenVINOInferSession.__init__ = _patched_init  # type: ignore[assignment]
-    OpenVINOInferSession._mt_device_patch = True  # type: ignore[attr-defined]
+    def _get_request(self) -> ov.InferRequest:
+        request = getattr(self._mt_request_local, "request", None)
+        if request is None:
+            request = self._mt_compiled_model.create_infer_request()
+            self._mt_request_local.request = request
+        return request
 
+    def __call__(self, input_content: np.ndarray) -> np.ndarray:
+        try:
+            prepared = np.ascontiguousarray(input_content)
+            infer_request = self._get_request()
+            infer_request.set_input_tensor(0, ov.Tensor(prepared, shared_memory=True))
+            infer_request.infer()
+            return np.asarray(infer_request.get_output_tensor(0).data)
+        except Exception as exc:
+            error_info = traceback.format_exc()
+            raise self._openvino_error_cls(error_info) from exc
 
-_patch_rapidocr_openvino_multi_output()
-_patch_rapidocr_openvino_device_selection()
+    def have_key(self, key: str = "character") -> bool:
+        try:
+            self.get_character_list(key)
+            return True
+        except Exception:
+            return False
+
+    def get_character_list(self, key: str = "character") -> List[str]:
+        framework_info = self.get_rt_info_framework()
+        if framework_info is None:
+            raise self._openvino_error_cls("Failed to get runtime framework info")
+        if key not in framework_info:
+            raise self._openvino_error_cls(f"Key '{key}' not found in framework info")
+        value_node = framework_info[key]
+        value = getattr(value_node, "value", None)
+        if value is None:
+            raise self._openvino_error_cls(f"Value is None for key '{key}'")
+        return str(value).splitlines()
+
+    def get_rt_info_framework(self) -> Any:
+        rt_info = self.model.get_rt_info()
+        if "framework" not in rt_info:
+            return None
+        return rt_info["framework"]
 
 
 class RapidOCRMixin:
@@ -233,12 +222,25 @@ class RapidOCRMixin:
     _ocr_cls_executor: ThreadPoolExecutor
     _ocr_rec_executor: ThreadPoolExecutor
     _shared_cpu_executor: ThreadPoolExecutor
+    _ocr_admission: _AdmissionController
     _ocr_execution_timeout_seconds: int
 
     if TYPE_CHECKING:
         def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
         def _acquire_non_text_family_lease(self, family: str) -> bool: ...
+        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
         def _release_non_text_family_lease(self, family: str) -> None: ...
+        def _acquire_admission(self, admission: _AdmissionController, label: str) -> None: ...
+        async def _acquire_admission_async(
+            self,
+            admission: _AdmissionController,
+            label: str,
+        ) -> None: ...
+        def _run_control(
+            self,
+            func: Any,
+            *args: Any,
+        ) -> asyncio.Future[Any]: ...
         @staticmethod
         def _run_in_executor(
             executor: ThreadPoolExecutor,
@@ -250,6 +252,14 @@ class RapidOCRMixin:
             family: str,
             future: Future[Any] | asyncio.Future[Any],
         ) -> None: ...
+        async def _await_with_timeout_and_cooperative_cancel(
+            self,
+            awaitable: asyncio.Future[Any] | asyncio.Task[Any],
+            *,
+            cancel_event: threading.Event,
+            timeout_seconds: float,
+            task_name: str,
+        ) -> Any: ...
         @staticmethod
         def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
 
@@ -546,6 +556,7 @@ class RapidOCRMixin:
 
     def _reconfigure_rapidocr_stage_executors(self, cfg: Dict[str, Any]) -> None:
         worker_count = self._resolve_rapidocr_stage_worker_count(cfg)
+        self._ocr_admission.resize(self._resolve_ocr_request_capacity(worker_count))
         if worker_count == self._ocr_stage_worker_count:
             return
 
@@ -591,6 +602,21 @@ class RapidOCRMixin:
                 f"{', '.join(backend_errors)}. No silent fallback is allowed."
             )
 
+    @staticmethod
+    def _configure_rapidocr_openvino_sessions(engine: RapidOCR) -> None:
+        cfg = getattr(engine, "cfg", None)
+        if cfg is None:
+            raise RuntimeError("RapidOCR initialized without runtime cfg metadata.")
+
+        stage_sessions = {
+            "det": _RapidOCROpenVINOInferSession(cfg.Det),
+            "cls": _RapidOCROpenVINOInferSession(cfg.Cls),
+            "rec": _RapidOCROpenVINOInferSession(cfg.Rec),
+        }
+        engine.text_det.session = stage_sessions["det"]
+        engine.text_cls.session = stage_sessions["cls"]
+        engine.text_rec.session = stage_sessions["rec"]
+
     def _instantiate_rapidocr(self, params: Dict[str, Any]) -> RapidOCR:
         rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "AUTO")).upper()
         config_path = self._require_rapidocr_config_path()
@@ -601,6 +627,7 @@ class RapidOCRMixin:
                 f"RapidOCR 初始化失败，无法以 OpenVINO({rapidocr_device}) 配置启动。"
             ) from exc
         self._validate_rapidocr_backend(engine)
+        self._configure_rapidocr_openvino_sessions(engine)
         return engine
 
     @staticmethod
@@ -901,7 +928,7 @@ class RapidOCRMixin:
             )
         LOG.info(
             "RapidOCR ready: config=%s device=%s stage_devices=%s stage_runtime_devices=%s exec_devices=%s preprocess_backends=%s opencl_device=%s hint=%s use_cls=%s max_side_len=%s "
-            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_stage_workers=%s",
+            "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_stage_workers=%s ocr_admission=%s",
             self.rapidocr_config_path,
             config.get("device_name"),
             {
@@ -929,6 +956,7 @@ class RapidOCRMixin:
             config.get("rec_batch_num"),
             config.get("cls_batch_num"),
             self._ocr_stage_worker_count,
+            self._ocr_admission.capacity,
         )
 
     def _unload_rapidocr_model_locked(self) -> None:
@@ -1026,15 +1054,47 @@ class RapidOCRMixin:
         boxes = np.asarray(det_boxes, dtype=np.float32)
         if boxes.size == 0:
             return []
-        futures = [
-            self._shared_cpu_executor.submit(
-                get_rotate_crop_image,
+        return [
+            get_rotate_crop_image(
                 image,
                 np.array(box, dtype=np.float32, copy=True),
             )
             for box in boxes
         ]
-        return [future.result() for future in futures]
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: Optional[threading.Event]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _InferenceCancelled("OCR task cancelled")
+
+    async def _rapidocr_crop_regions_async(
+        self,
+        image: np.ndarray,
+        det_boxes: np.ndarray,
+        cancel_event: Optional[threading.Event],
+    ) -> List[np.ndarray]:
+        boxes = np.asarray(det_boxes, dtype=np.float32)
+        if boxes.size == 0:
+            return []
+
+        max_inflight = max(1, getattr(self._shared_cpu_executor, "_max_workers", 1))
+        cropped: List[np.ndarray] = []
+        for start in range(0, len(boxes), max_inflight):
+            self._raise_if_cancelled(cancel_event)
+            current_boxes = boxes[start : start + max_inflight]
+            current_results = await asyncio.gather(
+                *[
+                    self._run_in_executor(
+                        self._shared_cpu_executor,
+                        get_rotate_crop_image,
+                        image,
+                        np.array(box, dtype=np.float32, copy=True),
+                    )
+                    for box in current_boxes
+                ]
+            )
+            cropped.extend(current_results)
+        return cropped
 
     @staticmethod
     def _rapidocr_classify_single_image(classifier: Any, image: np.ndarray) -> Tuple[str, float]:
@@ -1217,6 +1277,7 @@ class RapidOCRMixin:
         self,
         engine: RapidOCR,
         images: List[np.ndarray],
+        cancel_event: Optional[threading.Event],
     ) -> Tuple[List[np.ndarray], TextClsOutput]:
         start_time = time.perf_counter()
         img_list = list(images)
@@ -1228,18 +1289,24 @@ class RapidOCRMixin:
             img_list,
             engine.text_cls.cls_batch_num,
         )
-        batch_outputs = await asyncio.gather(
-            *[
-                self._run_in_executor(
-                    self._ocr_cls_executor,
-                    self._rapidocr_classify_batch,
-                    engine,
-                    img_list,
-                    batch_indices,
+        batch_outputs = []
+        max_inflight = max(1, self._ocr_stage_worker_count)
+        for start in range(0, len(batch_indices_list), max_inflight):
+            self._raise_if_cancelled(cancel_event)
+            batch_outputs.extend(
+                await asyncio.gather(
+                    *[
+                        self._run_in_executor(
+                            self._ocr_cls_executor,
+                            self._rapidocr_classify_batch,
+                            engine,
+                            img_list,
+                            batch_indices,
+                        )
+                        for batch_indices in batch_indices_list[start : start + max_inflight]
+                    ]
                 )
-                for batch_indices in batch_indices_list
-            ]
-        )
+            )
 
         cls_res: List[Tuple[str, float]] = [("", 0.0)] * len(img_list)
         for batch_indices, rotated_images, batch_results in batch_outputs:
@@ -1266,6 +1333,7 @@ class RapidOCRMixin:
         self,
         engine: RapidOCR,
         images: List[np.ndarray],
+        cancel_event: Optional[threading.Event],
     ) -> TextRecOutput:
         start_time = time.perf_counter()
         img_list = list(images)
@@ -1276,18 +1344,24 @@ class RapidOCRMixin:
             img_list,
             engine.text_rec.rec_batch_num,
         )
-        batch_outputs = await asyncio.gather(
-            *[
-                self._run_in_executor(
-                    self._ocr_rec_executor,
-                    self._rapidocr_recognize_batch,
-                    engine,
-                    img_list,
-                    batch_indices,
+        batch_outputs = []
+        max_inflight = max(1, self._ocr_stage_worker_count)
+        for start in range(0, len(batch_indices_list), max_inflight):
+            self._raise_if_cancelled(cancel_event)
+            batch_outputs.extend(
+                await asyncio.gather(
+                    *[
+                        self._run_in_executor(
+                            self._ocr_rec_executor,
+                            self._rapidocr_recognize_batch,
+                            engine,
+                            img_list,
+                            batch_indices,
+                        )
+                        for batch_indices in batch_indices_list[start : start + max_inflight]
+                    ]
                 )
-                for batch_indices in batch_indices_list
-            ]
-        )
+            )
 
         texts: List[str] = [""] * len(img_list)
         scores: List[float] = [0.0] * len(img_list)
@@ -1326,7 +1400,11 @@ class RapidOCRMixin:
             viser=viser,
         )
 
-    async def _infer_ocr_async(self, image: np.ndarray) -> OCRResult:
+    async def _infer_ocr_async(
+        self,
+        image: np.ndarray,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> OCRResult:
         if self._rapidocr_engine is None:
             raise RuntimeError("RapidOCR model is not loaded.")
 
@@ -1334,6 +1412,7 @@ class RapidOCRMixin:
         total_started_at = time.perf_counter()
         ori_img = _as_contiguous_bgr_uint8(image, context="OCR")
         det_ms = crop_ms = cls_ms = rec_ms = 0.0
+        self._raise_if_cancelled(cancel_event)
         stage_started_at = time.perf_counter()
         img, op_record = await self._run_in_executor(
             self._shared_cpu_executor,
@@ -1348,6 +1427,7 @@ class RapidOCRMixin:
 
         if engine.use_det:
             try:
+                self._raise_if_cancelled(cancel_event)
                 stage_started_at = time.perf_counter()
                 img, op_record, det_res = await self._run_in_executor(
                     self._ocr_det_executor,
@@ -1363,11 +1443,10 @@ class RapidOCRMixin:
             if det_res.boxes is None:
                 return OCRResult(texts=[], scores=[], boxes=[])
             stage_started_at = time.perf_counter()
-            cropped_img_list = await self._run_in_executor(
-                self._shared_cpu_executor,
-                self._rapidocr_crop_regions,
+            cropped_img_list = await self._rapidocr_crop_regions_async(
                 img,
                 det_res.boxes,
+                cancel_event,
             )
             crop_ms = (time.perf_counter() - stage_started_at) * 1000.0
         else:
@@ -1375,10 +1454,12 @@ class RapidOCRMixin:
 
         if engine.use_cls:
             try:
+                self._raise_if_cancelled(cancel_event)
                 stage_started_at = time.perf_counter()
                 cls_img_list, cls_res = await self._rapidocr_cls_and_rotate_async(
                     engine,
                     cropped_img_list,
+                    cancel_event,
                 )
                 cls_ms = (time.perf_counter() - stage_started_at) * 1000.0
             except RapidOCRError as exc:
@@ -1389,16 +1470,19 @@ class RapidOCRMixin:
 
         if engine.use_rec:
             try:
+                self._raise_if_cancelled(cancel_event)
                 stage_started_at = time.perf_counter()
                 rec_res = await self._rapidocr_recognize_async(
                     engine,
                     cls_img_list,
+                    cancel_event,
                 )
                 rec_ms = (time.perf_counter() - stage_started_at) * 1000.0
             except RapidOCRError as exc:
                 LOG.warning(exc)
                 return OCRResult(texts=[], scores=[], boxes=[])
 
+        self._raise_if_cancelled(cancel_event)
         stage_started_at = time.perf_counter()
         raw_result = await self._run_in_executor(
             self._shared_cpu_executor,
@@ -1443,35 +1527,31 @@ class RapidOCRMixin:
         self._acquire_non_text_family_lease("ocr")
         try:
             self._ensure_rapidocr_loaded()
-            return self._infer_ocr(image)
+            self._acquire_admission(self._ocr_admission, "OCR")
+            try:
+                return self._infer_ocr(image)
+            finally:
+                self._ocr_admission.release()
         finally:
             self._release_non_text_family_lease("ocr")
 
     async def get_ocr_results_async(self, image: np.ndarray) -> OCRResult:
-        lease_bound = False
-        await asyncio.to_thread(self._acquire_non_text_family_lease, "ocr")
+        await self._acquire_non_text_family_lease_async("ocr")
+        cancel_event = threading.Event()
         try:
-            await asyncio.to_thread(self._ensure_rapidocr_loaded)
-            task: asyncio.Task[OCRResult] = asyncio.create_task(self._infer_ocr_async(image))
-            self._bind_non_text_lease_to_future("ocr", task)
-            lease_bound = True
+            await self._run_control(self._ensure_rapidocr_loaded)
+            await self._acquire_admission_async(self._ocr_admission, "OCR")
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=self._ocr_execution_timeout_seconds,
+                task: asyncio.Task[OCRResult] = asyncio.create_task(
+                    self._infer_ocr_async(image, cancel_event=cancel_event)
                 )
-            except asyncio.TimeoutError as exc:
-                task.add_done_callback(
-                    partial(self._log_detached_async_task_failure, task_name="OCR task")
+                return await self._await_with_timeout_and_cooperative_cancel(
+                    task,
+                    cancel_event=cancel_event,
+                    timeout_seconds=self._ocr_execution_timeout_seconds,
+                    task_name="OCR task",
                 )
-                raise RuntimeError(
-                    f"推理任务执行超时（>{self._ocr_execution_timeout_seconds}s）"
-                ) from exc
-            except asyncio.CancelledError:
-                task.add_done_callback(
-                    partial(self._log_detached_async_task_failure, task_name="OCR task")
-                )
-                raise
+            finally:
+                self._ocr_admission.release()
         finally:
-            if not lease_bound:
-                self._release_non_text_family_lease("ocr")
+            self._release_non_text_family_lease("ocr")

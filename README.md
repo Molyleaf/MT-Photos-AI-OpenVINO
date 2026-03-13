@@ -49,11 +49,14 @@
 | `RAPIDOCR_DET_LIMIT_TYPE`           | 检测缩放策略；默认 `max`，避免把小图放大到阈值导致时延异常                | `max`                              |
 | `RAPIDOCR_REC_BATCH_NUM`            | 识别批大小                                                     | `8`                                |
 | `RAPIDOCR_CLS_BATCH_NUM`            | 方向分类批大小                                                   | `8`                                |
+| `OCR_MAX_CONCURRENT_REQUESTS`       | OCR 应用层最大并发请求数；用于限制 executor 积压并与 stage worker 对齐      | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
 | `OCR_PREWARM_ENABLED`               | 是否启用一次性后台 RapidOCR 预热；预热完成后会立即释放 OCR 模型                 | `false`                             |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 一次性后台预热延迟（秒）；仅在 `OCR_PREWARM_ENABLED=true` 时生效      | `1.0`                               |
 | `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；`AUTO` 在 GPU 可见时会优先解析为 `GPU`     | `AUTO`                             |
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
+| `INSIGHTFACE_MAX_WORKERS`           | `/represent` 应用层 worker 数；默认允许有限并发，避免单 worker 头阻塞        | `2`                                |
+| `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压                 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`                        | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口                                                      | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`  | `WARNING`                          |
@@ -72,6 +75,7 @@
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - RapidOCR 默认基线使用 `THROUGHPUT + stage devices(det=GPU / cls=CPU / rec=GPU) + rec/cls batch=8`。`RAPIDOCR_DEVICE=AUTO` 只作为全局默认入口，真正编译时会按 stage 收敛到上述设备，并显式关闭任何 `AUTO` startup/runtime CPU fallback。若 `Det/Cls/Rec` 任一 stage 的 `exec_devices` 不符合请求设备，初始化会直接失败。
 - RapidOCR 的预处理链会按 stage 走不同 backend：`det` 与 `rec` 在 GPU 路径上使用 `OpenCV UMat + Intel OpenCL` 做 resize/normalize/blob 生成，`cls` 保持 CPU 本地预处理，避免为了一个轻量分类器引入多余的 GPU<->CPU 往返。
+- OCR 现在会在应用层做有界准入，并把 `crop/cls/rec` 的任务提交限制在当前 worker 数窗口内；超时后会先发起协作取消，再等待已受理任务退场，避免后台遗留任务长期占住租约和 executor。
 - RapidOCR 初始化和慢请求日志会输出 `stage_devices`、`stage_runtime_devices`、`preprocess_backends` 与 `exec_devices`，便于核对 `det=GPU / cls=CPU / rec=GPU` 是否真正落地。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。
 - RapidOCR 的 OpenVINO session 会在线程内复用 `InferRequest`；方向分类阶段若发现 OpenVINO 返回条数少于当前批长度，会自动退回单张分类，避免 `IndexError` 并兼容 batch 输出不一致的运行时。
@@ -81,6 +85,7 @@
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
 - 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
+- `/represent` 默认不再固定单 worker；服务会以有限 worker 并发执行人脸检测/对齐/识别，并在应用层限制最大并发请求数，减少头阻塞和后台队列堆积。
 
 ## Windows 本机部署
 
