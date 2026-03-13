@@ -1,0 +1,2 @@
+# 仅用于构建阶段安装 Intel GPU runtime。
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ sid main contrib non-free non-free-firmware

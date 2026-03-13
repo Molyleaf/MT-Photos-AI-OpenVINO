@@ -13,7 +13,7 @@
 ## 1. 仓库事实与目录结构（先对齐背景）
 
 - 语言与运行时：**Python 3.12**（目标平台：Windows Server + Debian 13 容器）。
-- Debian 容器镜像源基线：APT 使用 `https://mirrors.zju.edu.cn/debian/`，PyPI 使用 `https://mirrors.zju.edu.cn/pypi/web/simple`。
+- Debian 容器镜像源基线：APT 使用 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 使用 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
 - 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）。
@@ -306,7 +306,7 @@
 ### 13.1 Debian 容器当前实践
 
 - 当前 Docker 基线镜像为 `python:3.12-slim-trixie`（Debian 13）。
-- APT 镜像固定为 `https://mirrors.zju.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.zju.edu.cn/pypi/web/simple`。
+- APT 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - `sources.list` 基线仅保留 `trixie`、`trixie-updates`、`trixie-security`；构建阶段允许临时增加 `sid` 源，仅用于安装 Intel GPU runtime 后立即清理。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
 - 当前 `requirements.txt` 在 Python 3.12 / manylinux 下可直接使用 wheel 安装，不再默认保留 InsightFace 专用构建依赖。
