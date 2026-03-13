@@ -12,6 +12,7 @@
 - 服务入口：`app/server.py`
 - QA-CLIP 离线转换脚本：`convert/convert.py`
 - 源码运行时需保留 `app/models/QA-CLIP/clip`，服务当前仍使用其中的 tokenizer 与词表资源
+- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `glintr100.onnx` 的批量输出元数据，避免批量识别被错误的静态 `{1,512}` 元数据拖回低吞吐路径
 
 ## 运行时环境变量
 
@@ -84,6 +85,7 @@
 - 默认还会在连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留常驻 Text-CLIP；如需调整可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
+- 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出元数据仍写死为 `{1,512}`，服务会在受控 runtime copy 中把 batch 维修正为动态后再初始化 ORT session；`/represent` 仍保持批量识别，不会回退逐张推理。
 - 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
 - `/represent` 默认不再固定单 worker；服务会以有限 worker 并发执行人脸检测/对齐/识别，并在应用层限制最大并发请求数，减少头阻塞和后台队列堆积。
 

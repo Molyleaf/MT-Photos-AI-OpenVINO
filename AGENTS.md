@@ -109,6 +109,7 @@
 - 对齐阶段必须使用 OpenCV + Intel OpenCL（`warpAffine` OpenCL 路径）；OpenCL 不可用或设备非 Intel 时必须直接报错，禁止静默回退 CPU。
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
+- 当 `antelopev2/glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时必须在受控 runtime root 中把识别输出 batch 维修正为动态后再初始化 ORT session；禁止通过退回逐张识别来规避 `VerifyOutputSizes` warning。
 - FaceAnalysis 仅用于模型发现、provider 管理与 session 生命周期；检测/对齐/识别链路必须在仓库内本地显式编排，严禁 monkey patch `insightface` 模块或模型实例方法。
 - `/represent` 必须提供应用层有界准入与有限并发 worker；默认不得固定为单 worker 串行，避免头阻塞与 executor backlog。
 
@@ -354,7 +355,7 @@
 - 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
 - 收敛 InsightFace 执行链路：`FaceAnalysis` 仅保留模型发现与 provider 初始化，检测/对齐/识别改为仓库内显式调用 PPP/OpenCL 路径，不再 monkey patch 第三方模块或对象方法。
 - 修复 InsightFace 检测参数兼容性：加载后会显式补齐 `SCRFD.det_thresh/nms_thresh/input_size/center_cache` 等运行时属性，并在 `FaceAnalysis.prepare()` 时显式传入 `det_thresh=0.5`，兼容旧版本对象缺字段场景。
-- 修复 InsightFace 识别输出 shape warning：当识别模型元数据仍声明静态 batch=`1` 时，运行时自动退回逐张识别，避免 ORT `VerifyOutputSizes` 对 `{1,512}` vs `{N,512}` 的重复告警。
+- 修复 InsightFace 识别输出 shape warning：当 `glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时会在受控 runtime copy 中把输出 batch 维修正为动态后再初始化 ORT session，继续保持批量识别吞吐而不是退回逐张推理。
 - 收敛 `/represent` 吞吐与 backlog：默认 worker 提升为有限并发，并新增 `INSIGHTFACE_MAX_WORKERS` / `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` 应用层限流；超时后先触发协作取消，避免后台线程脱离调用方继续堆积。
 - 修复图片请求总量控制：`/clip/img`、`/ocr`、`/represent` 现共享应用层图片名额池，默认且硬上限均为 `10`；超出时立即拒绝，避免 MT-Photos 客户端因积压过深触发超时取消。
 - 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。

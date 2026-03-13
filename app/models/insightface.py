@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+try:
+    import onnx
+except Exception:  # pragma: no cover - runtime dependency validated during face load
+    onnx = None
 from insightface.app import FaceAnalysis
 
 if TYPE_CHECKING:
@@ -49,6 +53,7 @@ _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
     ],
     dtype=np.float32,
 )
+_INSIGHTFACE_BATCH_DIM_PARAM = "batch"
 
 
 def _estimate_similarity_transform_matrix(src: Any, dst: Any) -> np.ndarray:
@@ -434,29 +439,19 @@ class InsightFaceMixin:
             _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
             for item in aligned_faces
         ]
-        output_shape = getattr(rec_model, "output_shape", None)
-        static_single_output_batch = (
-            isinstance(output_shape, (list, tuple))
-            and len(output_shape) >= 1
-            and isinstance(output_shape[0], int)
-            and int(output_shape[0]) == 1
+        batch = np.stack(prepared, axis=0)
+        blob = preprocess_runner.run(batch)
+        features = np.asarray(
+            rec_model.session.run(rec_model.output_names, {rec_model.input_name: blob})[0]
         )
-        if not static_single_output_batch:
-            batch = np.stack(prepared, axis=0)
-            blob = preprocess_runner.run(batch)
-            return np.asarray(
-                rec_model.session.run(rec_model.output_names, {rec_model.input_name: blob})[0]
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+        if features.shape[0] != len(prepared):
+            raise RuntimeError(
+                "InsightFace recognition output mismatch after batched run: "
+                f"expected_batch={len(prepared)} got_shape={tuple(features.shape)}"
             )
-
-        features: List[np.ndarray] = []
-        for item in prepared:
-            blob = preprocess_runner.run(item[np.newaxis, ...])
-            single = rec_model.session.run(
-                rec_model.output_names,
-                {rec_model.input_name: blob},
-            )[0]
-            features.append(np.asarray(single))
-        return np.concatenate(features, axis=0) if features else np.empty((0, 0), dtype=np.float32)
+        return features
 
     def _attach_insightface_preprocess(self, face_app: FaceAnalysis, device_name: str) -> None:
         det_model = getattr(face_app, "det_model", None)
@@ -496,6 +491,166 @@ class InsightFaceMixin:
             "InsightFace model directory missing for antelopev2. Checked paths: "
             f"{self.insightface_model_root / MODEL_NAME}, {self.insightface_root / MODEL_NAME}"
         )
+
+    @staticmethod
+    def _normalize_ort_shape(shape: Any) -> Tuple[Any, ...]:
+        if isinstance(shape, (list, tuple)):
+            return tuple(shape)
+        return tuple()
+
+    @classmethod
+    def _shape_has_static_batch_one(cls, shape: Any) -> bool:
+        normalized_shape = cls._normalize_ort_shape(shape)
+        if not normalized_shape:
+            return False
+        first_dim = normalized_shape[0]
+        try:
+            return int(first_dim) == 1
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _format_ort_shape(cls, shape: Any) -> List[str]:
+        return [
+            "None" if item is None else str(item)
+            for item in cls._normalize_ort_shape(shape)
+        ]
+
+    @classmethod
+    def _normalize_insightface_recognition_state(cls, rec_model: Any) -> Dict[str, List[str]]:
+        if rec_model is None:
+            raise RuntimeError("InsightFace recognition model is missing.")
+
+        session = getattr(rec_model, "session", None)
+        if session is None or not hasattr(session, "get_inputs") or not hasattr(session, "get_outputs"):
+            raise RuntimeError("InsightFace recognition session is missing ORT shape metadata.")
+
+        inputs = list(session.get_inputs())
+        outputs = list(session.get_outputs())
+        if not inputs or not outputs:
+            raise RuntimeError("InsightFace recognition session returned empty inputs/outputs.")
+
+        input_shape = cls._normalize_ort_shape(getattr(inputs[0], "shape", None))
+        output_shape = cls._normalize_ort_shape(getattr(outputs[0], "shape", None))
+        output_names = [str(item.name) for item in outputs if getattr(item, "name", None)]
+
+        rec_model.input_name = str(getattr(rec_model, "input_name", None) or inputs[0].name)
+        rec_model.output_names = output_names or list(getattr(rec_model, "output_names", []))
+        rec_model.input_shape = list(input_shape)
+        rec_model.output_shape = list(output_shape)
+
+        if cls._shape_has_static_batch_one(output_shape):
+            raise RuntimeError(
+                "InsightFace recognition output metadata is pinned to batch=1. "
+                "High-throughput batched recognition requires a dynamic output batch dimension."
+            )
+
+        return {
+            "input_shape": cls._format_ort_shape(input_shape),
+            "output_shape": cls._format_ort_shape(output_shape),
+        }
+
+    @staticmethod
+    def _ensure_runtime_model_link(src: Path, dst: Path) -> None:
+        if not src.is_file():
+            raise FileNotFoundError(f"InsightFace required model missing: {src}")
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            if dst.is_dir():
+                raise RuntimeError(f"InsightFace runtime model path is a directory: {dst}")
+            try:
+                if os.path.samefile(src, dst):
+                    return
+            except Exception:
+                pass
+            src_stat = src.stat()
+            dst_stat = dst.stat()
+            if dst_stat.st_size == src_stat.st_size and dst_stat.st_mtime_ns >= src_stat.st_mtime_ns:
+                return
+            dst.unlink()
+
+        try:
+            os.symlink(src, dst)
+        except Exception:
+            try:
+                os.link(src, dst)
+            except Exception:
+                shutil.copy2(src, dst)
+
+    @classmethod
+    def _prepare_batched_insightface_recognition_model(cls, src: Path, dst: Path) -> None:
+        if not src.is_file():
+            raise FileNotFoundError(f"InsightFace required model missing: {src}")
+        if onnx is None:
+            raise RuntimeError(
+                "InsightFace batched recognition metadata patch requires the 'onnx' package."
+            )
+
+        model = onnx.load(str(src))
+        if not model.graph.output:
+            raise RuntimeError(f"InsightFace recognition model has no outputs: {src}")
+        output_dims = model.graph.output[0].type.tensor_type.shape.dim
+        if not output_dims:
+            raise RuntimeError(
+                "InsightFace recognition model output shape metadata is missing. "
+                f"model={src}"
+            )
+
+        first_dim = output_dims[0]
+        has_static_dim = bool(getattr(first_dim, "HasField", lambda *_: False)("dim_value"))
+        if not has_static_dim or int(first_dim.dim_value) != 1:
+            cls._ensure_runtime_model_link(src, dst)
+            return
+
+        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            try:
+                existing_model = onnx.load(str(dst))
+                existing_dims = existing_model.graph.output[0].type.tensor_type.shape.dim
+                existing_first_dim = existing_dims[0] if existing_dims else None
+                existing_has_static_dim = bool(
+                    getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
+                )
+                if existing_first_dim is not None and (
+                    not existing_has_static_dim or int(existing_first_dim.dim_value) != 1
+                ):
+                    return
+            except Exception:
+                pass
+
+        first_dim.ClearField("dim_value")
+        first_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
+        if temp_path.exists():
+            temp_path.unlink()
+        try:
+            onnx.save(model, str(temp_path))
+            os.replace(temp_path, dst)
+            shutil.copystat(src, dst)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _prepare_insightface_runtime_root(self, source_root: Path) -> Path:
+        source_model_dir = source_root / MODEL_NAME
+        runtime_root = self.insightface_root / "_runtime_models"
+        primary_model_dir = runtime_root / MODEL_NAME
+        compat_model_dir = runtime_root / "models" / MODEL_NAME
+        primary_model_dir.mkdir(parents=True, exist_ok=True)
+        compat_model_dir.mkdir(parents=True, exist_ok=True)
+
+        det_src = source_model_dir / "scrfd_10g_bnkps.onnx"
+        rec_src = source_model_dir / "glintr100.onnx"
+        det_primary = primary_model_dir / det_src.name
+        rec_primary = primary_model_dir / rec_src.name
+
+        self._ensure_runtime_model_link(det_src, det_primary)
+        self._prepare_batched_insightface_recognition_model(rec_src, rec_primary)
+        self._ensure_runtime_model_link(det_primary, compat_model_dir / det_src.name)
+        self._ensure_runtime_model_link(rec_primary, compat_model_dir / rec_src.name)
+        return runtime_root
 
     def _build_insightface_provider_options(self, provider_device: str) -> Dict[str, str]:
         provider_options: Dict[str, str] = {
@@ -559,6 +714,7 @@ class InsightFaceMixin:
         provider_options: Dict[str, str],
     ) -> Tuple[FaceAnalysis, Path]:
         source_root = self._resolve_insightface_root()
+        runtime_root = self._prepare_insightface_runtime_root(source_root)
         init_signature = inspect.signature(FaceAnalysis.__init__)
         init_parameters = init_signature.parameters
         supports_var_kwargs = any(
@@ -568,7 +724,6 @@ class InsightFaceMixin:
         supports_allowed_modules = "allowed_modules" in init_parameters
         supports_provider_kwargs = "providers" in init_parameters or supports_var_kwargs
         supports_provider_options = "provider_options" in init_parameters or supports_var_kwargs
-        legacy_root: Optional[Path] = None
 
         def _build_kwargs(
             runtime_root: Path,
@@ -590,6 +745,24 @@ class InsightFaceMixin:
 
         attempts: List[Tuple[str, Path, Dict[str, Any]]] = [
             (
+                "runtime-with-provider-kwargs",
+                runtime_root,
+                _build_kwargs(
+                    runtime_root,
+                    include_provider_kwargs=supports_provider_kwargs,
+                    include_allowed_modules=supports_allowed_modules,
+                ),
+            ),
+            (
+                "runtime-without-provider-kwargs",
+                runtime_root,
+                _build_kwargs(
+                    runtime_root,
+                    include_provider_kwargs=False,
+                    include_allowed_modules=supports_allowed_modules,
+                ),
+            ),
+            (
                 "source-with-provider-kwargs",
                 source_root,
                 _build_kwargs(
@@ -608,25 +781,22 @@ class InsightFaceMixin:
                 ),
             ),
         ]
-
-        if legacy_root is None:
-            legacy_root = self._prepare_legacy_insightface_runtime_root(source_root)
         attempts.extend(
             (
                 (
                     "legacy-with-provider-kwargs",
-                    legacy_root,
+                    runtime_root,
                     _build_kwargs(
-                        legacy_root,
+                        runtime_root,
                         include_provider_kwargs=supports_provider_kwargs,
                         include_allowed_modules=supports_allowed_modules,
                     ),
                 ),
                 (
                     "legacy-minimal-kwargs",
-                    legacy_root,
+                    runtime_root,
                     _build_kwargs(
-                        legacy_root,
+                        runtime_root,
                         include_provider_kwargs=False,
                         include_allowed_modules=False,
                     ),
@@ -644,7 +814,10 @@ class InsightFaceMixin:
             seen_attempts.add(attempt_key)
             try:
                 face_app = FaceAnalysis(**kwargs)
-                if attempt_name != "source-with-provider-kwargs":
+                self._normalize_insightface_recognition_state(
+                    getattr(face_app, "models", {}).get("recognition")
+                )
+                if attempt_name not in {"runtime-with-provider-kwargs", "source-with-provider-kwargs"}:
                     LOG.warning(
                         "InsightFace initialized via compatibility path %s (runtime_root=%s)",
                         attempt_name,
@@ -673,29 +846,6 @@ class InsightFaceMixin:
             "InsightFace initialization failed after compatibility retries: "
             f"{summary}"
         ) from last_exc
-
-    def _prepare_legacy_insightface_runtime_root(self, source_root: Path) -> Path:
-        source_model_dir = source_root / MODEL_NAME
-        runtime_root = self.insightface_root / "_runtime_models"
-        runtime_model_dir = runtime_root / "models" / MODEL_NAME
-        runtime_model_dir.mkdir(parents=True, exist_ok=True)
-
-        required_files = ("scrfd_10g_bnkps.onnx", "glintr100.onnx")
-        for filename in required_files:
-            src = source_model_dir / filename
-            dst = runtime_model_dir / filename
-            if not src.is_file():
-                raise FileNotFoundError(f"InsightFace required model missing: {src}")
-            if dst.exists():
-                continue
-            try:
-                os.symlink(src, dst)
-            except Exception:
-                try:
-                    os.link(src, dst)
-                except Exception:
-                    shutil.copy2(src, dst)
-        return runtime_root
 
     @staticmethod
     def _validate_insightface_openvino_provider(
@@ -782,6 +932,9 @@ class InsightFaceMixin:
                 det_size=(640, 640),
                 det_thresh=float(getattr(face_app, "det_thresh", 0.5) or 0.5),
             )
+            rec_session_shapes = self._normalize_insightface_recognition_state(
+                getattr(face_app, "models", {}).get("recognition")
+            )
             provider_runtime = self._validate_insightface_openvino_provider(
                 face_app,
                 expected_device_type=provider_device,
@@ -797,13 +950,14 @@ class InsightFaceMixin:
             }
             self._face_engine = face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s face_workers=%s face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s rec_session_shapes=%s face_workers=%s face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 provider_options,
                 provider_runtime,
                 ppp_execution_devices,
+                rec_session_shapes,
                 getattr(self._face_executor, "_max_workers", "unknown"),
                 self._face_admission.capacity,
                 root_for_runtime,
