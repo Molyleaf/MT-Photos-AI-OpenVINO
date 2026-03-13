@@ -119,12 +119,12 @@ class _NonTextFamilyStateMachine:
                     self._condition.wait(timeout=0.1 if abort_event is not None else None)
                     continue
 
-                self._model.begin_switch()
+                getattr(self._model, "begin_switch")()
 
             switch_exc: Optional[Exception] = None
             unloaded_families: List[str] = []
             try:
-                unloaded_families = self._unload_callback(keep_family=family)
+                unloaded_families = self._unload_callback(family)
             except Exception as exc:
                 switch_exc = exc
 
@@ -134,7 +134,7 @@ class _NonTextFamilyStateMachine:
                     self._activate_family_locked(family)
                     self._inflight[family] += 1
                 else:
-                    self._model.release_to_idle()
+                    getattr(self._model, "release_to_idle")()
                 self._condition.notify_all()
 
             if switch_exc is not None:
@@ -165,7 +165,7 @@ class _NonTextFamilyStateMachine:
                 if self._is_stopping():
                     return
                 self._condition.wait()
-            self._model.begin_switch()
+            getattr(self._model, "begin_switch")()
 
     def wait_for_drain(self) -> None:
         with self._condition:
@@ -174,7 +174,7 @@ class _NonTextFamilyStateMachine:
 
     def finish_release(self) -> None:
         with self._condition:
-            self._model.release_to_idle()
+            getattr(self._model, "release_to_idle")()
             self._condition.notify_all()
 
 
@@ -185,6 +185,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     Non-text families are lazy-loaded and switch synchronously so only one
     vision/OCR/face family stays resident at a time, with idle release.
     """
+    ov_cache_dir: Optional[Path]
 
     def __init__(self) -> None:
         self._pid = os.getpid()
@@ -925,7 +926,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
         result = ov.opset13.result(parameter)
         result.set_friendly_name(f"{runner_name}_output")
-        preprocess_model = ov.Model(
+        model_factory: Any = ov.Model
+        preprocess_model = model_factory(
             [result],
             [parameter],
             f"{runner_name}_ppp",

@@ -441,6 +441,38 @@ class _InferenceCancelled(RuntimeError):
     pass
 
 
+@dataclass(slots=True)
+class _ManagedLease:
+    label: str
+    _callbacks: List[Callable[[], None]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _released: bool = False
+
+    def push(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._released:
+                callback()
+                return
+            self._callbacks.append(callback)
+
+    def bind_future(self, future: Any) -> None:
+        future.add_done_callback(lambda _future: self.release())
+
+    def release(self) -> None:
+        callbacks: List[Callable[[], None]]
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            callbacks = list(reversed(self._callbacks))
+            self._callbacks.clear()
+        for callback in callbacks:
+            callback()
+
+    async def release_async(self) -> None:
+        await asyncio.to_thread(self.release)
+
+
 class _AdmissionController:
     def __init__(self, name: str, capacity: int) -> None:
         self.name = str(name)
@@ -497,3 +529,4 @@ class _ClipImageTask:
     created_at: float
     started_at: Optional[float] = None
     started_event: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: threading.Event = field(default_factory=threading.Event)

@@ -5,24 +5,22 @@ import os
 import shutil
 import sys
 import threading
+from abc import abstractmethod
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import cv2
 import numpy as np
 import onnx
 from insightface.app import FaceAnalysis
 
-if __package__ == "models":
-    from schemas import FacialArea, RepresentResult
-else:
-    from ..schemas import FacialArea, RepresentResult
-
 from .common import (
     _AdmissionController,
     _InferenceCancelled,
+    NonTextFamily,
     _OpenVinoPreprocessRunner,
     _as_bool,
     _as_contiguous_bgr_uint8,
@@ -35,6 +33,7 @@ from .common import (
     _to_channel_triplet,
 )
 from .constants import INFERENCE_DEVICE, LOG, MODEL_NAME
+from .schemas import FacialArea, RepresentResult
 
 _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
     [
@@ -163,6 +162,72 @@ class InsightFaceMixin:
     _face_admission: _AdmissionController
     _execution_timeout_seconds: int
 
+    @abstractmethod
+    def _build_openvino_preprocess_runner(
+        self,
+        runner_name: str,
+        device_name: str,
+        output_height: int,
+        output_width: int,
+        mean_values: List[float],
+        std_values: List[float],
+    ) -> _OpenVinoPreprocessRunner:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _non_text_request_scope(
+        self,
+        *,
+        family: NonTextFamily,
+        admission: _AdmissionController,
+        label: str,
+        ensure_loaded: Any,
+    ) -> AbstractContextManager[Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _non_text_request_scope_async(
+        self,
+        *,
+        family: NonTextFamily,
+        admission: _AdmissionController,
+        label: str,
+        ensure_loaded: Any,
+    ) -> AbstractAsyncContextManager[Any]:
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def _run_in_executor(
+        executor: ThreadPoolExecutor,
+        func: Any,
+        *args: Any,
+    ) -> asyncio.Future[Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _await_with_timeout_and_cooperative_cancel(
+        self,
+        awaitable: asyncio.Future[Any] | asyncio.Task[Any],
+        *,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+        task_name: str,
+    ) -> Any:
+        raise NotImplementedError
+
+    @staticmethod
+    def _to_int_pair(value: Any, default: Tuple[int, int]) -> Tuple[int, int]:
+        try:
+            first, second = value
+            return int(first), int(second)
+        except Exception:
+            return default
+
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:
         name, vendor = _ensure_intel_opencl_device("InsightFace alignment")
@@ -194,7 +259,7 @@ class InsightFaceMixin:
         try:
             warped_umat = cv2.warpAffine(
                 _to_opencv_umat(source),
-                matrix,
+                cast(Any, matrix),
                 (int(image_size), int(image_size)),
                 borderValue=0.0,
             )
@@ -266,7 +331,7 @@ class InsightFaceMixin:
 
         self._normalize_insightface_detector_state(
             det_model,
-            det_size=tuple(int(value) for value in getattr(det_model, "input_size", (640, 640))),
+            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
             det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
             nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
         )
@@ -303,7 +368,10 @@ class InsightFaceMixin:
             if key in det_model.center_cache:
                 anchor_centers = det_model.center_cache[key]
             else:
-                anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+                anchor_centers = np.stack(
+                    cast(Any, np.mgrid[:height, :width][::-1]),
+                    axis=-1,
+                ).astype(np.float32)
                 anchor_centers = (anchor_centers * stride).reshape((-1, 2))
                 if det_model._num_anchors > 1:
                     anchor_centers = np.stack([anchor_centers] * det_model._num_anchors, axis=1)
@@ -340,7 +408,7 @@ class InsightFaceMixin:
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         self._normalize_insightface_detector_state(
             det_model,
-            det_size=tuple(int(value) for value in getattr(det_model, "input_size", (640, 640))),
+            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
             det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
             nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
         )

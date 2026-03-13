@@ -13,20 +13,13 @@ from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
-if __package__ in {None, ""}:
-    from models import AIModels, MODEL_NAME
-    from schemas import (
-        CheckResponse,
-        TextClipRequest,
-        RestartResponse,
-    )
-else:
-    from .models import AIModels, MODEL_NAME
-    from .schemas import (
-        CheckResponse,
-        TextClipRequest,
-        RestartResponse,
-    )
+from models.constants import MODEL_NAME
+from models.runtime import AIModels
+from models.schemas import (
+    CheckResponse,
+    TextClipRequest,
+    RestartResponse,
+)
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)

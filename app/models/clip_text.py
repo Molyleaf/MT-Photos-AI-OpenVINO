@@ -4,6 +4,7 @@ import socket
 import socketserver
 import threading
 import time
+from abc import abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,6 +61,14 @@ class ClipTextMixin:
     _text_service_server: Optional[_TextClipRpcServer]
     _text_service_thread: Optional[threading.Thread]
     _text_service_port: Optional[int]
+
+    @abstractmethod
+    def _compile_clip_model(
+        self,
+        model_or_path: Any,
+        performance_hint: str,
+    ) -> ov.CompiledModel:
+        raise NotImplementedError
 
     def _read_text_service_meta(self) -> Optional[Dict[str, Any]]:
         try:

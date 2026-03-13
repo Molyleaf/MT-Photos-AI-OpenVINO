@@ -1,5 +1,6 @@
 import asyncio
 import time
+from abc import abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional
@@ -8,7 +9,7 @@ import cv2
 import numpy as np
 import openvino as ov
 
-from .common import _ClipImageTask, _ManagedLease, _as_contiguous_bgr_uint8
+from .common import _ClipImageTask, _ManagedLease, NonTextFamily, _as_contiguous_bgr_uint8
 from .constants import (
     CLIP_EMBEDDING_DIMS,
     CLIP_IMAGE_RESOLUTION,
@@ -37,6 +38,75 @@ class ClipImageMixin:
     _clip_vision_model: Optional[ov.CompiledModel]
     _clip_vision_ppp: Any
     _clip_vision_request: Optional[ov.InferRequest]
+
+    @abstractmethod
+    def _acquire_image_request_slot(self, label: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _release_image_request_slot(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _build_openvino_preprocess_runner(
+        self,
+        runner_name: str,
+        device_name: str,
+        output_height: int,
+        output_width: int,
+        mean_values: List[float],
+        std_values: List[float],
+    ) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _safe_set_result(self, future: Future, value: Any) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _safe_set_exception(self, future: Future, exc: Exception) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _submit_clip_image_task(self, payload: Any) -> _ClipImageTask:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _wait_clip_image_task(self, task: _ClipImageTask) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _await_clip_image_task(self, task: _ClipImageTask) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _acquire_non_text_family_lease(self, family: NonTextFamily) -> bool | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _acquire_non_text_family_lease_async(self, family: NonTextFamily) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _release_non_text_family_lease(self, family: NonTextFamily) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _run_control(self, func: Any, *args: Any) -> asyncio.Future[Any]:
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def _run_in_executor(
+        executor: ThreadPoolExecutor,
+        func: Any,
+        *args: Any,
+    ) -> asyncio.Future[Any]:
+        raise NotImplementedError
 
     def _require_clip_image_dispatch_loop(self) -> asyncio.AbstractEventLoop:
         loop = self._clip_image_dispatch_loop

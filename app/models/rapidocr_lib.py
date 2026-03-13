@@ -3,6 +3,8 @@ import logging
 import os
 import threading
 import time
+from abc import abstractmethod
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,14 +19,12 @@ from rapidocr import RapidOCR
 from rapidocr.utils.log import logger as RAPIDOCR_LOGGER
 from rapidocr.utils.typings import EngineType
 
-if __package__ == "models":
-    from schemas import OCRBox, OCRResult
-else:
-    from ..schemas import OCRBox, OCRResult
+from .schemas import OCRBox, OCRResult
 
 from .common import (
     _AdmissionController,
     _InferenceCancelled,
+    NonTextFamily,
     _as_bool,
     _as_contiguous_bgr_uint8,
     _as_int,
@@ -61,6 +61,52 @@ class RapidOCRMixin:
     _shared_cpu_executor: ThreadPoolExecutor
     _ocr_admission: _AdmissionController
     _ocr_execution_timeout_seconds: int
+
+    @abstractmethod
+    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _non_text_request_scope(
+        self,
+        *,
+        family: NonTextFamily,
+        admission: _AdmissionController,
+        label: str,
+        ensure_loaded: Any,
+    ) -> AbstractContextManager[Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _non_text_request_scope_async(
+        self,
+        *,
+        family: NonTextFamily,
+        admission: _AdmissionController,
+        label: str,
+        ensure_loaded: Any,
+    ) -> AbstractAsyncContextManager[Any]:
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def _run_in_executor(
+        executor: ThreadPoolExecutor,
+        func: Any,
+        *args: Any,
+    ) -> asyncio.Future[Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _await_with_timeout_and_cooperative_cancel(
+        self,
+        awaitable: asyncio.Future[Any] | asyncio.Task[Any],
+        *,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+        task_name: str,
+    ) -> Any:
+        raise NotImplementedError
 
     def _require_rapidocr_config_path(self) -> Path:
         if not self.rapidocr_config_path.is_file():
