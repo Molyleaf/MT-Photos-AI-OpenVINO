@@ -330,37 +330,7 @@
 
 ### 13.2 最近稳定性修复（2026-03）
 
-- 修复 `/clip/img` 在 OpenVINO 动态输入模型上的 PPP 构建失败：视觉预处理 `resize` 显式固定为 `224x224`，保持输出维度 `768` 与接口语义不变。
-- 收敛上传读图链：`read_image_from_upload` 改为 OpenCV 原生解码，GIF 首帧优先走 `cv2.imdecodeanimation`，并移除 `ffmpeg/ffprobe` 与 `PIL` 运行时依赖。
-- 修复 RapidOCR 后端锁定问题：服务会直接把 `RAPIDOCR_OPENVINO_CONFIG_PATH` 作为 `config_path` 传给 `RapidOCR`，并在初始化后校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
-- 收敛 RapidOCR 运行设备：OCR 已回退到 RapidOCR 库内原生 OpenVINO CPU 路径；`RAPIDOCR_DEVICE` 与 stage 级设备变量若请求非 CPU，仅记录告警并统一收敛为 `CPU`。
-- 收敛 OpenVINO cache 配置：默认启用仓库内 `cache/openvino` 编译缓存目录，显式设置 `OV_CACHE_DIR` 时覆盖默认值，避免多 Worker 反复冷编译。
-- 修复 InsightFace PPP 预处理输出取值失败：改为显式 `infer({compiled_model.input(0): ...})` + `compiled_model.output(0)` 取输出，并在构建时执行 shape/dtype 自检，兼容匿名 `Result` 端口映射。
-- 收敛 RapidOCR 检测缩放策略：默认 `Det.limit_type=max`，避免把小图放大到 `limit_side_len` 触发结构性慢路径。
-- 修复 InsightFace OpenCL 对齐补丁兼容性：`norm_crop` 现在兼容 `UMat/ndarray` 输入，并对 `estimate_norm` 返回值执行显式矩阵校验，避免 `warpAffine` 参数类型错误。
-- 收敛 Text-CLIP 调度：文本模型改为独立常驻单例 RPC 服务，单进程下保持单线程后台实例，不再参与非文本队列插队与回切。
-- 收敛 `/clip/img` 吞吐路径：视觉请求改为标准预处理后聚合批推理，维持 PPP 归一化与接口语义不变，同时提升 GPU 利用率。
-- 收敛 OCR 启动行为：默认改为首次 `/ocr` 请求时才懒加载 OCR；如显式开启 `OCR_PREWARM_ENABLED=true`，只做一次性预热并立即释放 OCR，且 `/restart` 会取消未完成的预热。
-- 修复 InsightFace 五点对齐弃用 API warning：本地重写相似变换矩阵估计，保持 OpenCL `warpAffine` 路径与输出语义不变。
-- 收敛非文本模型路径：Vision-CLIP / OCR / InsightFace 保持各自独立执行路径，但模型准入改为单活租约切换；文本 CLIP 仍常驻。
-- 收敛 RapidOCR 调用链：OCR 执行改为直接走 `RapidOCR.__call__` 与库内 `run_ocr_steps`，不再替换 stage session，也不再维护仓库内自定义 det/cls/rec 预处理与拼装分支。
-- 收敛 RapidOCR 并发路径：OCR 改为按 `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 预建有界 `RapidOCR` 多实例池，每个 worker 独占一个库原生实例，避免共享 `InferRequest` 被全局锁串行后吞吐下降。
-- 收敛吞吐基线：RapidOCR 默认配置调整为 `THROUGHPUT + performance_num_requests=2 + num_streams=2 + rec/cls batch=8`；InsightFace OpenVINO EP 默认补齐 `cache_dir` 并关闭 OpenCL throttling。
-- 收敛 OpenVINO 同步推理调用：InsightFace PPP runner 与 CLIP 本地输入路径统一改为显式 `set_input_tensor(...) + infer() + get_output_tensor(0)`，规避匿名 `Result` 端口映射兼容问题并减少共享字典分发开销。
-- 收敛非文本超时语义：`INFERENCE_TASK_TIMEOUT` 仅作为兼容基线，运行时拆分为 `INFERENCE_QUEUE_TIMEOUT` 与 `INFERENCE_EXEC_TIMEOUT`，避免排队时间挤占执行窗口。
-- 修复 InsightFace 旧版本兼容问题：当构造阶段不支持 `providers` / `provider_options` / `allowed_modules` 参数时，运行时按兼容顺序重试实例化，再显式强制 `OpenVINOExecutionProvider`，并兼容旧路由器仅加载检测+识别必需模型文件。
-- 收敛 OCR 异步超时语义：OCR 的模型加载与租约切换不再占用执行超时窗口，并新增 `OCR_EXEC_TIMEOUT` 作为 OCR 专属执行超时覆盖；慢请求日志改为输出库内原生 CPU 路径的总耗时与关键配置。
-- 收敛 RapidOCR 无字图日志：对于确实不含文字的图片，服务会过滤 RapidOCR 自身 `"The text detection result is empty"` 预期 warning，保持 `/ocr` 返回空结果但不刷屏。
-- 收敛空闲内存兜底：默认连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留 Text-CLIP 常驻；业务端可通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖或关闭。
-- 收敛 InsightFace GPU 设备选择：当 `INSIGHTFACE_OV_DEVICE=AUTO` 且 GPU 可见时，运行时显式收敛到 `GPU`，并同步把 PPP 预处理编译到同一设备；日志会输出 `configured_device/runtime_device/provider_runtime/ppp_execution_devices`。
-- 收敛 InsightFace 执行链路：`FaceAnalysis` 仅保留模型发现与 provider 初始化，检测/对齐/识别改为仓库内显式调用 PPP/OpenCL 路径，不再 monkey patch 第三方模块或对象方法。
-- 修复 InsightFace 检测参数兼容性：加载后会显式补齐 `SCRFD.det_thresh/nms_thresh/input_size/center_cache` 等运行时属性，并在 `FaceAnalysis.prepare()` 时显式传入 `det_thresh=0.5`，兼容旧版本对象缺字段场景。
-- 修复 InsightFace 识别输出 shape warning：当 `glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时会在受控 runtime copy 中把输出 batch 维修正为动态后再初始化 ORT session，继续保持批量识别吞吐而不是退回逐张推理。
-- 收敛 `/represent` 吞吐与 backlog：默认 worker 提升为有限并发，并新增 `INSIGHTFACE_MAX_WORKERS` / `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` 应用层限流；超时后先触发协作取消，避免后台线程脱离调用方继续堆积。
-- 修复图片请求总量控制：`/clip/img`、`/ocr`、`/represent` 现共享应用层图片名额池，默认且硬上限均为 `10`；超出时立即拒绝，避免 MT-Photos 客户端因积压过深触发超时取消。
-- 修复 QA-CLIP GPU Remote Context 初始化兼容问题：当 `get_default_context("GPU")` 失败时，继续尝试具体 `GPU.*` 设备与 `create_context("GPU", {})` 兼容路径；若仍无法得到 GPU Remote Context，保持硬失败，不允许 silent fallback。
-- 修复 QA-CLIP 在 `available_devices=['CPU']` 误报场景下的提前退出：即使设备枚举未列出 GPU，也继续执行 Remote Context 显式探测；仅在全部 GPU 上下文路径均失败后再硬失败。
-- 收敛 Docker 依赖分类：当前 `requirements.txt` 在 Python 3.12 / manylinux 下可全量使用 wheel 安装，`build-essential`、`gcc`、`g++`、`libpq-dev` 不再作为 InsightFace 构建依赖保留在镜像中。
+
 
 ### 13.3 `/dev/dri` Intel iGPU 上线验收
 
