@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import openvino as ov
@@ -153,8 +153,8 @@ class ClipTextMixin:
                     response = {"error": str(exc)}
                 self.wfile.write((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
 
-        handler_class = cast(type[socketserver.BaseRequestHandler], _TextClipRequestHandler)
-        server = _TextClipRpcServer((TEXT_RPC_HOST, 0), handler_class)
+        handler_factory: Any = _TextClipRequestHandler
+        server = _TextClipRpcServer((TEXT_RPC_HOST, 0), handler_factory)
         self._text_service_server = server
         self._text_service_port = int(server.server_address[1])
         self._write_text_service_meta(self._text_service_port)

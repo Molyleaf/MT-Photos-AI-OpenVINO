@@ -33,6 +33,7 @@ from .common import (
     _get_compiled_model_execution_devices,
     _normalize_non_text_openvino_device,
     _resolve_non_text_openvino_runtime_device,
+    _to_opencv_umat,
     _to_channel_triplet,
 )
 from .constants import INFERENCE_DEVICE, LOG, MODEL_NAME
@@ -165,7 +166,11 @@ class InsightFaceMixin:
             func: Any,
             *args: Any,
         ) -> asyncio.Future[Any]: ...
-        def _bind_non_text_lease_to_future(self, family: str, future: Future[Any]) -> None: ...
+        def _bind_non_text_lease_to_future(
+            self,
+            family: str,
+            future: Future[Any] | asyncio.Future[Any],
+        ) -> None: ...
         @staticmethod
         def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
 
@@ -217,7 +222,7 @@ class InsightFaceMixin:
                 )
             try:
                 warped_umat = cv2.warpAffine(
-                    cv2.UMat(source),
+                    _to_opencv_umat(source),
                     matrix,
                     (int(image_size), int(image_size)),
                     borderValue=0.0,

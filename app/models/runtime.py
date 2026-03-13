@@ -5,7 +5,6 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
@@ -17,6 +16,7 @@ from .common import (
     _InferenceTask,
     _InterProcessFileLock,
     _OpenVinoPreprocessRunner,
+    TaskType,
     _as_bool,
     _as_float,
     _as_int,
@@ -222,7 +222,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _background_prewarm_loop(self) -> None:
         delay_seconds = max(0.0, _as_float(os.environ.get("OCR_PREWARM_DELAY_SECONDS"), 1.0))
-        if self._background_prewarm_cancel.wait(timeout=delay_seconds):
+        if bool(self._background_prewarm_cancel.wait(timeout=delay_seconds)):
             return
         if self._stopping or self._background_prewarm_cancel.is_set():
             return
@@ -351,8 +351,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     def _queue_size_locked(self) -> int:
         return len(self._normal_queue)
 
-    def _submit_task(self, kind: str, payload: Any) -> _InferenceTask:
-        future: Future = Future()
+    def _submit_task(self, kind: TaskType, payload: Any) -> _InferenceTask:
+        future: Future[Any] = Future()
         task = _InferenceTask(kind=kind, payload=payload, future=future, created_at=time.time())
         with self._condition:
             if self._stopping:
@@ -382,14 +382,14 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         if task.future.done():
             return task.future.result()
 
-        started = task.started_event.wait(timeout=self._queue_timeout_seconds)
+        started = bool(task.started_event.wait(timeout=self._queue_timeout_seconds))
         if not started:
             if task.future.done():
                 return task.future.result()
             queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
             if self._cancel_task_if_queued(task, queue_exc):
                 raise queue_exc
-            if not task.started_event.wait(timeout=0.05) and not task.future.done():
+            if not bool(task.started_event.wait(timeout=0.05)) and not task.future.done():
                 raise queue_exc
 
         try:
@@ -401,14 +401,16 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         if task.future.done():
             return task.future.result()
 
-        started = await asyncio.to_thread(task.started_event.wait, self._queue_timeout_seconds)
+        started = bool(
+            await asyncio.to_thread(task.started_event.wait, self._queue_timeout_seconds)
+        )
         if not started:
             if task.future.done():
                 return task.future.result()
             queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
             if self._cancel_task_if_queued(task, queue_exc):
                 raise queue_exc
-            started = await asyncio.to_thread(task.started_event.wait, 0.05)
+            started = bool(await asyncio.to_thread(task.started_event.wait, 0.05))
             if not started and not task.future.done():
                 raise queue_exc
 
@@ -437,7 +439,11 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         if exc is not None:
             LOG.error("%s failed after caller detached: %s", task_name, exc, exc_info=exc)
 
-    def _bind_non_text_lease_to_future(self, family: str, future: Future) -> None:
+    def _bind_non_text_lease_to_future(
+        self,
+        family: str,
+        future: Future[Any] | asyncio.Future[Any],
+    ) -> None:
         future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
 
     def _join_background_prewarm_thread(self, timeout_seconds: Optional[float]) -> None:
@@ -457,7 +463,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self,
         family: str,
         abort_event: Optional[threading.Event] = None,
-    ) -> bool:
+    ) -> bool | None:
         while True:
             previous_family: Optional[str]
             with self._non_text_condition:
@@ -691,9 +697,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         executor: ThreadPoolExecutor,
         func: Callable[..., Any],
         *args: Any,
-    ) -> asyncio.Future:
+    ) -> asyncio.Future[Any]:
         loop = asyncio.get_running_loop()
-        return loop.run_in_executor(executor, partial(func, *args))
+        return loop.run_in_executor(executor, func, *args)
 
     def release_models(self) -> None:
         self._release_non_text_models_sync(reason="manual")

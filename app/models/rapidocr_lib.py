@@ -45,6 +45,7 @@ from .common import (
     _openvino_device_expr_requests_npu,
     _resolve_non_text_openvino_runtime_device,
     _split_openvino_device_expr,
+    _to_opencv_umat,
 )
 from .constants import (
     DEFAULT_NON_TEXT_OV_DEVICE,
@@ -244,7 +245,11 @@ class RapidOCRMixin:
             func: Any,
             *args: Any,
         ) -> asyncio.Future[Any]: ...
-        def _bind_non_text_lease_to_future(self, family: str, future: Future[Any]) -> None: ...
+        def _bind_non_text_lease_to_future(
+            self,
+            family: str,
+            future: Future[Any] | asyncio.Future[Any],
+        ) -> None: ...
         @staticmethod
         def _log_detached_async_task_failure(task: "asyncio.Task[Any]", task_name: str) -> None: ...
 
@@ -674,7 +679,7 @@ class RapidOCRMixin:
 
     @staticmethod
     def _resize_image_opencl(image: np.ndarray, width: int, height: int) -> np.ndarray:
-        resized = cv2.resize(cv2.UMat(image), (int(width), int(height)))
+        resized = cv2.resize(_to_opencv_umat(image), (int(width), int(height)))
         if isinstance(resized, cv2.UMat):
             return _as_contiguous_bgr_uint8(resized.get(), context="RapidOCR OpenCL resize")
         return _as_contiguous_bgr_uint8(np.asarray(resized), context="RapidOCR OpenCL resize")
@@ -698,7 +703,7 @@ class RapidOCRMixin:
         scalefactor = 1.0 / (255.0 * std[0])
         mean_pixels = tuple(float(value) * 255.0 for value in mean)
         blob = cv2.dnn.blobFromImage(
-            cv2.UMat(prepared),
+            _to_opencv_umat(prepared),
             scalefactor=scalefactor,
             size=(int(target_width), int(target_height)),
             mean=mean_pixels,
@@ -1328,7 +1333,7 @@ class RapidOCRMixin:
         engine = self._rapidocr_engine
         total_started_at = time.perf_counter()
         ori_img = _as_contiguous_bgr_uint8(image, context="OCR")
-        preprocess_ms = det_ms = crop_ms = cls_ms = rec_ms = assemble_ms = 0.0
+        det_ms = crop_ms = cls_ms = rec_ms = 0.0
         stage_started_at = time.perf_counter()
         img, op_record = await self._run_in_executor(
             self._shared_cpu_executor,
@@ -1447,7 +1452,7 @@ class RapidOCRMixin:
         await asyncio.to_thread(self._acquire_non_text_family_lease, "ocr")
         try:
             await asyncio.to_thread(self._ensure_rapidocr_loaded)
-            task = asyncio.create_task(self._infer_ocr_async(image))
+            task: asyncio.Task[OCRResult] = asyncio.create_task(self._infer_ocr_async(image))
             self._bind_non_text_lease_to_future("ocr", task)
             lease_bound = True
             try:

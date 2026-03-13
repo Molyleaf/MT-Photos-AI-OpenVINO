@@ -5,7 +5,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -330,6 +330,11 @@ def _as_contiguous_bgr_uint8(image: Any, context: str) -> np.ndarray:
     if image.flags.c_contiguous:
         return image
     return np.ascontiguousarray(image)
+
+
+def _to_opencv_umat(image: np.ndarray) -> cv2.UMat:
+    # OpenCV Python accepts ndarray-backed UMat construction, but current stubs miss that overload.
+    return cv2.UMat(cast(Any, image))
 
 
 def _to_channel_triplet(value: Any) -> List[float]:
