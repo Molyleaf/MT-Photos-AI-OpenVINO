@@ -2,13 +2,13 @@ import asyncio
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 import cv2
 import numpy as np
 import openvino as ov
 
-from .common import _ClipImageTask, _as_contiguous_bgr_uint8
+from .common import _ClipImageTask, _ManagedLease, _as_contiguous_bgr_uint8
 from .constants import (
     CLIP_EMBEDDING_DIMS,
     CLIP_IMAGE_RESOLUTION,
@@ -23,95 +23,102 @@ class ClipImageMixin:
     qa_clip_path: Path
     _clip_inference_device: str
     _clip_remote_context: Any
-    _clip_image_condition: Any
     _stopping: bool
-    _clip_image_queue: Any
+    _clip_image_dispatch_loop: Optional[asyncio.AbstractEventLoop]
+    _clip_image_queue: Optional[asyncio.Queue[Optional[_ClipImageTask]]]
+    _clip_image_loop_ready: Any
     _shared_cpu_executor: ThreadPoolExecutor
     _clip_image_batch_size: int
     _clip_image_batch_wait_seconds: float
+    _queue_capacity: int
+    _queue_timeout_seconds: int
+    _execution_timeout_seconds: int
     _clip_vision_load_lock: Any
     _clip_vision_model: Optional[ov.CompiledModel]
     _clip_vision_ppp: Any
     _clip_vision_request: Optional[ov.InferRequest]
 
-    if TYPE_CHECKING:
-        def _acquire_image_request_slot(self, label: str) -> None: ...
-        def _release_image_request_slot(self) -> None: ...
-        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
-        def _build_openvino_preprocess_runner(self, **kwargs: Any) -> Any: ...
-        def _safe_set_result(self, future: Future[Any], value: Any) -> None: ...
-        def _safe_set_exception(self, future: Future[Any], exc: Exception) -> None: ...
-        def _submit_clip_image_task(self, payload: Any) -> _ClipImageTask: ...
-        def _wait_clip_image_task(self, task: _ClipImageTask) -> Any: ...
-        async def _await_clip_image_task(self, task: _ClipImageTask) -> Any: ...
-        def _bind_non_text_lease_to_future(
-            self,
-            family: str,
-            future: Future[Any] | asyncio.Future[Any],
-        ) -> None: ...
-        def _bind_image_request_slot_to_future(
-            self,
-            future: Future[Any] | asyncio.Future[Any],
-        ) -> None: ...
-        def _acquire_non_text_family_lease(self, family: str) -> bool: ...
-        async def _acquire_non_text_family_lease_async(self, family: str) -> bool: ...
-        def _release_non_text_family_lease(self, family: str) -> None: ...
-        def _run_control(
-            self,
-            func: Callable[..., Any],
-            *args: Any,
-        ) -> asyncio.Future[Any]: ...
-        @staticmethod
-        def _run_in_executor(
-            executor: ThreadPoolExecutor,
-            func: Any,
-            *args: Any,
-        ) -> asyncio.Future[Any]: ...
+    def _require_clip_image_dispatch_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self._clip_image_dispatch_loop
+        if loop is None:
+            raise RuntimeError("CLIP image queue loop is not initialized.")
+        return loop
 
-    def _worker_loop(self) -> None:
+    def _require_clip_image_queue(self) -> asyncio.Queue[Optional[_ClipImageTask]]:
+        queue = self._clip_image_queue
+        if queue is None:
+            raise RuntimeError("CLIP image queue is not initialized.")
+        return queue
+
+    def _clip_image_worker_thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._clip_image_dispatch_loop = loop
+        self._clip_image_queue = asyncio.Queue(maxsize=self._queue_capacity)
+        self._clip_image_loop_ready.set()
+        worker_task = loop.create_task(self._worker_loop())
+        try:
+            loop.run_forever()
+        finally:
+            worker_task.cancel()
+            loop.run_until_complete(asyncio.gather(worker_task, return_exceptions=True))
+            self._clip_image_queue = None
+            self._clip_image_dispatch_loop = None
+            loop.close()
+
+    async def _worker_loop(self) -> None:
+        queue = self._require_clip_image_queue()
+        stop_after_batch = False
         while True:
-            clip_image_task: Optional[_ClipImageTask] = None
+            task = await queue.get()
+            if task is None:
+                queue.task_done()
+                break
+            if task.cancel_requested.is_set():
+                queue.task_done()
+                continue
+            task.started_at = time.monotonic()
+            task.started_event.set()
+            batch, stop_after_batch = await self._collect_clip_image_batch(task)
+            try:
+                self._handle_clip_image_tasks(batch)
+            finally:
+                for _ in batch:
+                    queue.task_done()
+            if stop_after_batch:
+                break
 
-            with self._clip_image_condition:
-                while True:
-                    if self._stopping or self._clip_image_queue:
-                        break
-                    self._clip_image_condition.wait()
-
-                if self._stopping:
-                    break
-
-                if self._clip_image_queue:
-                    clip_image_task = self._clip_image_queue.popleft()
-                    clip_image_task.started_at = time.monotonic()
-                    clip_image_task.started_event.set()
-
-            if clip_image_task is not None:
-                self._handle_clip_image_tasks(
-                    self._collect_clip_image_batch(clip_image_task)
-                )
-
-    def _collect_clip_image_batch(self, first_task: _ClipImageTask) -> List[_ClipImageTask]:
+    async def _collect_clip_image_batch(
+        self,
+        first_task: _ClipImageTask,
+    ) -> tuple[List[_ClipImageTask], bool]:
         batch = [first_task]
         if self._clip_image_batch_size <= 1:
-            return batch
+            return batch, False
 
-        deadline = time.monotonic() + self._clip_image_batch_wait_seconds
+        queue = self._require_clip_image_queue()
+        deadline = asyncio.get_running_loop().time() + self._clip_image_batch_wait_seconds
+        stop_after_batch = False
 
         while len(batch) < self._clip_image_batch_size:
-            with self._clip_image_condition:
-                if not self._clip_image_queue:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0.0:
-                        return batch
-                    self._clip_image_condition.wait(timeout=remaining)
-                    continue
-
-                popped = self._clip_image_queue.popleft()
-                popped.started_at = time.monotonic()
-                popped.started_event.set()
-                batch.append(popped)
-        return batch
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                break
+            try:
+                popped = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            if popped is None:
+                queue.task_done()
+                stop_after_batch = True
+                break
+            if popped.cancel_requested.is_set():
+                queue.task_done()
+                continue
+            popped.started_at = time.monotonic()
+            popped.started_event.set()
+            batch.append(popped)
+        return batch, stop_after_batch
 
     def _handle_clip_image_tasks(self, tasks: List[_ClipImageTask]) -> None:
         if not tasks:
@@ -265,50 +272,46 @@ class ClipImageMixin:
             for index in range(len(tensors))
         ]
 
-    def get_image_embedding(self, image: np.ndarray) -> List[float]:
-        lease_bound = False
-        image_slot_bound = False
+    def _acquire_clip_image_lease(self) -> _ManagedLease:
+        lease = _ManagedLease("CLIP")
         self._acquire_image_request_slot("CLIP")
+        lease.push(self._release_image_request_slot)
+        self._acquire_non_text_family_lease("vision")
+        lease.push(lambda: self._release_non_text_family_lease("vision"))
+        return lease
+
+    async def _acquire_clip_image_lease_async(self) -> _ManagedLease:
+        lease = _ManagedLease("CLIP")
+        self._acquire_image_request_slot("CLIP")
+        lease.push(self._release_image_request_slot)
+        await self._acquire_non_text_family_lease_async("vision")
+        lease.push(lambda: self._release_non_text_family_lease("vision"))
+        return lease
+
+    def get_image_embedding(self, image: np.ndarray) -> List[float]:
+        lease = self._acquire_clip_image_lease()
         try:
-            self._acquire_non_text_family_lease("vision")
-            try:
-                self._ensure_clip_vision_loaded()
-                payload = self._preprocess_clip_image_tensor(image)
-                task = self._submit_clip_image_task(payload=payload)
-                self._bind_non_text_lease_to_future("vision", task.future)
-                self._bind_image_request_slot_to_future(task.future)
-                lease_bound = True
-                image_slot_bound = True
-                return self._wait_clip_image_task(task)
-            finally:
-                if not lease_bound:
-                    self._release_non_text_family_lease("vision")
-        finally:
-            if not image_slot_bound:
-                self._release_image_request_slot()
+            self._ensure_clip_vision_loaded()
+            payload = self._preprocess_clip_image_tensor(image)
+            task = self._submit_clip_image_task(payload=payload)
+            lease.bind_future(task.future)
+            return self._wait_clip_image_task(task)
+        except Exception:
+            lease.release()
+            raise
 
     async def get_image_embedding_async(self, image: np.ndarray) -> List[float]:
-        lease_bound = False
-        image_slot_bound = False
-        self._acquire_image_request_slot("CLIP")
+        lease = await self._acquire_clip_image_lease_async()
         try:
-            await self._acquire_non_text_family_lease_async("vision")
-            try:
-                await self._run_control(self._ensure_clip_vision_loaded)
-                payload = await self._run_in_executor(
-                    self._shared_cpu_executor,
-                    self._preprocess_clip_image_tensor,
-                    image,
-                )
-                task = self._submit_clip_image_task(payload=payload)
-                self._bind_non_text_lease_to_future("vision", task.future)
-                self._bind_image_request_slot_to_future(task.future)
-                lease_bound = True
-                image_slot_bound = True
-                return await self._await_clip_image_task(task)
-            finally:
-                if not lease_bound:
-                    self._release_non_text_family_lease("vision")
-        finally:
-            if not image_slot_bound:
-                self._release_image_request_slot()
+            await self._run_control(self._ensure_clip_vision_loaded)
+            payload = await self._run_in_executor(
+                self._shared_cpu_executor,
+                self._preprocess_clip_image_tensor,
+                image,
+            )
+            task = self._submit_clip_image_task(payload=payload)
+            lease.bind_future(task.future)
+            return await self._await_clip_image_task(task)
+        except Exception:
+            await lease.release_async()
+            raise

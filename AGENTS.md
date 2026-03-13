@@ -194,13 +194,15 @@
 1. Text-CLIP 作为独立单例服务常驻内存，始终保持单线程后台实例。
 2. `/clip/txt` 不进入 Vision-CLIP / OCR / InsightFace 的任何共享队列。
 3. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
-4. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
-5. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 4 条把 OCR 与其他非文本模型族并行常驻。
-6. InsightFace 使用独立执行路径；但其准入必须遵守第 4 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
-7. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
-8. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
-9. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
-10. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
+4. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
+5. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
+6. 非文本模型族切换状态机必须显式建模，当前基线为 `transitions`；禁止再回到多布尔位 + 条件变量拼接出的隐式状态机。
+7. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 5 条把 OCR 与其他非文本模型族并行常驻。
+8. InsightFace 使用独立执行路径；但其准入必须遵守第 5 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
+9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
+10. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+11. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
+12. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
 ---
 

@@ -44,6 +44,7 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     set -eux; \
+    # requirements.txt includes the transitions runtime used by the non-text family state machine. \
     pip install --cache-dir /root/.cache/pip --prefer-binary -r /tmp/requirements.txt; \
     if pip show opencv-python >/dev/null 2>&1; then pip uninstall -y opencv-python; fi; \
     if pip show opencv-contrib-python >/dev/null 2>&1; then pip uninstall -y opencv-contrib-python; fi; \

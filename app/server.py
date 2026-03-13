@@ -13,55 +13,41 @@ from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
-try:
+if __package__ in {None, ""}:
+    from models import AIModels, MODEL_NAME
+    from schemas import (
+        CheckResponse,
+        TextClipRequest,
+        RestartResponse,
+    )
+else:
     from .models import AIModels, MODEL_NAME
     from .schemas import (
         CheckResponse,
         TextClipRequest,
         RestartResponse,
     )
-except ImportError:
-    try:
-        from app.models import AIModels, MODEL_NAME
-        from app.schemas import (
-            CheckResponse,
-            TextClipRequest,
-            RestartResponse,
-        )
-    except ImportError:
-        from models import AIModels, MODEL_NAME
-        from schemas import (
-            CheckResponse,
-            TextClipRequest,
-            RestartResponse,
-        )
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 _LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
+LOGGER = logging.getLogger("mt_photos_ai.server")
 
-LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper()
-LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
 
-log_handlers = [logging.StreamHandler()]
-if sys.platform == "win32":
-    try:
-        log_handlers = [
-            logging.FileHandler(_LOG_FILE, encoding='utf-8', mode='a'),
-            logging.StreamHandler()
-        ]
-        print(f"服务日志将被写入: {_LOG_FILE}")
-    except Exception as e:
-        print(f"无法设置文件日志: {e}")
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=log_handlers
-)
-
-# 需要在 basicConfig 之后设置，才能覆盖 uvicorn.access 的默认访问日志级别。
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+def _configure_standalone_logging() -> None:
+    log_level_name = os.environ.get("LOG_LEVEL", "WARNING").upper()
+    log_level = getattr(logging, log_level_name, logging.WARNING)
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if sys.platform == "win32":
+        try:
+            handlers.insert(0, logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a"))
+        except Exception as exc:
+            print(f"无法设置文件日志: {exc}")
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
 
 
 API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"
@@ -78,7 +64,7 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
     if not api_auth_key or api_auth_key == "no-key":
         return
     if api_key_header != api_auth_key:
-        logging.warning(f"拒绝了无效的 API 密钥: {api_key_header}")
+        LOGGER.warning("拒绝了无效的 API 密钥。")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -106,7 +92,7 @@ def _startup_self_check_dri() -> None:
     inference_device = os.environ.get("INFERENCE_DEVICE", "AUTO")
     clip_device = os.environ.get("CLIP_INFERENCE_DEVICE", inference_device)
     if not (_device_requests_gpu(inference_device) or _device_requests_gpu(clip_device)):
-        logging.info("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
+        LOGGER.info("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
         return
 
     dri_dir = "/dev/dri"
@@ -137,7 +123,7 @@ def _startup_self_check_dri() -> None:
             f" 无权限节点: {', '.join(denied_nodes)}"
         )
 
-    logging.info(
+    LOGGER.info(
         "启动自检通过：GPU 设备节点可访问。INFERENCE_DEVICE=%s CLIP_INFERENCE_DEVICE=%s",
         inference_device,
         clip_device,
@@ -179,11 +165,11 @@ def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Opti
 async def lifespan(app: FastAPI):
     global models_instance
     _startup_self_check_dri()
-    logging.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
+    LOGGER.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
     models_instance = AIModels()
 
     yield
-    logging.info("应用关闭：正在释放所有模型。")
+    LOGGER.info("应用关闭：正在释放所有模型。")
     if models_instance:
         await asyncio.to_thread(models_instance.release_all_models)
 
@@ -208,23 +194,23 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
         if is_gif:
             img, gif_err = await asyncio.to_thread(_decode_first_gif_frame, contents)
             if img is None and gif_err:
-                logging.info("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
+                LOGGER.info("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
 
         if img is None:
             nparr = np.frombuffer(contents, np.uint8)
             img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
 
         if img is None:
-            logging.info(f"文件 '{file.filename}' 无法被解码为图像。")
+            LOGGER.info("文件 '%s' 无法被解码为图像。", file.filename)
             return None, f"文件 '{file.filename}' 无法被解码为图像。"
 
         if img.dtype == np.uint16:
-            logging.info(f"文件 '{file.filename}' 是 16-bit 图像，正在转换为 8-bit。")
+            LOGGER.info("文件 '%s' 是 16-bit 图像，正在转换为 8-bit。", file.filename)
             img = (img / 256).astype(np.uint8)
 
         height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
         if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
-            logging.info(f"文件 '{file.filename}' 尺寸超限: {width}x{height}")
+            LOGGER.info("文件 '%s' 尺寸超限: %sx%s", file.filename, width, height)
             return None, "height or width out of range"
 
         if channels == 1:
@@ -238,7 +224,7 @@ async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray]
         return img, None
 
     except Exception as e:
-        logging.error(f"读取图像 '{file.filename}' 时发生意外错误: {e}", exc_info=True)
+        LOGGER.error("读取图像 '%s' 时发生意外错误: %s", file.filename, e, exc_info=True)
         return None, f"处理图像时发生意外错误: {str(e)}"
 
 
@@ -272,7 +258,7 @@ async def check_service():
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
     _mark_request_activity()
-    logging.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
+    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
     if models_instance:
         await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}
@@ -280,7 +266,7 @@ async def restart_service():
 @app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_process():
     _mark_request_activity()
-    logging.info("收到 /restart_v2 请求，将重启整个服务进程。")
+    LOGGER.info("收到 /restart_v2 请求，将重启整个服务进程。")
     def delayed_restart():
         import time
         time.sleep(1)
@@ -304,7 +290,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         ocr_results_obj = await models_instance.get_ocr_results_async(image)
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
-        logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
+        LOGGER.error("处理 OCR 请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
 @app.post("/clip/img", dependencies=[Depends(get_api_key)])
@@ -313,7 +299,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
     _mark_request_activity()
-    logging.debug(f"开始处理 CLIP 图像请求: {file.filename}")
+    LOGGER.debug("开始处理 CLIP 图像请求: %s", file.filename)
 
     image, error_msg = await read_image_from_upload(file)
     if image is None:
@@ -324,7 +310,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
     except Exception as e:
-        logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)
+        LOGGER.error("处理 CLIP 请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
 @app.post("/clip/txt", dependencies=[Depends(get_api_key)])
@@ -338,7 +324,7 @@ async def clip_text_endpoint(request: TextClipRequest):
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
     except Exception as e:
-        logging.error(f"处理 CLIP 文本请求失败: '{request.text[:50]}...', 错误: {e}", exc_info=True)
+        LOGGER.error("处理 CLIP 文本请求失败: '%s...', 错误: %s", request.text[:50], e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
 @app.post("/represent", dependencies=[Depends(get_api_key)])
@@ -360,7 +346,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
             "result": results_dict
         }
     except Exception as e:
-        logging.error(f"处理人脸识别请求失败: {file.filename}, 错误: {e}", exc_info=True)
+        LOGGER.error("处理人脸识别请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
         if 'set enforce_detection' in str(e) or 'Face could not be detected' in str(e):
             return {"result": []}
 
@@ -368,6 +354,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
+    _configure_standalone_logging()
     port = int(os.environ.get("PORT", 8060))
     log_level = os.environ.get("LOG_LEVEL", "warning").lower()
 

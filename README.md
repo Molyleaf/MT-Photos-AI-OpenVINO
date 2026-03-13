@@ -70,10 +70,10 @@
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
-- `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再按 `CLIP_IMAGE_BATCH` 聚合成批并通过 `np.stack` 一次送入动态 batch 视觉模型。
+- `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再通过专用 `asyncio.Queue` 做受控微批，并以 `np.stack` 一次送入动态 batch 视觉模型。
 - 为避免 MT-Photos 客户端在积压时主动取消，服务会对 `/clip/img`、`/ocr`、`/represent` 共享一个图片请求名额池；默认值和运行时硬上限都是 `10`，第 `11` 张会立即失败而不是继续挂起等待。
 - RapidOCR 现已回到库内原生 `RapidOCR.__call__` CPU 执行链：服务只负责懒加载、应用层准入和超时控制，不再替换 session、也不再维护自定义 stage 级预处理/批调度。
-- 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界批队列，OCR/InsightFace 使用各自独立执行器；OCR/Face 的异步路径会先完成模型加载，再进入执行超时窗口。
+- 非文本超时仍拆分为“排队超时”和“执行超时”；`/clip/img` 使用有界 `asyncio.Queue` 批队列，OCR/InsightFace 使用各自独立执行器；OCR/Face 的异步路径会先完成模型加载，再进入执行超时窗口。
 - RapidOCR 会直接加载 `RAPIDOCR_OPENVINO_CONFIG_PATH` 指向的 YAML，并额外校验 `Det/Cls/Rec.engine_type=openvino`，避免回落到默认 ORT 配置。
 - RapidOCR 当前基线为 `OpenVINO + CPU + PP-OCRv5 mobile + use_cls=true`；即使显式传入 `RAPIDOCR_DEVICE=AUTO/GPU` 或 stage 级设备变量，运行时也会告警并强制回到 CPU。
 - RapidOCR 默认基线使用 `Det.limit_type=max`；若配置成 `min`，小图会被放大到 `limit_side_len`，通常会明显拉高检测时延。

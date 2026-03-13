@@ -3,19 +3,19 @@ import gc
 import os
 import threading
 import time
-from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager, contextmanager
-from functools import partial
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
 import openvino as ov
+from transitions import Machine
 
 from .clip_image import ClipImageMixin
 from .clip_text import ClipTextMixin
 from .common import (
     _AdmissionController,
+    _ManagedLease,
     NonTextFamily,
     _ClipImageTask,
     _InferenceCancelled,
@@ -41,6 +41,141 @@ from .constants import (
 )
 from .insightface import InsightFaceMixin
 from .rapidocr_lib import RapidOCRMixin
+
+
+class _NonTextFamilyStateModel:
+    def __init__(self) -> None:
+        self.state = "idle"
+
+
+class _NonTextFamilyStateMachine:
+    def __init__(
+        self,
+        *,
+        unload_callback: Callable[[Optional[NonTextFamily]], List[str]],
+        is_stopping: Callable[[], bool],
+    ) -> None:
+        self._unload_callback = unload_callback
+        self._is_stopping = is_stopping
+        self._condition = threading.Condition()
+        self._model = _NonTextFamilyStateModel()
+        self._machine = Machine(
+            model=self._model,
+            states=["idle", "switching", "vision", "ocr", "face"],
+            initial="idle",
+            auto_transitions=False,
+        )
+        self._machine.add_transition("begin_switch", ["idle", "vision", "ocr", "face"], "switching")
+        self._machine.add_transition(
+            "release_to_idle",
+            ["idle", "switching", "vision", "ocr", "face"],
+            "idle",
+        )
+        self._machine.add_transition("activate_vision", ["idle", "switching", "vision"], "vision")
+        self._machine.add_transition("activate_ocr", ["idle", "switching", "ocr"], "ocr")
+        self._machine.add_transition("activate_face", ["idle", "switching", "face"], "face")
+        self._inflight: Dict[NonTextFamily, int] = {
+            "vision": 0,
+            "ocr": 0,
+            "face": 0,
+        }
+
+    def _raise_if_stopping(self) -> None:
+        if self._is_stopping():
+            raise RuntimeError("模型服务已关闭")
+
+    def _active_family_locked(self) -> Optional[NonTextFamily]:
+        if self._model.state in {"idle", "switching"}:
+            return None
+        return self._model.state  # type: ignore[return-value]
+
+    def _activate_family_locked(self, family: NonTextFamily) -> None:
+        getattr(self._model, f"activate_{family}")()
+
+    def acquire(
+        self,
+        family: NonTextFamily,
+        abort_event: Optional[threading.Event] = None,
+    ) -> bool:
+        while True:
+            previous_family: Optional[NonTextFamily]
+            with self._condition:
+                while self._model.state == "switching":
+                    if abort_event is not None and abort_event.is_set():
+                        return False
+                    self._raise_if_stopping()
+                    self._condition.wait(timeout=0.1 if abort_event is not None else None)
+
+                if abort_event is not None and abort_event.is_set():
+                    return False
+                self._raise_if_stopping()
+                previous_family = self._active_family_locked()
+                if previous_family in (None, family):
+                    self._activate_family_locked(family)
+                    self._inflight[family] += 1
+                    return True
+
+                if self._inflight[previous_family] > 0:
+                    self._condition.wait(timeout=0.1 if abort_event is not None else None)
+                    continue
+
+                self._model.begin_switch()
+
+            switch_exc: Optional[Exception] = None
+            unloaded_families: List[str] = []
+            try:
+                unloaded_families = self._unload_callback(keep_family=family)
+            except Exception as exc:
+                switch_exc = exc
+
+            aborted = abort_event is not None and abort_event.is_set()
+            with self._condition:
+                if switch_exc is None and not aborted:
+                    self._activate_family_locked(family)
+                    self._inflight[family] += 1
+                else:
+                    self._model.release_to_idle()
+                self._condition.notify_all()
+
+            if switch_exc is not None:
+                raise switch_exc
+            if aborted:
+                return False
+            if unloaded_families:
+                LOG.info(
+                    "Switched non-text family from %s to %s; released=%s",
+                    previous_family,
+                    family,
+                    ",".join(unloaded_families),
+                )
+            return True
+
+    def release(self, family: NonTextFamily) -> None:
+        with self._condition:
+            inflight = self._inflight[family]
+            if inflight <= 0:
+                return
+            self._inflight[family] = inflight - 1
+            if self._inflight[family] == 0:
+                self._condition.notify_all()
+
+    def begin_release(self) -> None:
+        with self._condition:
+            while self._model.state == "switching":
+                if self._is_stopping():
+                    return
+                self._condition.wait()
+            self._model.begin_switch()
+
+    def wait_for_drain(self) -> None:
+        with self._condition:
+            while any(self._inflight.values()):
+                self._condition.wait()
+
+    def finish_release(self) -> None:
+        with self._condition:
+            self._model.release_to_idle()
+            self._condition.notify_all()
 
 
 class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
@@ -145,8 +280,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             0.0,
             _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
         )
-        self._clip_image_condition = threading.Condition()
-        self._clip_image_queue: Deque[_ClipImageTask] = deque()
+        self._clip_image_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._clip_image_queue: Optional[asyncio.Queue[Optional[_ClipImageTask]]] = None
+        self._clip_image_loop_ready = threading.Event()
         self._clip_image_worker: Optional[threading.Thread] = None
 
     def _initialize_non_text_model_state(self) -> None:
@@ -225,22 +361,23 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._background_prewarm_thread: Optional[threading.Thread] = None
 
     def _initialize_non_text_family_state(self) -> None:
-        self._non_text_condition = threading.Condition()
-        self._non_text_active_family: Optional[NonTextFamily] = None
-        self._non_text_inflight: Dict[NonTextFamily, int] = {
-            "vision": 0,
-            "ocr": 0,
-            "face": 0,
-        }
-        self._non_text_transition_in_progress = False
+        self._non_text_state = _NonTextFamilyStateMachine(
+            unload_callback=self._unload_non_text_models,
+            is_stopping=lambda: self._stopping,
+        )
 
     def _start_clip_image_worker(self) -> None:
         self._clip_image_worker = threading.Thread(
-            target=self._worker_loop,
-            name="ai-model-worker",
+            target=self._clip_image_worker_thread_main,
+            name="ai-clip-queue",
             daemon=True,
         )
         self._clip_image_worker.start()
+        ready = self._clip_image_loop_ready.wait(
+            timeout=max(2.0, float(self._execution_timeout_seconds))
+        )
+        if not ready:
+            raise RuntimeError("CLIP image queue worker failed to initialize in time.")
 
     def _start_background_services(self) -> None:
         self._start_background_prewarm()
@@ -496,33 +633,44 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             f"{runtime_hint}"
         ) from last_exc
 
-    def _clip_image_queue_size_locked(self) -> int:
-        return len(self._clip_image_queue)
+    async def _enqueue_clip_image_task_async(self, task: _ClipImageTask) -> None:
+        if self._stopping:
+            raise RuntimeError("模型服务已关闭")
+        queue = self._clip_image_queue
+        if queue is None:
+            raise RuntimeError("CLIP image queue is not initialized.")
+        if queue.full():
+            raise RuntimeError(f"推理队列已满（上限 {self._queue_capacity}），请稍后重试")
+        queue.put_nowait(task)
 
     def _submit_clip_image_task(self, payload: Any) -> _ClipImageTask:
         future: Future[Any] = Future()
         task = _ClipImageTask(payload=payload, future=future, created_at=time.time())
-        with self._clip_image_condition:
-            if self._stopping:
-                future.set_exception(RuntimeError("模型服务已关闭"))
-                return task
-            if self._clip_image_queue_size_locked() >= self._queue_capacity:
-                future.set_exception(
-                    RuntimeError(f"推理队列已满（上限 {self._queue_capacity}），请稍后重试")
-                )
-                return task
-            self._clip_image_queue.append(task)
-            self._clip_image_condition.notify()
+        loop = self._clip_image_dispatch_loop
+        if self._stopping:
+            future.set_exception(RuntimeError("模型服务已关闭"))
+            return task
+        if loop is None:
+            future.set_exception(RuntimeError("CLIP image queue loop is not initialized."))
+            return task
+        submit_future = asyncio.run_coroutine_threadsafe(
+            self._enqueue_clip_image_task_async(task),
+            loop,
+        )
+        try:
+            submit_future.result(timeout=max(1.0, float(self._queue_timeout_seconds)))
+        except Exception as exc:
+            submit_exc = exc if isinstance(exc, RuntimeError) else RuntimeError(str(exc))
+            self._safe_set_exception(
+                future,
+                submit_exc,
+            )
         return task
 
     def _cancel_clip_image_task_if_queued(self, task: _ClipImageTask, exc: Exception) -> bool:
-        with self._clip_image_condition:
-            if task.started_event.is_set():
-                return False
-            try:
-                self._clip_image_queue.remove(task)
-            except ValueError:
-                return False
+        if task.started_event.is_set():
+            return False
+        task.cancel_requested.set()
         self._safe_set_exception(task.future, exc)
         return True
 
@@ -578,19 +726,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         if not future.done():
             future.set_exception(exc)
 
-    def _bind_non_text_lease_to_future(
-        self,
-        family: NonTextFamily,
-        future: Future[Any] | asyncio.Future[Any],
-    ) -> None:
-        future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
-
-    def _bind_image_request_slot_to_future(
-        self,
-        future: Future[Any] | asyncio.Future[Any],
-    ) -> None:
-        future.add_done_callback(lambda _future: self._release_image_request_slot())
-
     @contextmanager
     def _non_text_request_scope(
         self,
@@ -600,20 +735,18 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         admission: _AdmissionController,
         ensure_loaded: Callable[[], None],
     ) -> Iterator[None]:
+        lease = _ManagedLease(label)
         self._acquire_image_request_slot(label)
+        lease.push(self._release_image_request_slot)
         try:
             self._acquire_non_text_family_lease(family)
-            try:
-                ensure_loaded()
-                self._acquire_admission(admission, label)
-                try:
-                    yield
-                finally:
-                    admission.release()
-            finally:
-                self._release_non_text_family_lease(family)
+            lease.push(lambda: self._release_non_text_family_lease(family))
+            ensure_loaded()
+            self._acquire_admission(admission, label)
+            lease.push(admission.release)
+            yield
         finally:
-            self._release_image_request_slot()
+            lease.release()
 
     @asynccontextmanager
     async def _non_text_request_scope_async(
@@ -624,20 +757,18 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         admission: _AdmissionController,
         ensure_loaded: Callable[[], None],
     ) -> AsyncIterator[None]:
+        lease = _ManagedLease(label)
         self._acquire_image_request_slot(label)
+        lease.push(self._release_image_request_slot)
         try:
             await self._acquire_non_text_family_lease_async(family)
-            try:
-                await self._run_control(ensure_loaded)
-                await self._acquire_admission_async(admission, label)
-                try:
-                    yield
-                finally:
-                    admission.release()
-            finally:
-                self._release_non_text_family_lease(family)
+            lease.push(lambda: self._release_non_text_family_lease(family))
+            await self._run_control(ensure_loaded)
+            await self._acquire_admission_async(admission, label)
+            lease.push(admission.release)
+            yield
         finally:
-            self._release_image_request_slot()
+            await lease.release_async()
 
     def _has_loaded_non_text_models_locked(self) -> bool:
         return bool(
@@ -672,126 +803,13 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         family: NonTextFamily,
         abort_event: Optional[threading.Event] = None,
     ) -> bool | None:
-        while True:
-            previous_family: Optional[NonTextFamily]
-            with self._non_text_condition:
-                while self._non_text_transition_in_progress:
-                    if abort_event is not None and abort_event.is_set():
-                        return False
-                    if self._stopping:
-                        raise RuntimeError("模型服务已关闭")
-                    self._non_text_condition.wait(
-                        timeout=0.1 if abort_event is not None else None
-                    )
-                if abort_event is not None and abort_event.is_set():
-                    return False
-                if self._stopping:
-                    raise RuntimeError("模型服务已关闭")
-
-                previous_family = self._non_text_active_family
-                if previous_family in (None, family):
-                    self._non_text_active_family = family
-                    self._non_text_inflight[family] += 1
-                    return True
-
-                if self._non_text_inflight[previous_family] > 0:
-                    if abort_event is not None and abort_event.is_set():
-                        return False
-                    self._non_text_condition.wait(
-                        timeout=0.1 if abort_event is not None else None
-                    )
-                    continue
-
-                self._non_text_transition_in_progress = True
-
-            switch_exc: Optional[Exception] = None
-            unloaded_families: List[str] = []
-            try:
-                unloaded_families = self._unload_non_text_models(keep_family=family)
-            except Exception as exc:
-                switch_exc = exc
-
-            aborted = abort_event is not None and abort_event.is_set()
-            with self._non_text_condition:
-                if switch_exc is None and not aborted:
-                    self._non_text_active_family = family
-                    self._non_text_inflight[family] += 1
-                self._non_text_transition_in_progress = False
-                self._non_text_condition.notify_all()
-
-            if switch_exc is not None:
-                raise switch_exc
-            if aborted:
-                return False
-            if unloaded_families:
-                LOG.info(
-                    "Switched non-text family from %s to %s; released=%s",
-                    previous_family,
-                    family,
-                    ",".join(unloaded_families),
-                )
-            return True
+        return self._non_text_state.acquire(family, abort_event=abort_event)
 
     async def _acquire_non_text_family_lease_async(self, family: NonTextFamily) -> bool:
-        while True:
-            previous_family: Optional[NonTextFamily]
-            need_wait = False
-            with self._non_text_condition:
-                if self._stopping:
-                    raise RuntimeError("模型服务已关闭")
-                if self._non_text_transition_in_progress:
-                    need_wait = True
-                else:
-                    previous_family = self._non_text_active_family
-                    if previous_family in (None, family):
-                        self._non_text_active_family = family
-                        self._non_text_inflight[family] += 1
-                        return True
-                    elif self._non_text_inflight[previous_family] > 0:
-                        need_wait = True
-                    else:
-                        self._non_text_transition_in_progress = True
-                        need_wait = False
-
-            if need_wait:
-                await asyncio.sleep(0.05)
-                continue
-
-            switch_exc: Optional[Exception] = None
-            unloaded_families: List[str] = []
-            try:
-                unloaded_families = await self._run_control(
-                    partial(self._unload_non_text_models, keep_family=family)
-                )
-            except Exception as exc:
-                switch_exc = exc
-
-            with self._non_text_condition:
-                if switch_exc is None:
-                    self._non_text_active_family = family
-                    self._non_text_inflight[family] += 1
-                self._non_text_transition_in_progress = False
-                self._non_text_condition.notify_all()
-
-            if switch_exc is not None:
-                raise switch_exc
-            if unloaded_families:
-                LOG.info(
-                    "Switched non-text family from %s to %s; released=%s",
-                    previous_family,
-                    family,
-                    ",".join(unloaded_families),
-                )
-            return True
+        return await self._run_control(self._non_text_state.acquire, family)
 
     def _release_non_text_family_lease(self, family: NonTextFamily) -> None:
-        with self._non_text_condition:
-            inflight = self._non_text_inflight[family]
-            if inflight <= 0:
-                return
-            self._non_text_inflight[family] = inflight - 1
-            if self._non_text_inflight[family] == 0:
-                self._non_text_condition.notify_all()
+        self._non_text_state.release(family)
 
     def _unload_non_text_models_locked(
         self,
@@ -835,12 +853,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         join_background_prewarm: bool = True,
     ) -> None:
         join_timeout_seconds = max(2.0, float(self._execution_timeout_seconds))
-        with self._non_text_condition:
-            while self._non_text_transition_in_progress:
-                if self._stopping:
-                    return
-                self._non_text_condition.wait()
-            self._non_text_transition_in_progress = True
+        self._non_text_state.begin_release()
 
         try:
             if cancel_background_prewarm:
@@ -848,9 +861,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             if join_background_prewarm:
                 self._join_background_prewarm_thread(timeout_seconds=join_timeout_seconds)
 
-            with self._non_text_condition:
-                while any(self._non_text_inflight.values()):
-                    self._non_text_condition.wait()
+            self._non_text_state.wait_for_drain()
 
             unloaded = self._unload_non_text_models()
             LOG.info(
@@ -859,10 +870,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 ",".join(unloaded) if unloaded else "none",
             )
         finally:
-            with self._non_text_condition:
-                self._non_text_active_family = None
-                self._non_text_transition_in_progress = False
-                self._non_text_condition.notify_all()
+            self._non_text_state.finish_release()
 
     def _load_family_with_process_lock(
         self, family: NonTextFamily, loader: Callable[[], None]
@@ -1010,6 +1018,23 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             return
         raise RuntimeError(f"{label} 推理任务排队超时（>{self._queue_timeout_seconds}s）")
 
+    async def _shutdown_clip_image_queue_async(self) -> List[_ClipImageTask]:
+        pending: List[_ClipImageTask] = []
+        queue = self._clip_image_queue
+        if queue is None:
+            return pending
+        while True:
+            try:
+                queued = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queue.task_done()
+            if queued is None:
+                continue
+            pending.append(queued)
+        queue.put_nowait(None)
+        return pending
+
     def release_models_for_restart(self) -> None:
         self._release_non_text_models_sync(reason="restart")
 
@@ -1026,13 +1051,23 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             join_background_prewarm=True,
         )
 
-        with self._clip_image_condition:
-            if self._stopping:
-                return
-            self._stopping = True
-            pending_tasks = list(self._clip_image_queue)
-            self._clip_image_queue.clear()
-            self._clip_image_condition.notify_all()
+        if self._stopping:
+            return
+        self._stopping = True
+        pending_tasks: List[_ClipImageTask] = []
+        clip_queue_loop = self._clip_image_dispatch_loop
+        if clip_queue_loop is not None:
+            shutdown_future = asyncio.run_coroutine_threadsafe(
+                self._shutdown_clip_image_queue_async(),
+                clip_queue_loop,
+            )
+            try:
+                pending_tasks = shutdown_future.result(
+                    timeout=max(2.0, float(self._execution_timeout_seconds))
+                )
+            except Exception as exc:
+                LOG.warning("Failed to drain CLIP image queue during shutdown: %s", exc)
+            clip_queue_loop.call_soon_threadsafe(clip_queue_loop.stop)
 
         for task in pending_tasks:
             self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))

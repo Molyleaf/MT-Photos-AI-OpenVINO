@@ -2,11 +2,10 @@ import asyncio
 import json
 import socket
 import socketserver
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import openvino as ov
@@ -17,17 +16,11 @@ from .constants import (
     CONTEXT_LENGTH,
     LOG,
     PROCESS_LOCK_POLL_SECONDS,
-    QA_CLIP_CLIP_ROOT,
     TEXT_RPC_HOST,
 )
+from .qa_clip_tokenizer import create_full_tokenizer
 
-if str(QA_CLIP_CLIP_ROOT) not in sys.path:
-    sys.path.insert(0, str(QA_CLIP_CLIP_ROOT))
-
-# noinspection PyUnresolvedReferences
-from bert_tokenizer import FullTokenizer  # noqa: E402
-
-_TOKENIZER = FullTokenizer()
+_TOKENIZER = create_full_tokenizer()
 _PAD_TOKEN_ID = int(_TOKENIZER.vocab["[PAD]"])
 _CLS_TOKEN_ID = int(_TOKENIZER.vocab["[CLS]"])
 _SEP_TOKEN_ID = int(_TOKENIZER.vocab["[SEP]"])
@@ -67,13 +60,6 @@ class ClipTextMixin:
     _text_service_server: Optional[_TextClipRpcServer]
     _text_service_thread: Optional[threading.Thread]
     _text_service_port: Optional[int]
-
-    if TYPE_CHECKING:
-        def _compile_clip_model(
-            self,
-            model_or_path: Any,
-            performance_hint: str,
-        ) -> ov.CompiledModel: ...
 
     def _read_text_service_meta(self) -> Optional[Dict[str, Any]]:
         try:

@@ -5,10 +5,9 @@ import threading
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-from importlib import import_module
 from pathlib import Path
 from queue import LifoQueue
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -18,14 +17,10 @@ from rapidocr import RapidOCR
 from rapidocr.utils.log import logger as RAPIDOCR_LOGGER
 from rapidocr.utils.typings import EngineType
 
-if TYPE_CHECKING:
-    from app.schemas import OCRBox, OCRResult
-elif __package__ and "." in __package__:
-    from ..schemas import OCRBox, OCRResult
+if __package__ == "models":
+    from schemas import OCRBox, OCRResult
 else:
-    _schemas = import_module("schemas")
-    OCRBox = _schemas.OCRBox
-    OCRResult = _schemas.OCRResult
+    from ..schemas import OCRBox, OCRResult
 
 from .common import (
     _AdmissionController,
@@ -66,39 +61,6 @@ class RapidOCRMixin:
     _shared_cpu_executor: ThreadPoolExecutor
     _ocr_admission: _AdmissionController
     _ocr_execution_timeout_seconds: int
-
-    if TYPE_CHECKING:
-        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
-        def _non_text_request_scope(
-            self,
-            *,
-            family: str,
-            admission: _AdmissionController,
-            label: str,
-            ensure_loaded: Any,
-        ) -> Any: ...
-        async def _non_text_request_scope_async(
-            self,
-            *,
-            family: str,
-            admission: _AdmissionController,
-            label: str,
-            ensure_loaded: Any,
-        ) -> Any: ...
-        @staticmethod
-        def _run_in_executor(
-            executor: ThreadPoolExecutor,
-            func: Any,
-            *args: Any,
-        ) -> asyncio.Future[Any]: ...
-        async def _await_with_timeout_and_cooperative_cancel(
-            self,
-            awaitable: asyncio.Future[Any] | asyncio.Task[Any],
-            *,
-            cancel_event: threading.Event,
-            timeout_seconds: float,
-            task_name: str,
-        ) -> Any: ...
 
     def _require_rapidocr_config_path(self) -> Path:
         if not self.rapidocr_config_path.is_file():

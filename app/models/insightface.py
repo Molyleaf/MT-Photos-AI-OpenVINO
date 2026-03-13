@@ -7,26 +7,18 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-try:
-    import onnx
-except Exception:  # pragma: no cover - runtime dependency validated during face load
-    onnx = None
+import onnx
 from insightface.app import FaceAnalysis
 
-if TYPE_CHECKING:
-    from app.schemas import FacialArea, RepresentResult
-elif __package__ and "." in __package__:
-    from ..schemas import FacialArea, RepresentResult
+if __package__ == "models":
+    from schemas import FacialArea, RepresentResult
 else:
-    _schemas = import_module("schemas")
-    FacialArea = _schemas.FacialArea
-    RepresentResult = _schemas.RepresentResult
+    from ..schemas import FacialArea, RepresentResult
 
 from .common import (
     _AdmissionController,
@@ -170,48 +162,6 @@ class InsightFaceMixin:
     _face_executor: ThreadPoolExecutor
     _face_admission: _AdmissionController
     _execution_timeout_seconds: int
-
-    if TYPE_CHECKING:
-        def _build_openvino_preprocess_runner(
-            self,
-            runner_name: str,
-            device_name: str,
-            output_height: int,
-            output_width: int,
-            mean_values: List[float],
-            std_values: List[float],
-        ) -> _OpenVinoPreprocessRunner: ...
-        def _load_family_with_process_lock(self, family: str, loader: Any) -> None: ...
-        def _non_text_request_scope(
-            self,
-            *,
-            family: str,
-            admission: _AdmissionController,
-            label: str,
-            ensure_loaded: Any,
-        ) -> Any: ...
-        async def _non_text_request_scope_async(
-            self,
-            *,
-            family: str,
-            admission: _AdmissionController,
-            label: str,
-            ensure_loaded: Any,
-        ) -> Any: ...
-        @staticmethod
-        def _run_in_executor(
-            executor: ThreadPoolExecutor,
-            func: Any,
-            *args: Any,
-        ) -> asyncio.Future[Any]: ...
-        async def _await_with_timeout_and_cooperative_cancel(
-            self,
-            awaitable: asyncio.Future[Any] | asyncio.Task[Any],
-            *,
-            cancel_event: threading.Event,
-            timeout_seconds: float,
-            task_name: str,
-        ) -> Any: ...
 
     @staticmethod
     def _enable_insightface_opencl_alignment() -> None:

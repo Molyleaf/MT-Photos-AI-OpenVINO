@@ -6,7 +6,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Tuple, cast
+from typing import Any, Callable, List, Literal, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -17,14 +17,13 @@ from .constants import (
     PROCESS_LOCK_POLL_SECONDS,
 )
 
-try:
-    import fcntl  # type: ignore[attr-defined]
-except ImportError:
-    fcntl = None  # type: ignore[assignment]
-
-try:
+if os.name == "nt":
     import msvcrt  # type: ignore[attr-defined]
-except ImportError:
+
+    fcntl = None  # type: ignore[assignment]
+else:
+    import fcntl  # type: ignore[attr-defined]
+
     msvcrt = None  # type: ignore[assignment]
 
 
@@ -474,20 +473,7 @@ class _AdmissionController:
             return True
 
     async def acquire_async(self, timeout: Optional[float]) -> bool:
-        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
-        while True:
-            with self._condition:
-                if self._active < self._capacity:
-                    self._active += 1
-                    return True
-
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    return False
-                await asyncio.sleep(min(PROCESS_LOCK_POLL_SECONDS, remaining))
-            else:
-                await asyncio.sleep(PROCESS_LOCK_POLL_SECONDS)
+        return await asyncio.to_thread(self.acquire, timeout)
 
     def release(self) -> None:
         with self._condition:

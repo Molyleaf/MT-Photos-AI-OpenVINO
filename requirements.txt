@@ -11,3 +11,4 @@ uvicorn
 python-multipart
 pyyaml
 six
+transitions
