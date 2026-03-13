@@ -111,9 +111,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
-        self._clip_vision_input_name: Optional[str] = None
-        self._clip_vision_host_input_cache: Dict[tuple[int, int, int], tuple[ov.Tensor, Any]] = {}
-        self._clip_vision_host_tensor_enabled = self._clip_remote_context is not None
         self._clip_image_batch_size = max(
             1,
             _as_int(
@@ -129,8 +126,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._rapidocr_engines = None
         self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
-        self._ocr_opencl_device_name: Optional[str] = None
-        self._ocr_opencl_device_vendor: Optional[str] = None
         self._face_engine = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
@@ -161,14 +156,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ocr_det_executor = ThreadPoolExecutor(
             max_workers=self._ocr_stage_worker_count,
             thread_name_prefix="ocr-det",
-        )
-        self._ocr_cls_executor = ThreadPoolExecutor(
-            max_workers=self._ocr_stage_worker_count,
-            thread_name_prefix="ocr-cls",
-        )
-        self._ocr_rec_executor = ThreadPoolExecutor(
-            max_workers=self._ocr_stage_worker_count,
-            thread_name_prefix="ocr-rec",
         )
         self._face_worker_count = self._resolve_face_worker_count()
         self._face_executor = ThreadPoolExecutor(
@@ -954,11 +941,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             return
         raise RuntimeError(f"{label} 推理任务排队超时（>{self._queue_timeout_seconds}s）")
 
-    def release_models(self) -> None:
-        self._release_non_text_models_sync(reason="manual")
-
-    def release_models_for_restart(self, text_restore_delay_seconds: Optional[float] = None) -> None:
-        _ = text_restore_delay_seconds
+    def release_models_for_restart(self) -> None:
         self._release_non_text_models_sync(reason="restart")
 
     def release_all_models(self) -> None:
@@ -994,8 +977,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._control_executor,
             self._shared_cpu_executor,
             self._ocr_det_executor,
-            self._ocr_cls_executor,
-            self._ocr_rec_executor,
             self._face_executor,
         ):
             executor.shutdown(wait=True, cancel_futures=True)

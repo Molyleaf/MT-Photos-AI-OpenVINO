@@ -36,17 +36,15 @@ except ImportError:
             RestartResponse,
         )
 
-# --- NSSM 日志优化和级别设置 ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
 _LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
 
-LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper() #
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
 
-log_handlers = [logging.StreamHandler()] # 默认输出到控制台
+log_handlers = [logging.StreamHandler()]
 if sys.platform == "win32":
-    # 在 Windows (NSSM) 上，额外记录到文件
     try:
         log_handlers = [
             logging.FileHandler(_LOG_FILE, encoding='utf-8', mode='a'),
@@ -62,10 +60,8 @@ logging.basicConfig(
     handlers=log_handlers
 )
 
-# --- 【修复日志：强制关闭 Uvicorn 200 访问日志】 ---
-# 必须在 basicConfig 之后调用，以覆盖 uvicorn.access 的默认设置
+# 需要在 basicConfig 之后设置，才能覆盖 uvicorn.access 的默认访问日志级别。
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-# --- 日志配置结束 ---
 
 
 API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"
@@ -95,9 +91,7 @@ MAX_IMAGE_SIDE = 10000
 def _mark_request_activity() -> None:
     if models_instance is None:
         return
-    mark_activity = getattr(models_instance, "mark_request_activity", None)
-    if callable(mark_activity):
-        mark_activity()
+    models_instance.mark_request_activity()
 
 
 def _device_requests_gpu(device_name: str) -> bool:
@@ -195,10 +189,7 @@ async def lifespan(app: FastAPI):
     yield
     logging.info("应用关闭：正在释放所有模型。")
     if models_instance:
-        if hasattr(models_instance, 'release_all_models') and callable(models_instance.release_all_models):
-            await asyncio.to_thread(models_instance.release_all_models)
-        else:
-            logging.info("AIModels 实例没有 release_all_models 方法 (lifespan)。")
+        await asyncio.to_thread(models_instance.release_all_models)
 
 
 app = FastAPI(
@@ -273,31 +264,21 @@ async def top_info():
 </html>"""
     return HTMLResponse(content=html_content)
 
-# --- 【修复：合并 /check 响应】 ---
 @app.post("/check", response_model=CheckResponse, dependencies=[Depends(get_api_key)])
-async def check_service(t: str = ""):
+async def check_service():
     _mark_request_activity()
     return {
         "result": "pass",
         "title": "mt-photos-ai服务",
         "help": "https://mtmt.tech/docs/advanced/ocr_api",
     }
-# --- 修复结束 ---
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
     _mark_request_activity()
     logging.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
     if models_instance:
-        if (
-            hasattr(models_instance, "release_models_for_restart")
-            and callable(models_instance.release_models_for_restart)
-        ):
-            await asyncio.to_thread(models_instance.release_models_for_restart)
-        elif hasattr(models_instance, "release_models") and callable(models_instance.release_models):
-            await asyncio.to_thread(models_instance.release_models)
-        else:
-            logging.error("'AIModels' object has no attribute 'release_models' during restart request!")
+        await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}
 
 @app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
@@ -325,7 +306,6 @@ async def ocr_endpoint(file: UploadFile = File(...)):
 
     try:
         ocr_results_obj = await models_instance.get_ocr_results_async(image)
-        # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         logging.error(f"处理 OCR 请求失败: {file.filename}, 错误: {e}", exc_info=True)
@@ -344,9 +324,8 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         return {"result": [], "msg": error_msg}
 
     try:
-        embedding = await models_instance.get_image_embedding_async(image, file.filename)
+        embedding = await models_instance.get_image_embedding_async(image)
         result_strings = [f"{f:.16f}" for f in embedding]
-        # --- 【修复检查点1：成功时不返回 msg】 ---
         return {"result": result_strings}
     except Exception as e:
         logging.error(f"处理 CLIP 请求失败: {file.filename}, 错误: {e}", exc_info=True)

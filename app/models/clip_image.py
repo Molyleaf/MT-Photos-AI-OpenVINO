@@ -2,7 +2,7 @@ import asyncio
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import cv2
 import numpy as np
@@ -33,9 +33,6 @@ class ClipImageMixin:
     _clip_vision_model: Optional[ov.CompiledModel]
     _clip_vision_ppp: Any
     _clip_vision_request: Optional[ov.InferRequest]
-    _clip_vision_input_name: Optional[str]
-    _clip_vision_host_input_cache: dict[tuple[int, int, int], tuple[ov.Tensor, Any]]
-    _clip_vision_host_tensor_enabled: bool
 
     if TYPE_CHECKING:
         def _acquire_image_request_slot(self, label: str) -> None: ...
@@ -135,8 +132,6 @@ class ClipImageMixin:
         self._clip_vision_request = None
         self._clip_vision_model = None
         self._clip_vision_ppp = None
-        self._clip_vision_input_name = None
-        self._clip_vision_host_input_cache.clear()
 
     def _unload_clip_vision_model(self) -> None:
         with self._clip_vision_load_lock:
@@ -168,79 +163,6 @@ class ClipImageMixin:
             return self.core.compile_model(str(model_or_path), self._clip_inference_device, config)
         return self.core.compile_model(model_or_path, self._clip_inference_device, config)
 
-    def _build_clip_vision_ppp_model(self, model_path: Path) -> ov.Model:
-        model = self.core.read_model(str(model_path))
-        input_shape = model.inputs[0].get_partial_shape()
-        if not input_shape.rank.is_static or input_shape.rank.get_length() != 4:
-            raise RuntimeError(
-                "CLIP vision input rank must be 4, "
-                f"got rank={input_shape.rank}"
-            )
-
-        model_height = input_shape[2]
-        model_width = input_shape[3]
-        if model_height.is_static and int(model_height.get_length()) != int(CLIP_IMAGE_RESOLUTION):
-            raise RuntimeError(
-                "CLIP image height mismatch: "
-                f"expected={CLIP_IMAGE_RESOLUTION}, got={int(model_height.get_length())}"
-            )
-        if model_width.is_static and int(model_width.get_length()) != int(CLIP_IMAGE_RESOLUTION):
-            raise RuntimeError(
-                "CLIP image width mismatch: "
-                f"expected={CLIP_IMAGE_RESOLUTION}, got={int(model_width.get_length())}"
-            )
-
-        ppp = ov.preprocess.PrePostProcessor(model)
-        ppp.input().tensor().set_shape([-1, -1, -1, 3]).set_element_type(ov.Type.u8).set_layout(
-            ov.Layout("NHWC")
-        ).set_color_format(ov.preprocess.ColorFormat.BGR)
-        ppp.input().preprocess().resize(
-            ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR,
-            int(CLIP_IMAGE_RESOLUTION),
-            int(CLIP_IMAGE_RESOLUTION),
-        )
-        ppp.input().preprocess().convert_color(ov.preprocess.ColorFormat.RGB)
-        ppp.input().preprocess().convert_element_type(ov.Type.f32)
-        ppp.input().preprocess().scale([255.0, 255.0, 255.0])
-        ppp.input().preprocess().mean(_CLIP_IMAGE_MEAN.tolist())
-        ppp.input().preprocess().scale(_CLIP_IMAGE_STD.tolist())
-        ppp.input().model().set_layout(ov.Layout("NCHW"))
-        return ppp.build()
-
-    def _get_clip_vision_host_input(
-        self, batch_size: int, image_height: int, image_width: int
-    ) -> Optional[Tuple[ov.Tensor, np.ndarray]]:
-        if (
-            not self._clip_vision_host_tensor_enabled
-            or self._clip_remote_context is None
-            or self._clip_vision_model is None
-        ):
-            return None
-
-        cache_key = (int(batch_size), int(image_height), int(image_width))
-        cached = self._clip_vision_host_input_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        try:
-            input_port = self._clip_vision_model.inputs[0]
-            input_shape = ov.Shape([int(batch_size), int(image_height), int(image_width), 3])
-            input_tensor = self._clip_remote_context.create_host_tensor(
-                input_port.get_element_type(), input_shape
-            )
-            input_view = np.asarray(input_tensor.data)
-            cache_entry = (input_tensor, input_view)
-            self._clip_vision_host_input_cache[cache_key] = cache_entry
-            return cache_entry
-        except Exception as exc:
-            LOG.warning(
-                "CLIP vision host tensor allocation failed, fallback to shared numpy inputs: %s",
-                exc,
-            )
-            self._clip_vision_host_tensor_enabled = False
-            self._clip_vision_host_input_cache.clear()
-            return None
-
     def _load_clip_vision_locked(self) -> None:
         vision_model_path = self.qa_clip_path / "openvino_image_fp16.xml"
         if not vision_model_path.exists():
@@ -266,7 +188,6 @@ class ClipImageMixin:
 
         self._clip_vision_model = compiled_model
         self._clip_vision_request = compiled_model.create_infer_request()
-        self._clip_vision_input_name = self._clip_vision_model.inputs[0].any_name
         self._clip_vision_ppp = self._build_openvino_preprocess_runner(
             runner_name="clip_vision",
             device_name=self._clip_inference_device,
@@ -275,8 +196,6 @@ class ClipImageMixin:
             mean_values=_CLIP_IMAGE_MEAN.tolist(),
             std_values=_CLIP_IMAGE_STD.tolist(),
         )
-        self._clip_vision_host_input_cache.clear()
-        self._clip_vision_host_tensor_enabled = False
         LOG.info(
             "CLIP Vision model loaded on %s with post-preprocess batching (batch=%s).",
             self._clip_inference_device,
@@ -347,8 +266,7 @@ class ClipImageMixin:
             for index in range(len(tensors))
         ]
 
-    def get_image_embedding(self, image: np.ndarray, filename: str = "unknown") -> List[float]:
-        _ = filename
+    def get_image_embedding(self, image: np.ndarray) -> List[float]:
         lease_bound = False
         image_slot_bound = False
         self._acquire_image_request_slot("CLIP")
@@ -370,10 +288,7 @@ class ClipImageMixin:
             if not image_slot_bound:
                 self._release_image_request_slot()
 
-    async def get_image_embedding_async(
-        self, image: np.ndarray, filename: str = "unknown"
-    ) -> List[float]:
-        _ = filename
+    async def get_image_embedding_async(self, image: np.ndarray) -> List[float]:
         lease_bound = False
         image_slot_bound = False
         self._acquire_image_request_slot("CLIP")
