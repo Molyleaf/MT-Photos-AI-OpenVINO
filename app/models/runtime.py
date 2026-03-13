@@ -46,7 +46,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     Text-CLIP stays resident as a single-threaded singleton service.
     Image-CLIP uses a dedicated batch queue after standardized preprocessing.
     Non-text families are lazy-loaded and switch synchronously so only one
-    vision/OCR/face family stays resident at a time.
+    vision/OCR/face family stays resident at a time, with idle release.
     """
 
     def __init__(self) -> None:
@@ -178,6 +178,15 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             ),
         )
         self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
+        self._idle_release_timeout_seconds = max(
+            0.0,
+            _as_float(os.environ.get("NON_TEXT_IDLE_RELEASE_SECONDS"), 60.0),
+        )
+        self._request_activity_lock = threading.Lock()
+        self._last_request_monotonic = time.monotonic()
+        self._idle_release_stop = threading.Event()
+        self._idle_release_wakeup = threading.Event()
+        self._idle_release_thread: Optional[threading.Thread] = None
         self._ocr_admission = _AdmissionController(
             "ocr",
             self._resolve_ocr_request_capacity(self._ocr_stage_worker_count),
@@ -206,9 +215,10 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ensure_text_service_ready(preload=True)
         self._background_prewarm_thread: Optional[threading.Thread] = None
         self._start_background_prewarm()
+        self._start_idle_release_monitor()
 
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_admission=%s face_workers=%s face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -220,6 +230,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             int(self._clip_image_batch_wait_seconds * 1000.0),
             "owner" if self._text_service_owner else "client",
             _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
+            int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
             self._face_worker_count,
             self._face_admission.capacity,
@@ -258,6 +269,63 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             daemon=True,
         )
         self._background_prewarm_thread.start()
+
+    def _start_idle_release_monitor(self) -> None:
+        if self._idle_release_timeout_seconds <= 0:
+            return
+        self._idle_release_stop.clear()
+        self._idle_release_wakeup.clear()
+        self._idle_release_thread = threading.Thread(
+            target=self._idle_release_loop,
+            name="ai-idle-release",
+            daemon=True,
+        )
+        self._idle_release_thread.start()
+
+    def mark_request_activity(self) -> None:
+        with self._request_activity_lock:
+            self._last_request_monotonic = time.monotonic()
+        self._idle_release_wakeup.set()
+
+    def _snapshot_last_request_monotonic(self) -> float:
+        with self._request_activity_lock:
+            return self._last_request_monotonic
+
+    def _idle_release_loop(self) -> None:
+        poll_seconds = min(5.0, max(0.5, self._idle_release_timeout_seconds / 6.0))
+        while not self._idle_release_stop.is_set():
+            deadline = self._snapshot_last_request_monotonic() + self._idle_release_timeout_seconds
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._idle_release_wakeup.wait(timeout=min(poll_seconds, remaining))
+                self._idle_release_wakeup.clear()
+                continue
+
+            try:
+                if self._has_loaded_non_text_models():
+                    LOG.info(
+                        "No business request for %.1fs; releasing non-text models.",
+                        self._idle_release_timeout_seconds,
+                    )
+                    self._release_non_text_models_sync(reason="idle-timeout")
+            except Exception as exc:
+                LOG.warning("Idle non-text model release failed: %s", exc, exc_info=True)
+            finally:
+                with self._request_activity_lock:
+                    self._last_request_monotonic = time.monotonic()
+
+    def _join_idle_release_thread(self, timeout_seconds: Optional[float]) -> None:
+        thread = self._idle_release_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            LOG.warning(
+                "Idle-release thread did not exit within %.1fs.",
+                float(timeout_seconds or 0.0),
+            )
+            return
+        self._idle_release_thread = None
 
     def _background_prewarm_loop(self) -> None:
         delay_seconds = max(0.0, _as_float(os.environ.get("OCR_PREWARM_DELAY_SECONDS"), 1.0))
@@ -484,6 +552,21 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         future: Future[Any] | asyncio.Future[Any],
     ) -> None:
         future.add_done_callback(lambda _future: self._release_non_text_family_lease(family))
+
+    def _has_loaded_non_text_models_locked(self) -> bool:
+        return bool(
+            self._clip_vision_model is not None
+            or self._clip_vision_request is not None
+            or self._clip_vision_ppp is not None
+            or self._rapidocr_engine is not None
+            or self._face_engine is not None
+            or self._face_det_ppp is not None
+            or self._face_rec_ppp is not None
+        )
+
+    def _has_loaded_non_text_models(self) -> bool:
+        with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
+            return self._has_loaded_non_text_models_locked()
 
     def _join_background_prewarm_thread(self, timeout_seconds: Optional[float]) -> None:
         thread = self._background_prewarm_thread
@@ -850,6 +933,11 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._release_non_text_models_sync(reason="restart")
 
     def release_all_models(self) -> None:
+        self._idle_release_stop.set()
+        self._idle_release_wakeup.set()
+        self._join_idle_release_thread(
+            timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
+        )
         self._background_prewarm_cancel.set()
         self._release_non_text_models_sync(
             reason="shutdown",

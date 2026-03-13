@@ -21,12 +21,20 @@ try:
         RestartResponse,
     )
 except ImportError:
-    from models import AIModels, MODEL_NAME
-    from schemas import (
-        CheckResponse,
-        TextClipRequest,
-        RestartResponse,
-    )
+    try:
+        from app.models import AIModels, MODEL_NAME
+        from app.schemas import (
+            CheckResponse,
+            TextClipRequest,
+            RestartResponse,
+        )
+    except ImportError:
+        from models import AIModels, MODEL_NAME
+        from schemas import (
+            CheckResponse,
+            TextClipRequest,
+            RestartResponse,
+        )
 
 # --- NSSM 日志优化和级别设置 ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -82,6 +90,14 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
 
 models_instance: Optional[AIModels] = None
 MAX_IMAGE_SIDE = 10000
+
+
+def _mark_request_activity() -> None:
+    if models_instance is None:
+        return
+    mark_activity = getattr(models_instance, "mark_request_activity", None)
+    if callable(mark_activity):
+        mark_activity()
 
 
 def _device_requests_gpu(device_name: str) -> bool:
@@ -260,6 +276,7 @@ async def top_info():
 # --- 【修复：合并 /check 响应】 ---
 @app.post("/check", response_model=CheckResponse, dependencies=[Depends(get_api_key)])
 async def check_service(t: str = ""):
+    _mark_request_activity()
     return {
         "result": "pass",
         "title": "mt-photos-ai服务",
@@ -269,6 +286,7 @@ async def check_service(t: str = ""):
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
+    _mark_request_activity()
     logging.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
     if models_instance:
         if (
@@ -284,6 +302,7 @@ async def restart_service():
 
 @app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_process():
+    _mark_request_activity()
     logging.info("收到 /restart_v2 请求，将重启整个服务进程。")
     def delayed_restart():
         import time
@@ -299,6 +318,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
+    _mark_request_activity()
     image, error_msg = await read_image_from_upload(file)
     if image is None:
         return {"result": [], "msg": error_msg}
@@ -316,6 +336,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
+    _mark_request_activity()
     logging.debug(f"开始处理 CLIP 图像请求: {file.filename}")
 
     image, error_msg = await read_image_from_upload(file)
@@ -336,6 +357,7 @@ async def clip_text_endpoint(request: TextClipRequest):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
+    _mark_request_activity()
     try:
         embedding = await models_instance.get_text_embedding_async(request.text)
         result_strings = [f"{f:.16f}" for f in embedding]
@@ -349,6 +371,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
+    _mark_request_activity()
     image, error_msg = await read_image_from_upload(file)
     if image is None:
         return {"result": [], "msg": error_msg}

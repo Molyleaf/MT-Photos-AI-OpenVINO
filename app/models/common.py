@@ -277,7 +277,7 @@ def _openvino_device_expr_requests_npu(device_expr: str) -> bool:
 def _default_rapidocr_stage_device(base_device: str, stage_name: str) -> str:
     normalized = _normalize_non_text_openvino_device(base_device)
     stage = str(stage_name).strip().lower()
-    if stage == "cls":
+    if stage in {"cls", "rec"}:
         if _openvino_device_expr_requests_npu(normalized) and not _openvino_device_expr_requests_cpu(
             normalized
         ):

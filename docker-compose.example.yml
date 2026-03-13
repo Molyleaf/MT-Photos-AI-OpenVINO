@@ -23,6 +23,7 @@ services:
       INFERENCE_TASK_TIMEOUT: "10"
       INFERENCE_EXEC_TIMEOUT: "30"
       OCR_EXEC_TIMEOUT: "30"
+      NON_TEXT_IDLE_RELEASE_SECONDS: "60"
       CLIP_IMAGE_BATCH: "8"
       RAPIDOCR_OPENVINO_CONFIG_PATH: "/app/config/cfg_openvino_cpu.yaml"
       RAPIDOCR_MODEL_DIR: "/models/rapidocr"
