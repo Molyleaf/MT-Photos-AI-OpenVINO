@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM python:3.12-slim-trixie
 
 WORKDIR /app
