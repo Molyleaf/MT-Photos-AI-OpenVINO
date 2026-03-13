@@ -1,6 +1,6 @@
 import asyncio
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional
@@ -19,7 +19,7 @@ from .constants import (
 )
 
 
-class ClipImageMixin:
+class ClipImageMixin(ABC):
     core: ov.Core
     qa_clip_path: Path
     _clip_inference_device: str
@@ -84,7 +84,7 @@ class ClipImageMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def _acquire_non_text_family_lease(self, family: NonTextFamily) -> bool | None:
+    def _acquire_non_text_family_lease(self, family: NonTextFamily) -> bool:
         raise NotImplementedError
 
     @abstractmethod

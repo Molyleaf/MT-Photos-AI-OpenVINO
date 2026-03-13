@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 import threading
-from abc import abstractmethod
+from abc import abstractmethod, ABC
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -149,7 +149,7 @@ def _estimate_insightface_norm_matrix(
     return _estimate_similarity_transform_matrix(landmark_array, destination)
 
 
-class InsightFaceMixin:
+class InsightFaceMixin(ABC):
     core: Any
     ov_cache_dir: Optional[Path]
     insightface_root: Path
@@ -348,8 +348,10 @@ class InsightFaceMixin:
         input_width = int(blob.shape[3])
         fmc = det_model.fmc
         batched_output = bool(getattr(det_model, "batched", False))
+        feat_stride_fpn = list(getattr(det_model, "_feat_stride_fpn"))
+        num_anchors = int(getattr(det_model, "_num_anchors"))
 
-        for idx, stride in enumerate(det_model._feat_stride_fpn):
+        for idx, stride in enumerate(feat_stride_fpn):
             kps_preds: Optional[np.ndarray] = None
             if batched_output:
                 scores = net_outs[idx][0]
@@ -373,8 +375,8 @@ class InsightFaceMixin:
                     axis=-1,
                 ).astype(np.float32)
                 anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-                if det_model._num_anchors > 1:
-                    anchor_centers = np.stack([anchor_centers] * det_model._num_anchors, axis=1)
+                if num_anchors > 1:
+                    anchor_centers = np.stack([anchor_centers] * num_anchors, axis=1)
                     anchor_centers = anchor_centers.reshape((-1, 2))
                 if len(det_model.center_cache) < 100:
                     det_model.center_cache[key] = anchor_centers

@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -45,7 +45,7 @@ class _SuppressExpectedRapidOCRNoTextFilter(logging.Filter):
         return record.getMessage().strip() != "The text detection result is empty"
 
 
-class RapidOCRMixin:
+class RapidOCRMixin(ABC):
     core: ov.Core
     ov_cache_dir: Optional[Path]
     rapidocr_config_path: Path

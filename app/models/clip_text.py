@@ -4,7 +4,7 @@ import socket
 import socketserver
 import threading
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +44,7 @@ def _tokenize_for_clip(texts: List[str], context_length: int = CONTEXT_LENGTH) -
     return result
 
 
-class ClipTextMixin:
+class ClipTextMixin(ABC):
     _pid: int
     _execution_timeout_seconds: int
     _clip_inference_device: str
@@ -89,7 +89,8 @@ class ClipTextMixin:
             encoding="utf-8",
         )
 
-    def _probe_text_service(self, port: int, timeout_seconds: float = 0.5) -> bool:
+    @staticmethod
+    def _probe_text_service(port: int, timeout_seconds: float = 0.5) -> bool:
         try:
             with socket.create_connection((TEXT_RPC_HOST, int(port)), timeout=timeout_seconds) as conn:
                 request = {"op": "ping"}

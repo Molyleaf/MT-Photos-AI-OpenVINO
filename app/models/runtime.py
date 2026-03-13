@@ -47,12 +47,27 @@ class _NonTextFamilyStateModel:
     def __init__(self) -> None:
         self.state = "idle"
 
+    def begin_switch(self) -> None:
+        raise NotImplementedError
+
+    def release_to_idle(self) -> None:
+        raise NotImplementedError
+
+    def activate_vision(self) -> None:
+        raise NotImplementedError
+
+    def activate_ocr(self) -> None:
+        raise NotImplementedError
+
+    def activate_face(self) -> None:
+        raise NotImplementedError
+
 
 class _NonTextFamilyStateMachine:
     def __init__(
         self,
         *,
-        unload_callback: Callable[[Optional[NonTextFamily]], List[str]],
+        unload_callback: Callable[[NonTextFamily], List[str]],
         is_stopping: Callable[[], bool],
     ) -> None:
         self._unload_callback = unload_callback
@@ -90,13 +105,18 @@ class _NonTextFamilyStateMachine:
         return self._model.state  # type: ignore[return-value]
 
     def _activate_family_locked(self, family: NonTextFamily) -> None:
-        getattr(self._model, f"activate_{family}")()
+        if family == "vision":
+            self._model.activate_vision()
+        elif family == "ocr":
+            self._model.activate_ocr()
+        else:
+            self._model.activate_face()
 
     def acquire(
         self,
         family: NonTextFamily,
         abort_event: Optional[threading.Event] = None,
-    ) -> bool:
+    ) -> bool | None:
         while True:
             previous_family: Optional[NonTextFamily]
             with self._condition:
@@ -110,7 +130,7 @@ class _NonTextFamilyStateMachine:
                     return False
                 self._raise_if_stopping()
                 previous_family = self._active_family_locked()
-                if previous_family in (None, family):
+                if previous_family is None or previous_family == family:
                     self._activate_family_locked(family)
                     self._inflight[family] += 1
                     return True
@@ -119,7 +139,7 @@ class _NonTextFamilyStateMachine:
                     self._condition.wait(timeout=0.1 if abort_event is not None else None)
                     continue
 
-                getattr(self._model, "begin_switch")()
+                self._model.begin_switch()
 
             switch_exc: Optional[Exception] = None
             unloaded_families: List[str] = []
@@ -134,7 +154,7 @@ class _NonTextFamilyStateMachine:
                     self._activate_family_locked(family)
                     self._inflight[family] += 1
                 else:
-                    getattr(self._model, "release_to_idle")()
+                    self._model.release_to_idle()
                 self._condition.notify_all()
 
             if switch_exc is not None:
@@ -165,7 +185,7 @@ class _NonTextFamilyStateMachine:
                 if self._is_stopping():
                     return
                 self._condition.wait()
-            getattr(self._model, "begin_switch")()
+            self._model.begin_switch()
 
     def wait_for_drain(self) -> None:
         with self._condition:
@@ -174,7 +194,7 @@ class _NonTextFamilyStateMachine:
 
     def finish_release(self) -> None:
         with self._condition:
-            getattr(self._model, "release_to_idle")()
+            self._model.release_to_idle()
             self._condition.notify_all()
 
 
@@ -186,6 +206,13 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     vision/OCR/face family stays resident at a time, with idle release.
     """
     ov_cache_dir: Optional[Path]
+
+    def _compile_clip_model(
+        self,
+        model_or_path: Any,
+        performance_hint: str,
+    ) -> ov.CompiledModel:
+        return ClipImageMixin._compile_clip_model(self, model_or_path, performance_hint)
 
     def __init__(self) -> None:
         self._pid = os.getpid()
@@ -803,7 +830,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self,
         family: NonTextFamily,
         abort_event: Optional[threading.Event] = None,
-    ) -> bool | None:
+    ) -> bool:
         return self._non_text_state.acquire(family, abort_event=abort_event)
 
     async def _acquire_non_text_family_lease_async(self, family: NonTextFamily) -> bool:
