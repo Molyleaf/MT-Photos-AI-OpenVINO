@@ -1,5 +1,5 @@
 numpy==2.3.5
-insightface
+insightface==0.7.3
 fastapi
 pydantic
 openvino

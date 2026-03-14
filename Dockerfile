@@ -12,6 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
     PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn \
     INFERENCE_DEVICE=AUTO \
+    MODEL_PATH=/models \
     RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
     RAPIDOCR_MODEL_DIR=/models/rapidocr
 
@@ -28,6 +29,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
+        g++ \
         libdrm2 \
         libglib2.0-0 \
         libgomp1 \
@@ -45,7 +47,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install --cache-dir /root/.cache/pip --prefer-binary -r /tmp/requirements.txt; \
     if pip show opencv-python >/dev/null 2>&1; then pip uninstall -y opencv-python; fi; \
     if pip show opencv-contrib-python >/dev/null 2>&1; then pip uninstall -y opencv-contrib-python; fi; \
-    pip install --cache-dir /root/.cache/pip --prefer-binary opencv-python-headless; \
+    pip install --cache-dir /root/.cache/pip --prefer-binary --force-reinstall --no-deps opencv-python-headless; \
     rm -f /tmp/requirements.txt
 
 RUN set -eux; \
@@ -72,6 +74,7 @@ RUN set -eux; \
     test -f /models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx
 
 COPY --chown=appuser:appgroup app /app
+COPY --chown=appuser:appgroup scripts /app/scripts
 
 USER appuser
 

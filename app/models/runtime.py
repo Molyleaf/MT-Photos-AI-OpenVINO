@@ -363,6 +363,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_task_queue = None
         self._face_loop_ready = threading.Event()
         self._face_worker: Optional[threading.Thread] = None
+        self._face_preprocess_device: Optional[str] = None
+        self._face_use_opencl = False
 
     def _initialize_execution_controls(self) -> None:
         configured_queue_capacity = max(1, QUEUE_MAX_SIZE)

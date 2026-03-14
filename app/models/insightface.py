@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import shutil
 import sys
@@ -51,13 +50,6 @@ _INSIGHTFACE_BATCH_FLAT_PARAM = "batch_flat"
 
 
 @dataclass(frozen=True)
-class _InsightFaceInitAttempt:
-    name: str
-    runtime_root: Path
-    kwargs: Dict[str, Any]
-
-
-@dataclass(frozen=True)
 class _LoadedInsightFaceRuntime:
     face_app: FaceAnalysis
     runtime_root: Path
@@ -72,7 +64,7 @@ class _PreparedInsightFaceImage:
     detector_input: np.ndarray
     det_scale: float
     image_shape: Tuple[int, int]
-    source_umat: cv2.UMat
+    source_frame: Any
 
 
 @dataclass(slots=True)
@@ -185,6 +177,8 @@ class InsightFaceMixin(ABC):
     _face_task_queue: Optional[asyncio.Queue[Optional[_FaceInferenceTask]]]
     _face_loop_ready: Any
     _face_worker: Optional[threading.Thread]
+    _face_preprocess_device: Optional[str]
+    _face_use_opencl: bool
     _execution_timeout_seconds: int
 
     @abstractmethod
@@ -253,17 +247,27 @@ class InsightFaceMixin(ABC):
         except Exception:
             return default
 
-    @staticmethod
-    def _enable_insightface_opencl_pipeline() -> None:
-        name, vendor = _ensure_intel_opencl_device("InsightFace preprocessing/alignment")
-        LOG.info(
-            "OpenCV OpenCL enabled for InsightFace resize/alignment on Intel device: %s (%s).",
-            name,
-            vendor,
-        )
+    def _configure_insightface_preprocess_backend(self, device_name: str) -> None:
+        normalized_device = str(device_name or "").strip().upper()
+        use_opencl = normalized_device == "GPU"
+        if use_opencl:
+            name, vendor = _ensure_intel_opencl_device("InsightFace preprocessing/alignment")
+            LOG.info(
+                "InsightFace preprocessing backend: device=%s OpenCV=OpenCL(%s / %s) OpenVINO_PPP=true",
+                normalized_device,
+                name,
+                vendor,
+            )
+        else:
+            LOG.info(
+                "InsightFace preprocessing backend: device=%s OpenCV=CPU OpenVINO_PPP=true",
+                normalized_device or "CPU",
+            )
+        self._face_preprocess_device = normalized_device or "CPU"
+        self._face_use_opencl = use_opencl
 
-    @staticmethod
-    def _align_face_opencl(
+    def _align_face(
+        self,
         img: Any,
         landmark: np.ndarray,
         image_size: int,
@@ -274,36 +278,49 @@ class InsightFaceMixin(ABC):
                 "InsightFace estimate_norm returned invalid affine matrix shape: "
                 f"{matrix.shape}"
             )
-        if not cv2.ocl.useOpenCL():
-            raise RuntimeError(
-                "OpenCV OpenCL was disabled during InsightFace alignment. "
-                "No silent fallback is allowed."
-            )
-        if isinstance(img, cv2.UMat):
-            source = img
-        else:
-            source = _to_opencv_umat(
-                _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
-            )
-        try:
-            warped_umat = cv2.warpAffine(
-                source,
-                cast(Any, matrix),
-                (int(image_size), int(image_size)),
-                borderValue=0.0,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "OpenCV OpenCL warpAffine failed in InsightFace alignment. "
-                "No silent fallback is allowed."
-            ) from exc
 
-        if isinstance(warped_umat, cv2.UMat):
-            return _as_contiguous_bgr_uint8(warped_umat.get(), context="InsightFace alignment")
-        return _as_contiguous_bgr_uint8(
-            np.asarray(warped_umat),
-            context="InsightFace alignment",
-        )
+        if self._face_use_opencl:
+            if not cv2.ocl.useOpenCL():
+                raise RuntimeError(
+                    "OpenCV OpenCL was disabled during InsightFace GPU alignment. "
+                    "No silent fallback is allowed."
+                )
+            if isinstance(img, cv2.UMat):
+                source = img
+            else:
+                source = _to_opencv_umat(
+                    _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
+                )
+            try:
+                warped = cv2.warpAffine(
+                    source,
+                    cast(Any, matrix),
+                    (int(image_size), int(image_size)),
+                    borderValue=0.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "OpenCV OpenCL warpAffine failed in InsightFace GPU alignment. "
+                    "No silent fallback is allowed."
+                ) from exc
+
+            aligned = warped.get() if isinstance(warped, cv2.UMat) else np.asarray(warped)
+        else:
+            source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
+            try:
+                aligned = cv2.warpAffine(
+                    source,
+                    cast(Any, matrix),
+                    (int(image_size), int(image_size)),
+                    flags=cv2.INTER_LINEAR,
+                    borderValue=0.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "OpenCV CPU warpAffine failed in InsightFace CPU alignment."
+                ) from exc
+
+        return _as_contiguous_bgr_uint8(aligned, context="InsightFace alignment")
 
     def _prepare_insightface_detection_input(
         self,
@@ -322,42 +339,61 @@ class InsightFaceMixin(ABC):
             new_height = int(new_width * im_ratio)
         det_scale = float(new_height) / float(image.shape[0])
 
-        if not cv2.ocl.useOpenCL():
-            raise RuntimeError(
-                "OpenCV OpenCL was disabled during InsightFace detector preprocessing. "
-                "No silent fallback is allowed."
-            )
-
-        source_umat = _to_opencv_umat(image)
         try:
-            resized_umat = cv2.resize(
-                source_umat,
-                (new_width, new_height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            det_umat = cv2.copyMakeBorder(
-                resized_umat,
-                0,
-                int(input_size[1] - new_height),
-                0,
-                int(input_size[0] - new_width),
-                cv2.BORDER_CONSTANT,
-                value=(0, 0, 0),
-            )
+            if self._face_use_opencl:
+                if not cv2.ocl.useOpenCL():
+                    raise RuntimeError(
+                        "OpenCV OpenCL was disabled during InsightFace GPU detector preprocessing. "
+                        "No silent fallback is allowed."
+                    )
+                source_frame = _to_opencv_umat(image)
+                resized = cv2.resize(
+                    source_frame,
+                    (new_width, new_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                det_frame = cv2.copyMakeBorder(
+                    resized,
+                    0,
+                    int(input_size[1] - new_height),
+                    0,
+                    int(input_size[0] - new_width),
+                    cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
+                detector_input = (
+                    det_frame.get() if isinstance(det_frame, cv2.UMat) else np.asarray(det_frame)
+                )
+            else:
+                source_frame = image
+                resized = cv2.resize(
+                    image,
+                    (new_width, new_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                detector_input = cv2.copyMakeBorder(
+                    resized,
+                    0,
+                    int(input_size[1] - new_height),
+                    0,
+                    int(input_size[0] - new_width),
+                    cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
         except Exception as exc:
+            backend = "GPU/OpenCL" if self._face_use_opencl else "CPU"
             raise RuntimeError(
-                "OpenCV OpenCL detector resize/letterbox failed. "
-                "No silent fallback is allowed."
+                f"OpenCV {backend} detector resize/letterbox failed in InsightFace preprocessing."
             ) from exc
 
         return _PreparedInsightFaceImage(
             detector_input=_as_contiguous_bgr_uint8(
-                det_umat.get(),
+                detector_input,
                 context="InsightFace detector",
             ),
             det_scale=det_scale,
             image_shape=(int(image.shape[0]), int(image.shape[1])),
-            source_umat=source_umat,
+            source_frame=source_frame,
         )
 
     @staticmethod
@@ -459,7 +495,7 @@ class InsightFaceMixin(ABC):
         if array.ndim == 3 and array.shape[0] == batch_size:
             return array.reshape(batch_size, items_per_image, channels)
         if array.ndim == 2 and array.shape[0] == expected_flat:
-            return array.reshape(batch_size, items_per_image, channels)
+            return array.reshape(items_per_image, batch_size, channels).transpose(1, 0, 2)
         if array.ndim == 2 and batch_size == 1 and array.shape[0] == items_per_image:
             return array.reshape(1, items_per_image, channels)
         raise RuntimeError(
@@ -745,21 +781,19 @@ class InsightFaceMixin(ABC):
             mean_values=_to_channel_triplet(getattr(rec_model, "input_mean", 127.5)),
             std_values=_to_channel_triplet(getattr(rec_model, "input_std", 127.5)),
         )
-
-        self._enable_insightface_opencl_pipeline()
+        self._configure_insightface_preprocess_backend(device_name)
         LOG.info(
-            "InsightFace preprocessing configured: OpenCV(OpenCL resize/align) + "
-            "OpenVINO PPP."
+            "InsightFace preprocessing configured: OpenCV(%s) + OpenVINO PPP.",
+            "OpenCL" if self._face_use_opencl else "CPU",
         )
 
-    def _resolve_insightface_root(self) -> Path:
-        candidate_roots = (self.insightface_model_root, self.insightface_root)
-        for root in candidate_roots:
-            if (root / MODEL_NAME).is_dir():
-                return root
+    def _resolve_insightface_source_model_dir(self) -> Path:
+        model_dir = self.insightface_model_root / MODEL_NAME
+        if model_dir.is_dir():
+            return model_dir
         raise FileNotFoundError(
-            "InsightFace model directory missing for antelopev2. Checked paths: "
-            f"{self.insightface_model_root / MODEL_NAME}, {self.insightface_root / MODEL_NAME}"
+            "InsightFace model directory missing for antelopev2. Expected path: "
+            f"{model_dir}"
         )
 
     @staticmethod
@@ -932,44 +966,24 @@ class InsightFaceMixin(ABC):
         }
 
     @staticmethod
-    def _ensure_runtime_model_link(
+    def _copy_runtime_insightface_model(
         src: Path,
         dst: Path,
-        *,
-        strict_identity: bool = False,
     ) -> None:
         if not src.is_file():
             raise FileNotFoundError(f"InsightFace required model missing: {src}")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists():
-            if dst.is_dir():
-                raise RuntimeError(f"InsightFace runtime model path is a directory: {dst}")
-            try:
-                if os.path.samefile(src, dst):
-                    return
-            except Exception:
-                pass
-            if not strict_identity:
-                src_stat = src.stat()
-                dst_stat = dst.stat()
-                if dst_stat.st_size == src_stat.st_size and dst_stat.st_mtime_ns >= src_stat.st_mtime_ns:
-                    return
-            else:
-                LOG.info(
-                    "Refreshing runtime model alias to avoid stale cached copy: src=%s dst=%s",
-                    src,
-                    dst,
-                )
-            dst.unlink()
-
+        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
+        if temp_path.exists():
+            temp_path.unlink()
         try:
-            os.symlink(src, dst)
-        except Exception:
-            try:
-                os.link(src, dst)
-            except Exception:
-                shutil.copy2(src, dst)
+            shutil.copyfile(src, temp_path)
+            shutil.copystat(src, temp_path)
+            os.replace(temp_path, dst)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
     @classmethod
     def _prepare_batched_insightface_recognition_model(cls, src: Path, dst: Path) -> None:
@@ -1000,7 +1014,7 @@ class InsightFaceMixin(ABC):
 
         first_dim = output_dims[0]
         if cls._onnx_dim_value(first_dim) is None:
-            cls._ensure_runtime_model_link(src, dst)
+            cls._copy_runtime_insightface_model(src, dst)
             return
 
         first_dim.ClearField("dim_value")
@@ -1067,36 +1081,29 @@ class InsightFaceMixin(ABC):
                 )
 
         if not patched:
-            cls._ensure_runtime_model_link(src, dst)
+            cls._copy_runtime_insightface_model(src, dst)
             return
 
         cls._save_patched_insightface_model(model, src, dst)
 
-    def _prepare_insightface_runtime_root(self, source_root: Path) -> Path:
-        source_model_dir = source_root / MODEL_NAME
+    def _prepare_insightface_runtime_root(self, source_model_dir: Path) -> Path:
         runtime_root = self.insightface_root / "_runtime_models"
-        primary_model_dir = runtime_root / MODEL_NAME
-        compat_model_dir = runtime_root / "models" / MODEL_NAME
-        primary_model_dir.mkdir(parents=True, exist_ok=True)
-        compat_model_dir.mkdir(parents=True, exist_ok=True)
+        runtime_model_dir = runtime_root / "models" / MODEL_NAME
+        legacy_model_dir = runtime_root / MODEL_NAME
+        if legacy_model_dir.exists():
+            if legacy_model_dir.is_dir():
+                shutil.rmtree(legacy_model_dir)
+            else:
+                legacy_model_dir.unlink()
+        runtime_model_dir.mkdir(parents=True, exist_ok=True)
 
         det_src = source_model_dir / "scrfd_10g_bnkps.onnx"
         rec_src = source_model_dir / "glintr100.onnx"
-        det_primary = primary_model_dir / det_src.name
-        rec_primary = primary_model_dir / rec_src.name
+        det_runtime = runtime_model_dir / det_src.name
+        rec_runtime = runtime_model_dir / rec_src.name
 
-        self._prepare_batched_insightface_detector_model(det_src, det_primary)
-        self._prepare_batched_insightface_recognition_model(rec_src, rec_primary)
-        self._ensure_runtime_model_link(
-            det_primary,
-            compat_model_dir / det_src.name,
-            strict_identity=True,
-        )
-        self._ensure_runtime_model_link(
-            rec_primary,
-            compat_model_dir / rec_src.name,
-            strict_identity=True,
-        )
+        self._prepare_batched_insightface_detector_model(det_src, det_runtime)
+        self._prepare_batched_insightface_recognition_model(rec_src, rec_runtime)
         return runtime_root
 
     def _build_insightface_provider_options(self, provider_device: str) -> Dict[str, str]:
@@ -1114,190 +1121,50 @@ class InsightFaceMixin(ABC):
         return provider_options
 
     @staticmethod
-    def _enforce_insightface_openvino_provider(
-        face_app: FaceAnalysis,
-        provider_options: Dict[str, str],
-    ) -> None:
+    def _validate_insightface_loaded_modules(face_app: FaceAnalysis) -> None:
         models_map = getattr(face_app, "models", {})
-        configured_sessions = 0
-        for task_name, model in models_map.items():
-            session = getattr(model, "session", None)
-            if session is None or not hasattr(session, "set_providers"):
-                continue
-            try:
-                session.set_providers(
-                    ["OpenVINOExecutionProvider"],
-                    [provider_options],
-                )
-            except TypeError:
-                session.set_providers(
-                    [("OpenVINOExecutionProvider", provider_options)]
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "InsightFace failed to set OpenVINOExecutionProvider for task="
-                    f"{task_name}. No silent fallback is allowed."
-                ) from exc
-            configured_sessions += 1
-
-        if configured_sessions == 0:
+        loaded_tasks = {str(task_name) for task_name in models_map.keys()}
+        required_tasks = {"detection", "recognition"}
+        missing_tasks = sorted(required_tasks - loaded_tasks)
+        unexpected_tasks = sorted(loaded_tasks - required_tasks)
+        if missing_tasks or unexpected_tasks:
             raise RuntimeError(
-                "InsightFace session initialization missing; cannot enforce OpenVINOExecutionProvider."
+                "InsightFace loaded unexpected module set under strict initialization: "
+                f"missing={missing_tasks or ['none']} unexpected={unexpected_tasks or ['none']}"
             )
-
-    @staticmethod
-    def _is_insightface_init_kwargs_error(exc: Exception) -> bool:
-        if not isinstance(exc, TypeError):
-            return False
-        message = str(exc)
-        return any(
-            keyword in message
-            for keyword in ("providers", "provider_options", "allowed_modules")
-        )
-
-    @staticmethod
-    def _strip_insightface_unsupported_init_kwargs(
-        kwargs: Dict[str, Any],
-        exc: Exception,
-    ) -> Tuple[Dict[str, Any], List[str]]:
-        message = str(exc)
-        stripped_kwargs = dict(kwargs)
-        stripped_keys: List[str] = []
-        for key in ("provider_options", "providers", "allowed_modules"):
-            if key in stripped_kwargs and key in message:
-                stripped_kwargs.pop(key, None)
-                stripped_keys.append(key)
-        if stripped_keys:
-            return stripped_kwargs, stripped_keys
-
-        if any(keyword in message for keyword in ("providers", "provider_options", "allowed_modules")):
-            for key in ("provider_options", "providers", "allowed_modules"):
-                if key in stripped_kwargs:
-                    stripped_kwargs.pop(key, None)
-                    stripped_keys.append(key)
-        return stripped_kwargs, stripped_keys
-
-    @staticmethod
-    def _build_insightface_init_attempt(
-        runtime_root: Path,
-        provider_names: List[str],
-        provider_options: Dict[str, str],
-        *,
-        attempt_name: str,
-    ) -> _InsightFaceInitAttempt:
-        kwargs: Dict[str, Any] = {
-            "name": MODEL_NAME,
-            "root": str(runtime_root),
-            "allowed_modules": ["detection", "recognition"],
-            "providers": list(provider_names),
-            "provider_options": [dict(provider_options)],
-        }
-        return _InsightFaceInitAttempt(attempt_name, runtime_root, kwargs)
 
     def _instantiate_insightface_face_analysis(
         self,
         provider_names: List[str],
         provider_options: Dict[str, str],
     ) -> Tuple[FaceAnalysis, Path]:
-        source_model_root = self._resolve_insightface_root()
-        source_init_root = (
-            source_model_root.parent
-            if source_model_root.name.lower() == "models"
-            else source_model_root
+        source_model_dir = self._resolve_insightface_source_model_dir()
+        runtime_root = self._prepare_insightface_runtime_root(source_model_dir)
+        init_kwargs: Dict[str, Any] = {
+            "name": MODEL_NAME,
+            "root": str(runtime_root),
+            "allowed_modules": ["detection", "recognition"],
+            "providers": list(provider_names),
+            "provider_options": [dict(provider_options)],
+        }
+        try:
+            face_app = FaceAnalysis(**init_kwargs)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Installed insightface does not support strict "
+                "FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., "
+                "provider_options=...) initialization. Compatibility retries are disabled."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"InsightFace strict initialization failed for runtime_root={runtime_root}: {exc}"
+            ) from exc
+
+        self._validate_insightface_loaded_modules(face_app)
+        self._normalize_insightface_recognition_state(
+            getattr(face_app, "models", {}).get("recognition")
         )
-        runtime_root = self._prepare_insightface_runtime_root(source_model_root)
-        pending_attempts: List[_InsightFaceInitAttempt] = [
-            self._build_insightface_init_attempt(
-                runtime_root,
-                provider_names,
-                provider_options,
-                attempt_name="runtime-preferred",
-            )
-        ]
-        source_fallback_added = False
-        if source_init_root != runtime_root:
-            source_fallback_added = True
-            pending_attempts.append(
-                self._build_insightface_init_attempt(
-                    source_init_root,
-                    provider_names,
-                    provider_options,
-                    attempt_name="source-preferred",
-                )
-            )
-
-        seen_attempts: set[Tuple[str, str]] = set()
-        attempt_errors: List[str] = []
-        last_exc: Optional[Exception] = None
-        while pending_attempts:
-            attempt = pending_attempts.pop(0)
-            attempt_key = (
-                str(attempt.runtime_root),
-                json.dumps(attempt.kwargs, sort_keys=True, ensure_ascii=True),
-            )
-            if attempt_key in seen_attempts:
-                continue
-            seen_attempts.add(attempt_key)
-            try:
-                face_app = FaceAnalysis(**attempt.kwargs)
-                self._normalize_insightface_recognition_state(
-                    getattr(face_app, "models", {}).get("recognition")
-                )
-                if attempt.name != "runtime-preferred":
-                    LOG.warning(
-                        "InsightFace initialized via compatibility path %s (runtime_root=%s)",
-                        attempt.name,
-                        attempt.runtime_root,
-                    )
-                return face_app, attempt.runtime_root
-            except Exception as exc:
-                last_exc = exc
-                attempt_errors.append(f"{attempt.name}: {exc}")
-                if self._is_insightface_init_kwargs_error(exc):
-                    stripped_kwargs, stripped_keys = self._strip_insightface_unsupported_init_kwargs(
-                        attempt.kwargs,
-                        exc,
-                    )
-                    if stripped_keys and stripped_kwargs != attempt.kwargs:
-                        LOG.warning(
-                            "InsightFace init retry after unsupported kwargs on %s: removed=%s error=%s",
-                            attempt.name,
-                            ",".join(stripped_keys),
-                            exc,
-                        )
-                        pending_attempts.insert(
-                            0,
-                            _InsightFaceInitAttempt(
-                                f"{attempt.name}-compat",
-                                attempt.runtime_root,
-                                stripped_kwargs,
-                            ),
-                        )
-                        continue
-
-                LOG.warning(
-                    "InsightFace init attempt %s failed (runtime_root=%s): %s",
-                    attempt.name,
-                    attempt.runtime_root,
-                    exc,
-                )
-                if not source_fallback_added and attempt.runtime_root != source_init_root:
-                    source_fallback_added = True
-                    fallback_kwargs = dict(attempt.kwargs)
-                    fallback_kwargs["root"] = str(source_init_root)
-                    pending_attempts.append(
-                        _InsightFaceInitAttempt(
-                            "source-fallback",
-                            source_init_root,
-                            fallback_kwargs,
-                        )
-                    )
-
-        summary = "; ".join(attempt_errors) or "no attempts executed"
-        raise RuntimeError(
-            "InsightFace initialization failed after explicit OpenVINO provider retries: "
-            f"{summary}"
-        ) from last_exc
+        return face_app, runtime_root
 
     def _initialize_loaded_insightface_runtime(
         self,
@@ -1305,43 +1172,75 @@ class InsightFaceMixin(ABC):
         provider_options: Dict[str, str],
         provider_device: str,
     ) -> _LoadedInsightFaceRuntime:
-        face_app, runtime_root = self._instantiate_insightface_face_analysis(
-            provider_names,
-            provider_options,
-        )
-        det_session_shapes = self._normalize_insightface_detector_session_state(
-            getattr(face_app, "det_model", None)
-        )
-        self._prepare_insightface_detector(
-            face_app,
-            det_size=(640, 640),
-            det_thresh=0.5,
-        )
-        self._enforce_insightface_openvino_provider(face_app, provider_options)
-        rec_session_shapes = self._normalize_insightface_recognition_state(
-            getattr(face_app, "models", {}).get("recognition")
-        )
-        provider_runtime = self._validate_insightface_openvino_provider(
-            face_app,
-            expected_device_type=provider_device,
-        )
-        self._attach_insightface_preprocess(face_app, device_name=provider_device)
-        ppp_execution_devices = {
-            "det": _get_compiled_model_execution_devices(
-                getattr(self._face_det_ppp, "compiled_model", None)
-            ),
-            "rec": _get_compiled_model_execution_devices(
-                getattr(self._face_rec_ppp, "compiled_model", None)
-            ),
-        }
-        return _LoadedInsightFaceRuntime(
-            face_app=face_app,
-            runtime_root=runtime_root,
-            provider_runtime=provider_runtime,
-            ppp_execution_devices=ppp_execution_devices,
-            det_session_shapes=det_session_shapes,
-            rec_session_shapes=rec_session_shapes,
-        )
+        face_app: Optional[FaceAnalysis] = None
+        try:
+            face_app, runtime_root = self._instantiate_insightface_face_analysis(
+                provider_names,
+                provider_options,
+            )
+            det_session_shapes = self._normalize_insightface_detector_session_state(
+                getattr(face_app, "det_model", None)
+            )
+            self._prepare_insightface_detector(
+                face_app,
+                det_size=(640, 640),
+                det_thresh=0.5,
+            )
+            self._disable_insightface_session_fallback(face_app)
+            rec_session_shapes = self._normalize_insightface_recognition_state(
+                getattr(face_app, "models", {}).get("recognition")
+            )
+            provider_runtime = self._validate_insightface_openvino_provider(
+                face_app,
+                expected_device_type=provider_device,
+            )
+            self._attach_insightface_preprocess(face_app, device_name=provider_device)
+            ppp_execution_devices = {
+                "det": _get_compiled_model_execution_devices(
+                    getattr(self._face_det_ppp, "compiled_model", None)
+                ),
+                "rec": _get_compiled_model_execution_devices(
+                    getattr(self._face_rec_ppp, "compiled_model", None)
+                ),
+            }
+            return _LoadedInsightFaceRuntime(
+                face_app=face_app,
+                runtime_root=runtime_root,
+                provider_runtime=provider_runtime,
+                ppp_execution_devices=ppp_execution_devices,
+                det_session_shapes=det_session_shapes,
+                rec_session_shapes=rec_session_shapes,
+            )
+        except Exception:
+            self._dispose_insightface_face_analysis(face_app)
+            self._face_det_ppp = None
+            self._face_rec_ppp = None
+            self._face_preprocess_device = None
+            self._face_use_opencl = False
+            raise
+
+    @staticmethod
+    def _disable_insightface_session_fallback(face_app: FaceAnalysis) -> None:
+        models_map = getattr(face_app, "models", {})
+        for task_name in ("detection", "recognition"):
+            model = models_map.get(task_name)
+            if model is None:
+                raise RuntimeError(
+                    f"InsightFace fallback control failed: missing task={task_name}."
+                )
+            session = getattr(model, "session", None)
+            disable_fallback = getattr(session, "disable_fallback", None)
+            if session is None or not callable(disable_fallback):
+                raise RuntimeError(
+                    "InsightFace fallback control failed for task="
+                    f"{task_name}: ORT session does not expose disable_fallback()."
+                )
+            disable_fallback()
+            if getattr(session, "_enable_fallback", False):
+                raise RuntimeError(
+                    "InsightFace fallback control failed for task="
+                    f"{task_name}: ORT session fallback is still enabled."
+                )
 
     @staticmethod
     def _validate_insightface_openvino_provider(
@@ -1350,11 +1249,19 @@ class InsightFaceMixin(ABC):
     ) -> Dict[str, Dict[str, Any]]:
         models_map = getattr(face_app, "models", {})
         runtime_state: Dict[str, Dict[str, Any]] = {}
+        required_tasks = {"detection", "recognition"}
         normalized_expected = str(expected_device_type or "").strip().upper()
-        for task_name, model in models_map.items():
+        for task_name in sorted(required_tasks):
+            model = models_map.get(task_name)
+            if model is None:
+                raise RuntimeError(
+                    f"InsightFace provider validation failed: missing required task={task_name}."
+                )
             session = getattr(model, "session", None)
             if session is None or not hasattr(session, "get_providers"):
-                continue
+                raise RuntimeError(
+                    f"InsightFace provider validation failed: task={task_name} has no ORT session."
+                )
             providers = [str(item) for item in session.get_providers()]
             if not providers or providers[0] != "OpenVINOExecutionProvider":
                 raise RuntimeError(
@@ -1364,35 +1271,86 @@ class InsightFaceMixin(ABC):
                     "No silent fallback is allowed."
                 )
             task_state: Dict[str, Any] = {"providers": providers}
+            task_state["session_run_fallback_disabled"] = (
+                getattr(session, "_enable_fallback", None) is False
+            )
             get_provider_options = getattr(session, "get_provider_options", None)
-            if callable(get_provider_options):
-                try:
-                    provider_options = get_provider_options()
-                except Exception:
-                    provider_options = None
-                if isinstance(provider_options, dict):
-                    openvino_options = provider_options.get("OpenVINOExecutionProvider")
-                    if isinstance(openvino_options, dict):
-                        normalized_options = {
-                            str(key): str(value) for key, value in openvino_options.items()
-                        }
-                        task_state["openvino_options"] = normalized_options
-                        actual_device = str(
-                            normalized_options.get("device_type", "")
-                        ).strip().upper()
-                        if normalized_expected and actual_device and actual_device != normalized_expected:
-                            raise RuntimeError(
-                                "InsightFace provider validation failed for task="
-                                f"{task_name}, expected device_type={normalized_expected} "
-                                f"but got {actual_device}. No silent fallback is allowed."
-                            )
+            if not callable(get_provider_options):
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}: ORT session does not expose provider options."
+                )
+            try:
+                provider_options = get_provider_options()
+            except Exception as exc:
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}: unable to read provider options."
+                ) from exc
+            if not isinstance(provider_options, dict):
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}: provider options are missing."
+                )
+
+            openvino_options = provider_options.get("OpenVINOExecutionProvider")
+            if not isinstance(openvino_options, dict):
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}: OpenVINOExecutionProvider options are missing."
+                )
+
+            normalized_options = {
+                str(key): str(value) for key, value in openvino_options.items()
+            }
+            task_state["openvino_options"] = normalized_options
+            actual_device = str(
+                normalized_options.get("device_type", "")
+            ).strip().upper()
+            task_state["reported_device_type"] = actual_device or None
+            task_state["expected_device_type"] = normalized_expected or None
+            if normalized_expected and actual_device and actual_device != normalized_expected:
+                raise RuntimeError(
+                    "InsightFace provider validation failed for task="
+                    f"{task_name}, expected device_type={normalized_expected} "
+                    f"but got {actual_device}. No silent fallback is allowed."
+                )
             runtime_state[task_name] = task_state
         return runtime_state
 
+    @staticmethod
+    def _dispose_insightface_face_analysis(face_app: Optional[FaceAnalysis]) -> None:
+        if face_app is None:
+            return
+
+        det_model = getattr(face_app, "det_model", None)
+        if det_model is not None and isinstance(getattr(det_model, "center_cache", None), dict):
+            det_model.center_cache.clear()
+
+        models_map = getattr(face_app, "models", None)
+        if isinstance(models_map, dict):
+            for model in list(models_map.values()):
+                if isinstance(getattr(model, "center_cache", None), dict):
+                    model.center_cache.clear()
+                if hasattr(model, "session"):
+                    try:
+                        model.session = None
+                    except Exception:
+                        pass
+            models_map.clear()
+
+        try:
+            face_app.det_model = None
+        except Exception:
+            pass
+
     def _unload_face_model_locked(self) -> None:
+        self._dispose_insightface_face_analysis(self._face_engine)
         self._face_engine = None
         self._face_det_ppp = None
         self._face_rec_ppp = None
+        self._face_preprocess_device = None
+        self._face_use_opencl = False
 
     def _unload_face_model(self) -> None:
         with self._face_load_lock:
@@ -1447,8 +1405,10 @@ class InsightFaceMixin(ABC):
             self._face_engine = None
             self._face_det_ppp = None
             self._face_rec_ppp = None
+            self._face_preprocess_device = None
+            self._face_use_opencl = False
             raise RuntimeError(
-                "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL resize/alignment. "
+                "InsightFace must run with OpenVINOExecutionProvider + OpenCV resize/alignment + OpenVINO PPP. "
                 "No silent fallback is allowed."
             ) from exc
 
@@ -1459,11 +1419,13 @@ class InsightFaceMixin(ABC):
 
     @staticmethod
     def _set_face_task_result(task: _FaceInferenceTask, value: List[RepresentResult]) -> None:
+        task.payload = None
         if not task.future.done():
             task.future.set_result(value)
 
     @staticmethod
     def _set_face_task_exception(task: _FaceInferenceTask, exc: Exception) -> None:
+        task.payload = None
         if not task.future.done():
             task.future.set_exception(exc)
 
@@ -1766,8 +1728,8 @@ class InsightFaceMixin(ABC):
                 bbox = np.asarray(detections[face_index, 0:4], dtype=np.float32)
                 det_score = float(detections[face_index, 4])
                 aligned_faces.append(
-                    self._align_face_opencl(
-                        prepared_images[prepared_index].source_umat,
+                    self._align_face(
+                        prepared_images[prepared_index].source_frame,
                         np.asarray(kpss[face_index]),
                         rec_image_size,
                     )

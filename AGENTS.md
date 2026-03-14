@@ -17,7 +17,7 @@
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
 - 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）。
-- 模型转换：`convert/convert.py`（QA-CLIP -> OpenVINO IR）。
+- 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
 - QA-CLIP 子库：`app/models/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
 - 配置存储：`app/config`。
@@ -104,11 +104,10 @@
 - InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时；当 `AUTO` 且 GPU 可见时，运行时必须显式收敛到 `GPU`，并在日志里输出 `configured_device/runtime_device/provider_runtime`。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
-- 必须兼容 `insightface` 旧版 `FaceAnalysis.__init__` 不支持 `providers/allowed_modules` 的情况；此时必须在会话级显式设置 `OpenVINOExecutionProvider` 并校验 provider 顺序。
-- InsightFace 兼容性判断禁止只依赖 `inspect.signature()` 静态签名；必须基于真实实例化结果做兼容重试，避免 `__init__(**kwargs)` 继续把不受支持参数透传到内部实现后再报错。
-- 对 `insightface` 旧版模型路由不兼容时，允许运行时构造仅含检测+识别必需 ONNX 的模型目录用于初始化，但不得改变 `/represent` 接口语义与返回字段。
-- 检测缩放/letterbox 与对齐阶段都必须使用 OpenCV + Intel OpenCL（`resize/copyMakeBorder/warpAffine` OpenCL 路径）；OpenCL 不可用或设备非 Intel 时必须直接报错，禁止静默回退 CPU。
-- 同一张输入图的对齐阶段必须复用单次上传后的 OpenCL/UMat 源图，禁止继续走“逐脸重新上传整图到 OpenCL 再 `warpAffine`”的重复拷贝链。
+- 必须固定到新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；禁止 compat dataclass、构造参数重试、source fallback、`set_providers` 后置修正。
+- InsightFace 运行时模型目录固定为 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；禁止再维护额外的兼容目录、双 root 或 source/runtime 回退。
+- InsightFace 必须支持 `INSIGHTFACE_OV_DEVICE=GPU|CPU|AUTO` 三种显式运行模式；`GPU` 模式走 OpenCV OpenCL + PPP，`CPU` 模式走 OpenCV CPU + PPP，二者都必须保持 OpenVINOExecutionProvider 为首位 provider。
+- 同一张输入图的对齐阶段必须复用单次准备后的源图对象；GPU 模式复用单次上传后的 OpenCL/UMat，CPU 模式复用同一份连续 `numpy` 源图，禁止重复拷贝链。
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 - 当 `antelopev2/glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时必须在受控 runtime root 中把识别输出 batch 维修正为动态后再初始化 ORT session；禁止通过退回逐张识别来规避 `VerifyOutputSizes` warning。
@@ -281,7 +280,9 @@
 - `python -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`
-- `python -m compileall convert`
+- `python -m compileall scripts`
+- `docker build -t mt-photos-ai-openvino .`
+- `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
 - 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
 - 关键端点冒烟：`/check`、`/clip/txt`、`/ocr`、`/represent`
@@ -311,7 +312,7 @@
   - 实现约束、后端选择原因、无 silent fallback 规则
   - 容器构建内部实践、镜像裁剪策略、依赖清理策略
   - 稳定性修复记录、兼容性说明、上线验收清单
-  - `convert/convert.py`、NNCF、IR 导出和模型转换流程说明
+  - `scripts/convert.py`、NNCF、IR 导出和模型转换流程说明
   - Agent/开发自检、压测、调度策略、文档同步要求
 
 ---
@@ -324,7 +325,7 @@
 - APT 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - `sources.list` 基线仅保留 `trixie`、`trixie-updates`、`trixie-security`；构建阶段允许临时增加 `sid` 源，仅用于安装 Intel GPU runtime 后立即清理。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
-- 当前 `requirements.txt` 在 Python 3.12 / manylinux 下可直接使用 wheel 安装，不再默认保留 InsightFace 专用构建依赖。
+- 当前 Docker 构建需保留 `g++` 作为 `insightface==0.7.3` 在 Linux/Python 3.12 下的源码构建依赖；若后续确认官方 wheels 覆盖当前基线，再评估移除。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
@@ -416,6 +417,7 @@ services:
 docker compose up -d --build
 docker compose ps
 docker compose logs --tail=200 mt-photos-ai-openvino
+docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU
 
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
@@ -424,7 +426,7 @@ curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" 
 
 ---
 
-## 14. `convert/convert.py` 运行环境
+## 14. `scripts/convert.py` 运行环境
 
 | 环境变量 | 可选值 | 默认值 |
 |---|---|---|
@@ -434,4 +436,4 @@ curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `QA_CLIP_ENABLE_NNCF_WEIGHT_COMPRESSION` | `0`（关闭）或 `1`（开启） | `0` |
 | `QA_CLIP_NNCF_WEIGHT_MODE` | NNCF 压缩模式名（常见：`INT8_ASYM` / `INT8_SYM` / `NF4` / `E2M1`） | `INT8_ASYM` |
 
-`convert/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。
+`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。

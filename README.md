@@ -10,9 +10,9 @@
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 服务入口：`app/server.py`
-- QA-CLIP 离线转换脚本：`convert/convert.py`
+- QA-CLIP 离线转换脚本：`scripts/convert.py`
 - 源码运行时需保留 `app/models/QA-CLIP/clip`，服务当前仍使用其中的 tokenizer 与词表资源
-- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `glintr100.onnx` 的批量输出元数据，避免批量识别被错误的静态 `{1,512}` 元数据拖回低吞吐路径
+- `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时把 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx` 物化为动态 batch 运行时模型
 
 ## 运行时环境变量
 
@@ -96,8 +96,10 @@
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
 - 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出 batch 元数据仍写死为 `{1,512}`，或 `scrfd_10g_bnkps.onnx` 的输入/输出 batch 元数据仍固定为单 batch，服务会在受控 runtime copy 中统一修正为动态后再初始化 ORT session；仓库内原始模型文件不会被改写。
-- 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
-- `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
+- InsightFace 固定使用新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；若当前 `insightface` 包不支持这组参数，服务会直接失败，不再做兼容重试。
+- InsightFace 运行时模型固定物化到 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；服务只会在这里生成动态 batch detector/recognition 运行时模型，不再维护兼容目录或 source/runtime 回退。
+- `INSIGHTFACE_OV_DEVICE=GPU` 时，InsightFace 预处理走 OpenCV OpenCL + OpenVINO PPP；`INSIGHTFACE_OV_DEVICE=CPU` 时，预处理走 OpenCV CPU + OpenVINO PPP，二者都必须保持 `OpenVINOExecutionProvider` 为首位 provider。
+- `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，GPU 模式使用 OpenCV OpenCL 缩放/对齐，CPU 模式使用 OpenCV CPU 缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
 
 ## Windows 本机部署
 
@@ -160,6 +162,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
+- 当前 Linux/Python 3.12 基线下，`insightface==0.7.3` 在构建镜像时仍可能走源码编译；Dockerfile 已显式安装 `g++` 以保证该步骤可完成。
 - 当前 Docker 构建会在 `pip install -r requirements.txt` 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 OpenCL/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
 - 因此当前运行时镜像不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不再打包 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`。
 - Intel GPU 固件属于宿主机职责；若宿主 Debian 13 需要补齐固件，请在宿主机安装 `firmware-misc-nonfree`（或兼容包名 `firmware-misc-non-free`），而不是放进应用容器。
@@ -223,6 +226,7 @@ docker run -d \
   -e API_AUTH_KEY=mt_photos_ai_extra \
   -e INFERENCE_DEVICE=AUTO \
   -e CLIP_INFERENCE_DEVICE=AUTO \
+  -e MODEL_PATH=/models \
   -e CLIP_IMAGE_BATCH=8 \
   -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=AUTO \
@@ -247,16 +251,6 @@ docker exec -it mt-photos-ai-openvino python -c 'import cv2; cv2.ocl.setUseOpenC
 ```
 
 若请求了 GPU 推理但容器内 GPU 设备不可用，服务会直接报错并终止启动。
-
-## Windows Server GPU-PV（`/dev/dxg`）说明
-
-在 Windows Server + Linux 容器 + GPU-PV 场景下，QA-CLIP 与 InsightFace 的 OpenVINO GPU 推理仍以当前容器运行时能力为准。
-
-需要注意：
-
-- 当前服务已不依赖 `ffmpeg/QSV` 做上传解码
-- 当前 Debian/Linux 容器启动自检与验收仍以 `/dev/dri` 为准；仅有 `/dev/dxg` 不视为满足当前镜像的 GPU 启动条件
-- 若 `get_default_context("GPU")` 因插件上下文初始化时机失败，服务会自动重试具体 `GPU.*` 设备与 `create_context("GPU", {})`；若仍失败，则保持硬失败并退出启动
 
 ## RapidOCR 模型预置
 
@@ -293,7 +287,44 @@ Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.
 
 ## 冒烟检查
 
-服务启动后，可先检查：
+推荐先在 Docker 容器内执行 InsightFace 专项冒烟：
+
+```bash
+docker build -t mt-photos-ai-openvino .
+docker run --rm -it \
+  -e INFERENCE_DEVICE=CPU \
+  -e CLIP_INFERENCE_DEVICE=CPU \
+  -e RAPIDOCR_DEVICE=CPU \
+  -e INSIGHTFACE_OV_DEVICE=CPU \
+  mt-photos-ai-openvino \
+  python scripts/smoke_insightface.py --device CPU
+```
+
+如宿主机已映射 Intel iGPU 的 `/dev/dri`，可进一步执行 GPU 冒烟：
+
+```bash
+docker run --rm -it \
+  --device /dev/dri:/dev/dri \
+  --group-add $(getent group video | cut -d: -f3) \
+  --group-add $(getent group render | cut -d: -f3) \
+  -e INFERENCE_DEVICE=CPU \
+  -e CLIP_INFERENCE_DEVICE=CPU \
+  -e RAPIDOCR_DEVICE=CPU \
+  -e INSIGHTFACE_OV_DEVICE=GPU \
+  -e OPENCV_OPENCL_DEVICE=Intel:GPU:0 \
+  mt-photos-ai-openvino \
+  python scripts/smoke_insightface.py --device GPU
+```
+
+脚本会校验：
+
+- `OpenVINOExecutionProvider` 仍是 detection/recognition 的首位 provider，且 `device_type` 与请求一致
+- 运行时模型目录已经收敛到 `_runtime_models/models/antelopev2`
+- 本地 `/represent` pipeline 与原生 `FaceAnalysis.get` 的检测框、分数和 embedding 语义保持一致
+- batched detection / recognition 与 single-image 路径一致
+- `release_models_for_restart()` 后 face runtime 引用已释放，且能够重新加载
+
+服务启动后，也可以再做基础端点检查：
 
 ```bash
 curl -s http://127.0.0.1:8060/
