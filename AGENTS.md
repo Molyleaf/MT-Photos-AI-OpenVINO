@@ -325,7 +325,6 @@
 - APT 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 镜像固定为 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - `sources.list` 基线仅保留 `trixie`、`trixie-updates`、`trixie-security`；构建阶段允许临时增加 `sid` 源，仅用于安装 Intel GPU runtime 后立即清理。
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
-- 当前 Docker 构建需保留 `g++` 作为 `insightface==0.7.3` 在 Linux/Python 3.12 下的源码构建依赖；若后续确认官方 wheels 覆盖当前基线，再评估移除。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。

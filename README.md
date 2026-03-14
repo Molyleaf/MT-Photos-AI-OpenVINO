@@ -162,7 +162,6 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
-- 当前 Linux/Python 3.12 基线下，`insightface==0.7.3` 在构建镜像时仍可能走源码编译；Dockerfile 已显式安装 `g++` 以保证该步骤可完成。
 - 当前 Docker 构建会在 `pip install -r requirements.txt` 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 OpenCL/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
 - 因此当前运行时镜像不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不再打包 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`。
 - Intel GPU 固件属于宿主机职责；若宿主 Debian 13 需要补齐固件，请在宿主机安装 `firmware-misc-nonfree`（或兼容包名 `firmware-misc-non-free`），而不是放进应用容器。
