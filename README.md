@@ -12,7 +12,7 @@
 - 服务入口：`app/server.py`
 - QA-CLIP 离线转换脚本：`convert/convert.py`
 - 源码运行时需保留 `app/models/QA-CLIP/clip`，服务当前仍使用其中的 tokenizer 与词表资源
-- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `scrfd_10g_bnkps.onnx` / `glintr100.onnx` 的批量元数据，避免 `/represent` 被错误的静态 batch 元数据拖回低吞吐路径
+- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `glintr100.onnx` 的批量输出元数据，避免批量识别被错误的静态 `{1,512}` 元数据拖回低吞吐路径
 
 ## 运行时环境变量
 
@@ -97,8 +97,8 @@
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
 - 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出元数据仍写死为 `{1,512}`，服务会在受控 runtime copy 中把 batch 维修正为动态后再初始化 ORT session；`/represent` 仍保持批量识别，不会回退逐张推理。
 - 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
-- `/represent` 现在会通过有界微批队列跨请求聚合人脸检测和识别；OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转。
-- 服务会在受控 runtime copy 中同时修正 `scrfd_10g_bnkps.onnx` 的输入 batch 元数据和 `glintr100.onnx` 的输出 batch 元数据；仓库内原始模型文件不会被改写。
+- `/represent` 现在会通过有界微批队列平滑跨请求调度；检测阶段保持单张语义，OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转。
+- 服务会在受控 runtime copy 中修正 `glintr100.onnx` 的输出 batch 元数据；检测模型 `scrfd_10g_bnkps.onnx` 保持原始单张检测语义，仓库内原始模型文件不会被改写。
 
 ## Windows 本机部署
 

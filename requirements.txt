@@ -4,7 +4,7 @@ fastapi
 pydantic
 openvino
 onnx
-# InsightFace keeps using ORT + OpenVINO EP; runtime-only batch metadata patching for scrfd/glintr stays in-process and does not add extra batching dependencies.
+# InsightFace keeps using ORT + OpenVINO EP; runtime-only batched recognition metadata patching stays in-process and does not add extra batching dependencies.
 rapidocr==3.7.0
 onnxruntime-openvino
 uvicorn

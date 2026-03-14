@@ -823,7 +823,12 @@ class InsightFaceMixin(ABC):
         }
 
     @staticmethod
-    def _ensure_runtime_model_link(src: Path, dst: Path) -> None:
+    def _ensure_runtime_model_link(
+        src: Path,
+        dst: Path,
+        *,
+        strict_identity: bool = False,
+    ) -> None:
         if not src.is_file():
             raise FileNotFoundError(f"InsightFace required model missing: {src}")
 
@@ -836,10 +841,17 @@ class InsightFaceMixin(ABC):
                     return
             except Exception:
                 pass
-            src_stat = src.stat()
-            dst_stat = dst.stat()
-            if dst_stat.st_size == src_stat.st_size and dst_stat.st_mtime_ns >= src_stat.st_mtime_ns:
-                return
+            if not strict_identity:
+                src_stat = src.stat()
+                dst_stat = dst.stat()
+                if dst_stat.st_size == src_stat.st_size and dst_stat.st_mtime_ns >= src_stat.st_mtime_ns:
+                    return
+            else:
+                LOG.info(
+                    "Refreshing runtime model alias to avoid stale cached copy: src=%s dst=%s",
+                    src,
+                    dst,
+                )
             dst.unlink()
 
         try:
@@ -849,66 +861,6 @@ class InsightFaceMixin(ABC):
                 os.link(src, dst)
             except Exception:
                 shutil.copy2(src, dst)
-
-    @classmethod
-    def _prepare_batched_insightface_detection_model(cls, src: Path, dst: Path) -> None:
-        if not src.is_file():
-            raise FileNotFoundError(f"InsightFace required model missing: {src}")
-        if onnx is None:
-            raise RuntimeError(
-                "InsightFace batched detection metadata patch requires the 'onnx' package."
-            )
-
-        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
-            try:
-                existing_model = onnx.load(str(dst))
-                existing_inputs = existing_model.graph.input
-                if existing_inputs:
-                    existing_dims = existing_inputs[0].type.tensor_type.shape.dim
-                    existing_first_dim = existing_dims[0] if existing_dims else None
-                    has_static_dim = bool(
-                        getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
-                    )
-                    if existing_first_dim is not None and not has_static_dim:
-                        return
-            except Exception:
-                pass
-
-        model = onnx.load(str(src))
-        if not model.graph.input:
-            raise RuntimeError(f"InsightFace detection model has no inputs: {src}")
-
-        input_dims = model.graph.input[0].type.tensor_type.shape.dim
-        if not input_dims:
-            raise RuntimeError(
-                "InsightFace detection model input shape metadata is missing. "
-                f"model={src}"
-            )
-        first_input_dim = input_dims[0]
-        if getattr(first_input_dim, "HasField", lambda *_: False)("dim_value"):
-            first_input_dim.ClearField("dim_value")
-        first_input_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
-
-        for output_index, output_value in enumerate(model.graph.output):
-            output_dims = output_value.type.tensor_type.shape.dim
-            if not output_dims:
-                continue
-            first_dim = output_dims[0]
-            if getattr(first_dim, "HasField", lambda *_: False)("dim_value"):
-                first_dim.ClearField("dim_value")
-            first_dim.dim_param = f"anchors_{output_index}"
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
-        if temp_path.exists():
-            temp_path.unlink()
-        try:
-            onnx.save(model, str(temp_path))
-            os.replace(temp_path, dst)
-            shutil.copystat(src, dst)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
 
     @classmethod
     def _prepare_batched_insightface_recognition_model(cls, src: Path, dst: Path) -> None:
@@ -978,10 +930,22 @@ class InsightFaceMixin(ABC):
         det_primary = primary_model_dir / det_src.name
         rec_primary = primary_model_dir / rec_src.name
 
-        self._prepare_batched_insightface_detection_model(det_src, det_primary)
+        self._ensure_runtime_model_link(
+            det_src,
+            det_primary,
+            strict_identity=True,
+        )
         self._prepare_batched_insightface_recognition_model(rec_src, rec_primary)
-        self._ensure_runtime_model_link(det_primary, compat_model_dir / det_src.name)
-        self._ensure_runtime_model_link(rec_primary, compat_model_dir / rec_src.name)
+        self._ensure_runtime_model_link(
+            det_primary,
+            compat_model_dir / det_src.name,
+            strict_identity=True,
+        )
+        self._ensure_runtime_model_link(
+            rec_primary,
+            compat_model_dir / rec_src.name,
+            strict_identity=True,
+        )
         return runtime_root
 
     def _build_insightface_provider_options(self, provider_device: str) -> Dict[str, str]:

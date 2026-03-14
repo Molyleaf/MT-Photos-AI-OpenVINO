@@ -111,10 +111,9 @@
 - 同一张输入图的对齐阶段必须复用单次上传后的 OpenCL/UMat 源图，禁止继续走“逐脸重新上传整图到 OpenCL 再 `warpAffine`”的重复拷贝链。
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
-- 当 `antelopev2/scrfd_10g_bnkps.onnx` 输入元数据仍声明静态 `batch=1` 时，运行时必须在受控 runtime root 中把检测输入 batch 维修正为动态后再初始化 ORT session；禁止回退为“每请求只能单张检测”来规避跨请求批处理。
 - 当 `antelopev2/glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时必须在受控 runtime root 中把识别输出 batch 维修正为动态后再初始化 ORT session；禁止通过退回逐张识别来规避 `VerifyOutputSizes` warning。
 - FaceAnalysis 仅用于模型发现、provider 管理与 session 生命周期；检测/对齐/识别链路必须在仓库内本地显式编排，严禁 monkey patch `insightface` 模块或模型实例方法。
-- `/represent` 必须提供应用层有界准入、有限并发 worker 与专用有界批队列；允许跨请求聚合检测批和识别批，但不得改变单请求响应语义、字段和错误处理规则。
+- `/represent` 必须提供应用层有界准入、有限并发 worker 与专用有界批队列；允许跨请求聚合识别批并平滑调度检测，但不得改变单请求响应语义、字段和错误处理规则。
 
 ---
 
@@ -206,7 +205,7 @@
 7. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 5 条把 OCR 与其他非文本模型族并行常驻。
 8. InsightFace 使用独立执行路径；但其准入必须遵守第 5 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
 9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
-10. `/represent` 必须通过专用有界批队列聚合跨请求检测/识别；批处理只能发生在 InsightFace 模型族内部，不得绕开第 5 条让多个非文本模型族并行常驻。
+10. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 5 条让多个非文本模型族并行常驻。
 11. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
 12. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
 13. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
