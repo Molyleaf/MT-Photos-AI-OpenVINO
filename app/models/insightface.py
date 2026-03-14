@@ -1,8 +1,6 @@
 import asyncio
-import inspect
 import json
 import os
-import queue
 import shutil
 import sys
 import threading
@@ -49,6 +47,7 @@ _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
     dtype=np.float32,
 )
 _INSIGHTFACE_BATCH_DIM_PARAM = "batch"
+_INSIGHTFACE_BATCH_FLAT_PARAM = "batch_flat"
 
 
 @dataclass(frozen=True)
@@ -64,7 +63,8 @@ class _LoadedInsightFaceRuntime:
     runtime_root: Path
     provider_runtime: Dict[str, Dict[str, Any]]
     ppp_execution_devices: Dict[str, List[str]]
-    rec_session_shapes: Dict[str, List[str]]
+    det_session_shapes: Dict[str, Any]
+    rec_session_shapes: Dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -181,12 +181,10 @@ class InsightFaceMixin(ABC):
     _face_batch_size: int
     _face_batch_wait_seconds: float
     _face_queue_capacity: int
-    _face_task_queue: Optional[queue.Queue[Optional[_FaceInferenceTask]]]
-    _face_batch_dispatcher: Optional[threading.Thread]
-    _face_batch_workers: List[threading.Thread]
-    _face_worker_queues: List[queue.Queue[Optional[List[_FaceInferenceTask]]]]
-    _face_available_workers: Optional[queue.Queue[int]]
-    _face_batch_ready: threading.Event
+    _face_dispatch_loop: Optional[asyncio.AbstractEventLoop]
+    _face_task_queue: Optional[asyncio.Queue[Optional[_FaceInferenceTask]]]
+    _face_loop_ready: Any
+    _face_worker: Optional[threading.Thread]
     _execution_timeout_seconds: int
 
     @abstractmethod
@@ -788,6 +786,64 @@ class InsightFaceMixin(ABC):
             for item in cls._normalize_ort_shape(shape)
         ]
 
+    @staticmethod
+    def _onnx_dim_has_value(dim: Any) -> bool:
+        has_field = getattr(dim, "HasField", None)
+        if callable(has_field):
+            return bool(has_field("dim_value"))
+        try:
+            int(getattr(dim, "dim_value"))
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _onnx_dim_has_param(dim: Any) -> bool:
+        has_field = getattr(dim, "HasField", None)
+        if callable(has_field):
+            return bool(has_field("dim_param"))
+        return bool(str(getattr(dim, "dim_param", "")).strip())
+
+    @classmethod
+    def _onnx_dim_value(cls, dim: Any) -> Optional[int]:
+        if not cls._onnx_dim_has_value(dim):
+            return None
+        return int(dim.dim_value)
+
+    @classmethod
+    def _save_patched_insightface_model(cls, model: Any, src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
+        if temp_path.exists():
+            temp_path.unlink()
+        try:
+            onnx.save(model, str(temp_path))
+            os.replace(temp_path, dst)
+            shutil.copystat(src, dst)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    @classmethod
+    def _insightface_detector_model_has_dynamic_batch_metadata(cls, model: Any) -> bool:
+        if not model.graph.input or not model.graph.output:
+            return False
+        input_dims = model.graph.input[0].type.tensor_type.shape.dim
+        if not input_dims or cls._onnx_dim_value(input_dims[0]) is not None:
+            return False
+        for output in model.graph.output:
+            output_dims = output.type.tensor_type.shape.dim
+            if not output_dims or cls._onnx_dim_value(output_dims[0]) is not None:
+                return False
+        return True
+
+    @classmethod
+    def _insightface_recognition_model_has_dynamic_output_batch(cls, model: Any) -> bool:
+        if not model.graph.output:
+            return False
+        output_dims = model.graph.output[0].type.tensor_type.shape.dim
+        return bool(output_dims) and cls._onnx_dim_value(output_dims[0]) is None
+
     @classmethod
     def _normalize_insightface_recognition_state(cls, rec_model: Any) -> Dict[str, List[str]]:
         if rec_model is None:
@@ -820,6 +876,59 @@ class InsightFaceMixin(ABC):
         return {
             "input_shape": cls._format_ort_shape(input_shape),
             "output_shape": cls._format_ort_shape(output_shape),
+        }
+
+    @classmethod
+    def _normalize_insightface_detector_session_state(cls, det_model: Any) -> Dict[str, Any]:
+        if det_model is None:
+            raise RuntimeError("InsightFace detection model is missing.")
+
+        session = getattr(det_model, "session", None)
+        if session is None or not hasattr(session, "get_inputs") or not hasattr(session, "get_outputs"):
+            raise RuntimeError("InsightFace detection session is missing ORT shape metadata.")
+
+        inputs = list(session.get_inputs())
+        outputs = list(session.get_outputs())
+        if not inputs or not outputs:
+            raise RuntimeError("InsightFace detection session returned empty inputs/outputs.")
+
+        input_shape = cls._normalize_ort_shape(getattr(inputs[0], "shape", None))
+        output_shapes = [
+            cls._normalize_ort_shape(getattr(output_meta, "shape", None))
+            for output_meta in outputs
+        ]
+        det_model.input_name = str(getattr(det_model, "input_name", None) or inputs[0].name)
+        det_model.output_names = [
+            str(item.name) for item in outputs if getattr(item, "name", None)
+        ] or list(getattr(det_model, "output_names", []))
+        det_model.input_shape = list(input_shape)
+        det_model.output_shapes = [list(shape) for shape in output_shapes]
+
+        if cls._shape_has_static_batch_one(input_shape):
+            raise RuntimeError(
+                "InsightFace detection input metadata is pinned to batch=1. "
+                "Cross-request batched detection requires a dynamic input batch dimension."
+            )
+
+        static_output_dims = []
+        for output_meta, output_shape in zip(outputs, output_shapes):
+            if not output_shape:
+                continue
+            first_dim = output_shape[0]
+            try:
+                static_value = int(first_dim)
+            except (TypeError, ValueError):
+                continue
+            static_output_dims.append((str(getattr(output_meta, "name", "?")), static_value))
+        if static_output_dims:
+            raise RuntimeError(
+                "InsightFace detection output metadata is pinned to a static flattened batch "
+                f"dimension: {static_output_dims}. Batched detection requires dynamic output metadata."
+            )
+
+        return {
+            "input_shape": cls._format_ort_shape(input_shape),
+            "output_shapes": [cls._format_ort_shape(shape) for shape in output_shapes],
         }
 
     @staticmethod
@@ -874,14 +983,7 @@ class InsightFaceMixin(ABC):
         if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
             try:
                 existing_model = onnx.load(str(dst))
-                existing_dims = existing_model.graph.output[0].type.tensor_type.shape.dim
-                existing_first_dim = existing_dims[0] if existing_dims else None
-                existing_has_static_dim = bool(
-                    getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
-                )
-                if existing_first_dim is not None and (
-                    not existing_has_static_dim or int(existing_first_dim.dim_value) != 1
-                ):
+                if cls._insightface_recognition_model_has_dynamic_output_batch(existing_model):
                     return
             except Exception:
                 pass
@@ -897,25 +999,78 @@ class InsightFaceMixin(ABC):
             )
 
         first_dim = output_dims[0]
-        has_static_dim = bool(getattr(first_dim, "HasField", lambda *_: False)("dim_value"))
-        if not has_static_dim or int(first_dim.dim_value) != 1:
+        if cls._onnx_dim_value(first_dim) is None:
             cls._ensure_runtime_model_link(src, dst)
             return
 
         first_dim.ClearField("dim_value")
         first_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
-        if temp_path.exists():
-            temp_path.unlink()
-        try:
-            onnx.save(model, str(temp_path))
-            os.replace(temp_path, dst)
-            shutil.copystat(src, dst)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+        cls._save_patched_insightface_model(model, src, dst)
+
+    @classmethod
+    def _prepare_batched_insightface_detector_model(cls, src: Path, dst: Path) -> None:
+        if not src.is_file():
+            raise FileNotFoundError(f"InsightFace required model missing: {src}")
+        if onnx is None:
+            raise RuntimeError(
+                "InsightFace batched detector metadata patch requires the 'onnx' package."
+            )
+
+        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            try:
+                existing_model = onnx.load(str(dst))
+                if cls._insightface_detector_model_has_dynamic_batch_metadata(existing_model):
+                    return
+            except Exception:
+                pass
+
+        model = onnx.load(str(src))
+        if not model.graph.input or not model.graph.output:
+            raise RuntimeError(f"InsightFace detection model is missing inputs/outputs: {src}")
+
+        input_dims = model.graph.input[0].type.tensor_type.shape.dim
+        if not input_dims:
+            raise RuntimeError(
+                "InsightFace detection model input shape metadata is missing. "
+                f"model={src}"
+            )
+
+        patched = False
+        input_first_dim = input_dims[0]
+        if cls._onnx_dim_value(input_first_dim) is not None:
+            input_first_dim.ClearField("dim_value")
+            input_first_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
+            patched = True
+        elif not cls._onnx_dim_has_param(input_first_dim):
+            raise RuntimeError(
+                "InsightFace detection model input batch metadata is missing. "
+                f"model={src}"
+            )
+
+        for output in model.graph.output:
+            output_dims = output.type.tensor_type.shape.dim
+            if not output_dims:
+                raise RuntimeError(
+                    "InsightFace detection model output shape metadata is missing. "
+                    f"model={src} output={output.name}"
+                )
+            output_first_dim = output_dims[0]
+            if cls._onnx_dim_value(output_first_dim) is not None:
+                output_first_dim.ClearField("dim_value")
+                output_first_dim.dim_param = _INSIGHTFACE_BATCH_FLAT_PARAM
+                patched = True
+            elif not cls._onnx_dim_has_param(output_first_dim):
+                raise RuntimeError(
+                    "InsightFace detection model output batch metadata is missing. "
+                    f"model={src} output={output.name}"
+                )
+
+        if not patched:
+            cls._ensure_runtime_model_link(src, dst)
+            return
+
+        cls._save_patched_insightface_model(model, src, dst)
 
     def _prepare_insightface_runtime_root(self, source_root: Path) -> Path:
         source_model_dir = source_root / MODEL_NAME
@@ -930,11 +1085,7 @@ class InsightFaceMixin(ABC):
         det_primary = primary_model_dir / det_src.name
         rec_primary = primary_model_dir / rec_src.name
 
-        self._ensure_runtime_model_link(
-            det_src,
-            det_primary,
-            strict_identity=True,
-        )
+        self._prepare_batched_insightface_detector_model(det_src, det_primary)
         self._prepare_batched_insightface_recognition_model(rec_src, rec_primary)
         self._ensure_runtime_model_link(
             det_primary,
@@ -1034,26 +1185,13 @@ class InsightFaceMixin(ABC):
         *,
         attempt_name: str,
     ) -> _InsightFaceInitAttempt:
-        init_signature = inspect.signature(FaceAnalysis.__init__)
-        init_parameters = init_signature.parameters
-        supports_var_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in init_parameters.values()
-        )
-        supports_allowed_modules = "allowed_modules" in init_parameters
-        supports_provider_kwargs = "providers" in init_parameters or supports_var_kwargs
-        supports_provider_options = "provider_options" in init_parameters or supports_var_kwargs
-
         kwargs: Dict[str, Any] = {
             "name": MODEL_NAME,
             "root": str(runtime_root),
+            "allowed_modules": ["detection", "recognition"],
+            "providers": list(provider_names),
+            "provider_options": [dict(provider_options)],
         }
-        if supports_allowed_modules:
-            kwargs["allowed_modules"] = ["detection", "recognition"]
-        if supports_provider_kwargs:
-            kwargs["providers"] = list(provider_names)
-            if supports_provider_options:
-                kwargs["provider_options"] = [dict(provider_options)]
         return _InsightFaceInitAttempt(attempt_name, runtime_root, kwargs)
 
     def _instantiate_insightface_face_analysis(
@@ -1157,7 +1295,7 @@ class InsightFaceMixin(ABC):
 
         summary = "; ".join(attempt_errors) or "no attempts executed"
         raise RuntimeError(
-            "InsightFace initialization failed after compatibility retries: "
+            "InsightFace initialization failed after explicit OpenVINO provider retries: "
             f"{summary}"
         ) from last_exc
 
@@ -1170,6 +1308,9 @@ class InsightFaceMixin(ABC):
         face_app, runtime_root = self._instantiate_insightface_face_analysis(
             provider_names,
             provider_options,
+        )
+        det_session_shapes = self._normalize_insightface_detector_session_state(
+            getattr(face_app, "det_model", None)
         )
         self._prepare_insightface_detector(
             face_app,
@@ -1198,6 +1339,7 @@ class InsightFaceMixin(ABC):
             runtime_root=runtime_root,
             provider_runtime=provider_runtime,
             ppp_execution_devices=ppp_execution_devices,
+            det_session_shapes=det_session_shapes,
             rec_session_shapes=rec_session_shapes,
         )
 
@@ -1285,14 +1427,16 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s rec_session_shapes=%s face_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 provider_options,
                 runtime.provider_runtime,
                 runtime.ppp_execution_devices,
+                runtime.det_session_shapes,
                 runtime.rec_session_shapes,
+                1,
                 self._face_worker_count,
                 self._face_batch_size,
                 int(self._face_batch_wait_seconds * 1000.0),
@@ -1326,22 +1470,20 @@ class InsightFaceMixin(ABC):
     def _submit_face_task(self, image: np.ndarray) -> _FaceInferenceTask:
         future: Future[List[RepresentResult]] = Future()
         task = _FaceInferenceTask(payload=image, future=future, created_at=time.time())
+        loop = self._face_dispatch_loop
         if self._stopping:
             future.set_exception(RuntimeError("模型服务已关闭"))
             return task
-
-        task_queue = self._face_task_queue
-        if task_queue is None:
-            future.set_exception(RuntimeError("InsightFace batch queue is not initialized."))
+        if loop is None:
+            future.set_exception(RuntimeError("InsightFace queue loop is not initialized."))
             return task
 
         try:
-            task_queue.put(task, timeout=max(1.0, float(self._queue_timeout_seconds)))
-        except queue.Full:
-            self._set_face_task_exception(
-                task,
-                RuntimeError(f"推理队列已满（上限 {self._face_queue_capacity}），请稍后重试"),
+            submit_future = asyncio.run_coroutine_threadsafe(
+                self._enqueue_face_task_async(task),
+                loop,
             )
+            submit_future.result(timeout=max(1.0, float(self._queue_timeout_seconds)))
         except Exception as exc:
             submit_exc = exc if isinstance(exc, RuntimeError) else RuntimeError(str(exc))
             self._set_face_task_exception(task, submit_exc)
@@ -1411,7 +1553,57 @@ class InsightFaceMixin(ABC):
                 LOG.warning("Face task cancellation completed with error: %s", cancel_exc)
             raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
 
-    def _collect_face_task_batch(
+    def _require_face_dispatch_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self._face_dispatch_loop
+        if loop is None:
+            raise RuntimeError("InsightFace queue loop is not initialized.")
+        return loop
+
+    def _require_face_queue(self) -> asyncio.Queue[Optional[_FaceInferenceTask]]:
+        task_queue = self._face_task_queue
+        if task_queue is None:
+            raise RuntimeError("InsightFace batch queue is not initialized.")
+        return task_queue
+
+    def _face_worker_thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._face_dispatch_loop = loop
+        self._face_task_queue = asyncio.Queue(maxsize=self._face_queue_capacity)
+        self._face_loop_ready.set()
+        worker_task = loop.create_task(self._face_worker_loop())
+        try:
+            loop.run_forever()
+        finally:
+            worker_task.cancel()
+            loop.run_until_complete(asyncio.gather(worker_task, return_exceptions=True))
+            self._face_task_queue = None
+            self._face_dispatch_loop = None
+            loop.close()
+
+    async def _face_worker_loop(self) -> None:
+        task_queue = self._require_face_queue()
+        stop_after_batch = False
+        while True:
+            queued = await task_queue.get()
+            if queued is None:
+                task_queue.task_done()
+                break
+            if queued.cancel_requested.is_set():
+                task_queue.task_done()
+                continue
+            queued.started_at = time.monotonic()
+            queued.started_event.set()
+            batch, stop_after_batch = await self._collect_face_task_batch(queued)
+            try:
+                self._handle_face_task_batch(batch)
+            finally:
+                for _ in batch:
+                    task_queue.task_done()
+            if stop_after_batch:
+                break
+
+    async def _collect_face_task_batch(
         self,
         first_task: _FaceInferenceTask,
     ) -> Tuple[List[_FaceInferenceTask], bool]:
@@ -1419,129 +1611,94 @@ class InsightFaceMixin(ABC):
         if self._face_batch_size <= 1:
             return batch, False
 
-        task_queue = self._face_task_queue
-        if task_queue is None:
-            return batch, False
-
-        deadline = time.monotonic() + self._face_batch_wait_seconds
+        task_queue = self._require_face_queue()
+        deadline = asyncio.get_running_loop().time() + self._face_batch_wait_seconds
         stop_after_batch = False
         while len(batch) < self._face_batch_size:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0.0:
                 break
             try:
-                queued = task_queue.get(timeout=remaining)
-            except queue.Empty:
+                queued = await asyncio.wait_for(task_queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
                 break
             if queued is None:
+                task_queue.task_done()
                 stop_after_batch = True
                 break
+            if queued.cancel_requested.is_set():
+                task_queue.task_done()
+                continue
+            queued.started_at = time.monotonic()
+            queued.started_event.set()
             batch.append(queued)
         return batch, stop_after_batch
 
-    def _face_batch_dispatcher_loop(self) -> None:
+    async def _enqueue_face_task_async(self, task: _FaceInferenceTask) -> None:
+        if self._stopping:
+            raise RuntimeError("模型服务已关闭")
         task_queue = self._face_task_queue
-        available_workers = self._face_available_workers
-        if task_queue is None or available_workers is None:
-            return
-
-        while True:
-            queued = task_queue.get()
-            if queued is None:
-                break
-            batch, stop_after_batch = self._collect_face_task_batch(queued)
-            active_batch: List[_FaceInferenceTask] = []
-            for task in batch:
-                if task.cancel_requested.is_set():
-                    if not task.future.done():
-                        self._set_face_task_exception(task, _InferenceCancelled("Face task cancelled"))
-                    continue
-                active_batch.append(task)
-            if active_batch:
-                worker_index = available_workers.get()
-                self._face_worker_queues[worker_index].put(active_batch)
-            if stop_after_batch:
-                break
-
-    def _face_batch_worker_loop(
-        self,
-        worker_index: int,
-        worker_queue: "queue.Queue[Optional[List[_FaceInferenceTask]]]",
-        available_workers: "queue.Queue[int]",
-    ) -> None:
-        available_workers.put(worker_index)
-        while True:
-            batch = worker_queue.get()
-            if batch is None:
-                break
-            try:
-                self._handle_face_task_batch(batch)
-            finally:
-                available_workers.put(worker_index)
+        if task_queue is None:
+            raise RuntimeError("InsightFace batch queue is not initialized.")
+        if task_queue.full():
+            raise RuntimeError(f"推理队列已满（上限 {self._face_queue_capacity}），请稍后重试")
+        task_queue.put_nowait(task)
 
     def _start_face_batch_service(self) -> None:
-        if self._face_task_queue is not None:
+        if self._face_worker is not None:
             return
 
-        self._face_task_queue = queue.Queue(maxsize=self._face_queue_capacity)
-        self._face_available_workers = queue.Queue(maxsize=self._face_worker_count)
-        self._face_worker_queues = []
-        self._face_batch_workers = []
-        for worker_index in range(self._face_worker_count):
-            worker_queue: "queue.Queue[Optional[List[_FaceInferenceTask]]]" = queue.Queue(maxsize=1)
-            worker_thread = threading.Thread(
-                target=self._face_batch_worker_loop,
-                args=(worker_index, worker_queue, self._face_available_workers),
-                name=f"face-batch-{worker_index}",
-                daemon=True,
-            )
-            self._face_worker_queues.append(worker_queue)
-            self._face_batch_workers.append(worker_thread)
-            worker_thread.start()
-
-        self._face_batch_dispatcher = threading.Thread(
-            target=self._face_batch_dispatcher_loop,
-            name="face-batch-dispatch",
+        self._face_worker = threading.Thread(
+            target=self._face_worker_thread_main,
+            name="ai-face-queue",
             daemon=True,
         )
-        self._face_batch_dispatcher.start()
-        self._face_batch_ready.set()
+        self._face_worker.start()
+        ready = self._face_loop_ready.wait(
+            timeout=max(2.0, float(self._execution_timeout_seconds))
+        )
+        if not ready:
+            raise RuntimeError("InsightFace queue worker failed to initialize in time.")
 
     def _stop_face_batch_service(self) -> List[_FaceInferenceTask]:
         pending: List[_FaceInferenceTask] = []
+        loop = self._face_dispatch_loop
+        if loop is not None:
+            shutdown_future = asyncio.run_coroutine_threadsafe(
+                self._shutdown_face_queue_async(),
+                loop,
+            )
+            try:
+                pending = shutdown_future.result(
+                    timeout=max(2.0, float(self._execution_timeout_seconds))
+                )
+            except Exception as exc:
+                LOG.warning("Failed to drain InsightFace queue during shutdown: %s", exc)
+            loop.call_soon_threadsafe(loop.stop)
+
+        worker = self._face_worker
+        if worker is not None:
+            worker.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+            self._face_worker = None
+
+        self._face_loop_ready.clear()
+        return pending
+
+    async def _shutdown_face_queue_async(self) -> List[_FaceInferenceTask]:
+        pending: List[_FaceInferenceTask] = []
         task_queue = self._face_task_queue
-        if task_queue is not None:
-            while True:
-                try:
-                    queued = task_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if queued is None:
-                    continue
-                pending.append(queued)
+        if task_queue is None:
+            return pending
+        while True:
             try:
-                task_queue.put_nowait(None)
-            except Exception:
-                pass
-
-        dispatcher = self._face_batch_dispatcher
-        if dispatcher is not None:
-            dispatcher.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
-            self._face_batch_dispatcher = None
-
-        for worker_queue in self._face_worker_queues:
-            try:
-                worker_queue.put_nowait(None)
-            except Exception:
-                pass
-        for worker_thread in self._face_batch_workers:
-            worker_thread.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
-
-        self._face_task_queue = None
-        self._face_available_workers = None
-        self._face_worker_queues = []
-        self._face_batch_workers = []
-        self._face_batch_ready.clear()
+                queued = task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            task_queue.task_done()
+            if queued is None:
+                continue
+            pending.append(queued)
+        task_queue.put_nowait(None)
         return pending
 
     def _infer_face_batch(
@@ -1740,8 +1897,7 @@ class InsightFaceMixin(ABC):
             admission=self._face_admission,
             ensure_loaded=self._ensure_face_loaded,
         ):
-            task = await asyncio.to_thread(
-                self._submit_face_task,
-                _as_contiguous_bgr_uint8(image, context="InsightFace"),
+            task = self._submit_face_task(
+                _as_contiguous_bgr_uint8(image, context="InsightFace")
             )
             return await self._await_face_task(task)

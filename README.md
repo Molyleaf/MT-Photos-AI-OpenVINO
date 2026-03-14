@@ -57,7 +57,7 @@
 | `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；`AUTO` 在 GPU 可见时会优先解析为 `GPU`     | `AUTO`                             |
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
-| `INSIGHTFACE_MAX_WORKERS`           | `/represent` 应用层 worker 数；默认允许有限并发，避免单 worker 头阻塞        | `2`                                |
+| `INSIGHTFACE_MAX_WORKERS`           | `/represent` admission/批量预算基线；当前微批执行固定单 lane，用它推导并发上限与默认批大小 | `2`                                |
 | `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `INSIGHTFACE_BATCH_SIZE`            | `/represent` 跨请求检测/识别微批大小上限；运行时会按 admission 上限自动截断    | `min(INSIGHTFACE_MAX_CONCURRENT_REQUESTS, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `INSIGHTFACE_BATCH_WAIT_MS`         | `/represent` 微批等待窗口（毫秒）                                         | `5`                                |
@@ -95,10 +95,9 @@
 - 默认还会在连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留常驻 Text-CLIP；如需调整可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；返回 `{"result":"pass"}` 时本轮释放已经完成。
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
-- 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出元数据仍写死为 `{1,512}`，服务会在受控 runtime copy 中把 batch 维修正为动态后再初始化 ORT session；`/represent` 仍保持批量识别，不会回退逐张推理。
+- 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出 batch 元数据仍写死为 `{1,512}`，或 `scrfd_10g_bnkps.onnx` 的输入/输出 batch 元数据仍固定为单 batch，服务会在受控 runtime copy 中统一修正为动态后再初始化 ORT session；仓库内原始模型文件不会被改写。
 - 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
-- `/represent` 现在会通过有界微批队列平滑跨请求调度；检测阶段保持单张语义，OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转。
-- 服务会在受控 runtime copy 中修正 `glintr100.onnx` 的输出 batch 元数据；检测模型 `scrfd_10g_bnkps.onnx` 保持原始单张检测语义，仓库内原始模型文件不会被改写。
+- `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
 
 ## Windows 本机部署
 

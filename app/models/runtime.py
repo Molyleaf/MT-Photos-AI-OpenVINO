@@ -359,12 +359,10 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_engine = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        self._face_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
         self._face_task_queue = None
-        self._face_batch_dispatcher = None
-        self._face_batch_workers = []
-        self._face_worker_queues = []
-        self._face_available_workers = None
-        self._face_batch_ready = threading.Event()
+        self._face_loop_ready = threading.Event()
+        self._face_worker: Optional[threading.Thread] = None
 
     def _initialize_execution_controls(self) -> None:
         configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
@@ -468,7 +466,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_batch=%s/%sms face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -483,6 +481,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
+            1,
             self._face_worker_count,
             self._face_batch_size,
             int(self._face_batch_wait_seconds * 1000.0),
