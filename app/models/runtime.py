@@ -15,6 +15,7 @@ from .clip_image import ClipImageMixin
 from .clip_text import ClipTextMixin
 from .common import (
     _AdmissionController,
+    _FaceInferenceTask,
     _ManagedLease,
     NonTextFamily,
     _ClipImageTask,
@@ -243,6 +244,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._initialize_execution_controls()
             self._initialize_non_text_family_state()
             self._start_clip_image_worker()
+            self._start_face_batch_service()
             self._ensure_text_service_ready(preload=True)
             self._start_background_services()
             self._log_ready()
@@ -357,6 +359,12 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_engine = None
         self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
+        self._face_task_queue = None
+        self._face_batch_dispatcher = None
+        self._face_batch_workers = []
+        self._face_worker_queues = []
+        self._face_available_workers = None
+        self._face_batch_ready = threading.Event()
 
     def _initialize_execution_controls(self) -> None:
         configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
@@ -398,6 +406,21 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             "face",
             self._resolve_face_request_capacity(self._face_worker_count),
         )
+        self._face_batch_size = max(
+            1,
+            min(
+                self._face_admission.capacity,
+                _as_int(
+                    os.environ.get("INSIGHTFACE_BATCH_SIZE"),
+                    max(2, min(self._face_admission.capacity, self._face_worker_count * 2)),
+                ),
+            ),
+        )
+        self._face_batch_wait_seconds = max(
+            0.0,
+            _as_float(os.environ.get("INSIGHTFACE_BATCH_WAIT_MS"), 5.0) / 1000.0,
+        )
+        self._face_queue_capacity = self._face_admission.capacity
 
         self._shared_cpu_executor = ThreadPoolExecutor(
             max_workers=max(2, min(8, os.cpu_count() or 4)),
@@ -410,10 +433,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ocr_executor = ThreadPoolExecutor(
             max_workers=self._ocr_worker_count,
             thread_name_prefix="ocr",
-        )
-        self._face_executor = ThreadPoolExecutor(
-            max_workers=self._face_worker_count,
-            thread_name_prefix="face-ov",
         )
 
         self._request_activity_lock = threading.Lock()
@@ -449,7 +468,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_workers=%s face_batch=%s/%sms face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -465,6 +484,8 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
             self._face_worker_count,
+            self._face_batch_size,
+            int(self._face_batch_wait_seconds * 1000.0),
             self._face_admission.capacity,
         )
 
@@ -1142,6 +1163,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 return
             self._stopping = True
             pending_tasks: List[_ClipImageTask] = []
+            pending_face_tasks: List[_FaceInferenceTask] = []
             clip_queue_loop = self._clip_image_dispatch_loop
             if clip_queue_loop is not None:
                 shutdown_future = asyncio.run_coroutine_threadsafe(
@@ -1158,6 +1180,10 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
             for task in pending_tasks:
                 self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
+            pending_face_tasks = self._stop_face_batch_service()
+            for task in pending_face_tasks:
+                if not task.future.done():
+                    task.future.set_exception(RuntimeError("模型服务正在关闭"))
 
             if self._clip_image_worker is not None:
                 self._clip_image_worker.join()
@@ -1169,7 +1195,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 self._control_executor,
                 self._shared_cpu_executor,
                 self._ocr_executor,
-                self._face_executor,
             ):
                 executor.shutdown(wait=True, cancel_futures=True)
 

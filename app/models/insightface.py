@@ -2,12 +2,14 @@ import asyncio
 import inspect
 import json
 import os
+import queue
 import shutil
 import sys
 import threading
+import time
 from abc import abstractmethod, ABC
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -19,6 +21,7 @@ from insightface.app import FaceAnalysis
 
 from .common import (
     _AdmissionController,
+    _FaceInferenceTask,
     _InferenceCancelled,
     NonTextFamily,
     _OpenVinoPreprocessRunner,
@@ -62,6 +65,21 @@ class _LoadedInsightFaceRuntime:
     provider_runtime: Dict[str, Dict[str, Any]]
     ppp_execution_devices: Dict[str, List[str]]
     rec_session_shapes: Dict[str, List[str]]
+
+
+@dataclass(slots=True)
+class _PreparedInsightFaceImage:
+    detector_input: np.ndarray
+    det_scale: float
+    image_shape: Tuple[int, int]
+    source_umat: cv2.UMat
+
+
+@dataclass(slots=True)
+class _PendingInsightFaceRecognition:
+    task_index: int
+    face_meta: List[Tuple[np.ndarray, float]]
+    aligned_faces: List[np.ndarray]
 
 
 def _estimate_similarity_transform_matrix(src: Any, dst: Any) -> np.ndarray:
@@ -158,8 +176,17 @@ class InsightFaceMixin(ABC):
     _face_det_ppp: Optional[_OpenVinoPreprocessRunner]
     _face_rec_ppp: Optional[_OpenVinoPreprocessRunner]
     _face_load_lock: Any
-    _face_executor: ThreadPoolExecutor
     _face_admission: _AdmissionController
+    _face_worker_count: int
+    _face_batch_size: int
+    _face_batch_wait_seconds: float
+    _face_queue_capacity: int
+    _face_task_queue: Optional[queue.Queue[Optional[_FaceInferenceTask]]]
+    _face_batch_dispatcher: Optional[threading.Thread]
+    _face_batch_workers: List[threading.Thread]
+    _face_worker_queues: List[queue.Queue[Optional[List[_FaceInferenceTask]]]]
+    _face_available_workers: Optional[queue.Queue[int]]
+    _face_batch_ready: threading.Event
     _execution_timeout_seconds: int
 
     @abstractmethod
@@ -229,17 +256,17 @@ class InsightFaceMixin(ABC):
             return default
 
     @staticmethod
-    def _enable_insightface_opencl_alignment() -> None:
-        name, vendor = _ensure_intel_opencl_device("InsightFace alignment")
+    def _enable_insightface_opencl_pipeline() -> None:
+        name, vendor = _ensure_intel_opencl_device("InsightFace preprocessing/alignment")
         LOG.info(
-            "OpenCV OpenCL enabled for InsightFace alignment on Intel device: %s (%s).",
+            "OpenCV OpenCL enabled for InsightFace resize/alignment on Intel device: %s (%s).",
             name,
             vendor,
         )
 
     @staticmethod
     def _align_face_opencl(
-        img: np.ndarray,
+        img: Any,
         landmark: np.ndarray,
         image_size: int,
     ) -> np.ndarray:
@@ -249,16 +276,20 @@ class InsightFaceMixin(ABC):
                 "InsightFace estimate_norm returned invalid affine matrix shape: "
                 f"{matrix.shape}"
             )
-        source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
-
         if not cv2.ocl.useOpenCL():
             raise RuntimeError(
                 "OpenCV OpenCL was disabled during InsightFace alignment. "
                 "No silent fallback is allowed."
             )
+        if isinstance(img, cv2.UMat):
+            source = img
+        else:
+            source = _to_opencv_umat(
+                _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
+            )
         try:
             warped_umat = cv2.warpAffine(
-                _to_opencv_umat(source),
+                source,
                 cast(Any, matrix),
                 (int(image_size), int(image_size)),
                 borderValue=0.0,
@@ -274,6 +305,61 @@ class InsightFaceMixin(ABC):
         return _as_contiguous_bgr_uint8(
             np.asarray(warped_umat),
             context="InsightFace alignment",
+        )
+
+    def _prepare_insightface_detection_input(
+        self,
+        img: np.ndarray,
+        det_model: Any,
+    ) -> _PreparedInsightFaceImage:
+        image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
+        input_size = tuple(det_model.input_size)
+        im_ratio = float(image.shape[0]) / float(image.shape[1])
+        model_ratio = float(input_size[1]) / float(input_size[0])
+        if im_ratio > model_ratio:
+            new_height = input_size[1]
+            new_width = int(new_height / im_ratio)
+        else:
+            new_width = input_size[0]
+            new_height = int(new_width * im_ratio)
+        det_scale = float(new_height) / float(image.shape[0])
+
+        if not cv2.ocl.useOpenCL():
+            raise RuntimeError(
+                "OpenCV OpenCL was disabled during InsightFace detector preprocessing. "
+                "No silent fallback is allowed."
+            )
+
+        source_umat = _to_opencv_umat(image)
+        try:
+            resized_umat = cv2.resize(
+                source_umat,
+                (new_width, new_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            det_umat = cv2.copyMakeBorder(
+                resized_umat,
+                0,
+                int(input_size[1] - new_height),
+                0,
+                int(input_size[0] - new_width),
+                cv2.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenCV OpenCL detector resize/letterbox failed. "
+                "No silent fallback is allowed."
+            ) from exc
+
+        return _PreparedInsightFaceImage(
+            detector_input=_as_contiguous_bgr_uint8(
+                det_umat.get(),
+                context="InsightFace detector",
+            ),
+            det_scale=det_scale,
+            image_shape=(int(image.shape[0]), int(image.shape[1])),
+            source_umat=source_umat,
         )
 
     @staticmethod
@@ -350,11 +436,76 @@ class InsightFaceMixin(ABC):
             det_size=det_size,
             det_thresh=float(det_thresh),
         )
+        input_width, input_height = tuple(int(value) for value in det_model.input_size)
+        num_anchors = int(getattr(det_model, "_num_anchors"))
+        for stride in list(getattr(det_model, "_feat_stride_fpn", [])):
+            cls._get_insightface_anchor_centers(
+                det_model,
+                height=input_height // int(stride),
+                width=input_width // int(stride),
+                stride=int(stride),
+                num_anchors=num_anchors,
+            )
 
-    def _run_insightface_detector_forward(self, det_model: Any, img: np.ndarray) -> Any:
+    @staticmethod
+    def _reshape_insightface_detector_output(
+        output: Any,
+        *,
+        batch_size: int,
+        items_per_image: int,
+        channels: int,
+        label: str,
+    ) -> np.ndarray:
+        array = np.asarray(output)
+        expected_flat = items_per_image * batch_size
+        if array.ndim == 3 and array.shape[0] == batch_size:
+            return array.reshape(batch_size, items_per_image, channels)
+        if array.ndim == 2 and array.shape[0] == expected_flat:
+            return array.reshape(batch_size, items_per_image, channels)
+        if array.ndim == 2 and batch_size == 1 and array.shape[0] == items_per_image:
+            return array.reshape(1, items_per_image, channels)
+        raise RuntimeError(
+            "InsightFace detector output shape mismatch for "
+            f"{label}: batch_size={batch_size} items_per_image={items_per_image} "
+            f"channels={channels} got_shape={tuple(array.shape)}"
+        )
+
+    @staticmethod
+    def _get_insightface_anchor_centers(
+        det_model: Any,
+        *,
+        height: int,
+        width: int,
+        stride: int,
+        num_anchors: int,
+    ) -> np.ndarray:
+        key = (height, width, stride)
+        anchor_centers = det_model.center_cache.get(key)
+        if anchor_centers is not None:
+            return anchor_centers
+
+        anchor_centers = np.stack(
+            cast(Any, np.mgrid[:height, :width][::-1]),
+            axis=-1,
+        ).astype(np.float32)
+        anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+        if num_anchors > 1:
+            anchor_centers = np.stack([anchor_centers] * num_anchors, axis=1)
+            anchor_centers = anchor_centers.reshape((-1, 2))
+        if len(det_model.center_cache) < 100:
+            det_model.center_cache[key] = anchor_centers
+        return anchor_centers
+
+    def _run_insightface_detector_forward_batch(
+        self,
+        det_model: Any,
+        det_images: List[np.ndarray],
+    ) -> List[Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]]:
         preprocess_runner = self._face_det_ppp
         if preprocess_runner is None:
             raise RuntimeError("InsightFace detection PPP runner is not initialized.")
+        if not det_images:
+            return []
 
         self._normalize_insightface_detector_state(
             det_model,
@@ -363,101 +514,95 @@ class InsightFaceMixin(ABC):
             nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
         )
         distance2bbox, distance2kps = self._resolve_insightface_detector_helpers(det_model)
-        scores_list: List[np.ndarray] = []
-        bboxes_list: List[np.ndarray] = []
-        kpss_list: List[np.ndarray] = []
-
-        image_bgr = _as_contiguous_bgr_uint8(np.asarray(img), context="InsightFace detector")
-        blob = preprocess_runner.run(image_bgr[np.newaxis, ...])
+        batch = np.ascontiguousarray(np.stack(det_images, axis=0), dtype=np.uint8)
+        blob = preprocess_runner.run(batch)
         net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: blob})
 
+        batch_size = int(blob.shape[0])
         input_height = int(blob.shape[2])
         input_width = int(blob.shape[3])
         fmc = det_model.fmc
-        batched_output = bool(getattr(det_model, "batched", False))
         feat_stride_fpn = list(getattr(det_model, "_feat_stride_fpn"))
         num_anchors = int(getattr(det_model, "_num_anchors"))
+        per_image_scores: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
+        per_image_bboxes: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
+        per_image_kpss: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
 
         for idx, stride in enumerate(feat_stride_fpn):
-            kps_preds: Optional[np.ndarray] = None
-            if batched_output:
-                scores = net_outs[idx][0]
-                bbox_preds = net_outs[idx + fmc][0] * stride
-                if det_model.use_kps:
-                    kps_preds = net_outs[idx + fmc * 2][0] * stride
-            else:
-                scores = net_outs[idx]
-                bbox_preds = net_outs[idx + fmc] * stride
-                if det_model.use_kps:
-                    kps_preds = net_outs[idx + fmc * 2] * stride
-
             height = input_height // stride
             width = input_width // stride
-            key = (height, width, stride)
-            if key in det_model.center_cache:
-                anchor_centers = det_model.center_cache[key]
-            else:
-                anchor_centers = np.stack(
-                    cast(Any, np.mgrid[:height, :width][::-1]),
-                    axis=-1,
-                ).astype(np.float32)
-                anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-                if num_anchors > 1:
-                    anchor_centers = np.stack([anchor_centers] * num_anchors, axis=1)
-                    anchor_centers = anchor_centers.reshape((-1, 2))
-                if len(det_model.center_cache) < 100:
-                    det_model.center_cache[key] = anchor_centers
-
-            pos_inds = np.where(scores >= det_model.det_thresh)[0]
-            bboxes = distance2bbox(anchor_centers, bbox_preds)
-            pos_scores = scores[pos_inds]
-            pos_bboxes = bboxes[pos_inds]
-            scores_list.append(pos_scores)
-            bboxes_list.append(pos_bboxes)
+            item_count = height * width * num_anchors
+            anchor_centers = self._get_insightface_anchor_centers(
+                det_model,
+                height=height,
+                width=width,
+                stride=stride,
+                num_anchors=num_anchors,
+            )
+            score_batch = self._reshape_insightface_detector_output(
+                net_outs[idx],
+                batch_size=batch_size,
+                items_per_image=item_count,
+                channels=1,
+                label=f"score@{stride}",
+            )
+            bbox_batch = self._reshape_insightface_detector_output(
+                net_outs[idx + fmc],
+                batch_size=batch_size,
+                items_per_image=item_count,
+                channels=4,
+                label=f"bbox@{stride}",
+            )
 
             if det_model.use_kps:
-                if kps_preds is None or distance2kps is None:
+                if distance2kps is None:
                     raise RuntimeError(
-                        "InsightFace detector returned no keypoint predictions "
-                        "for a keypoint-enabled model."
+                        "InsightFace detector module missing distance2kps for a "
+                        "keypoint-enabled model."
                     )
-                kpss = distance2kps(anchor_centers, kps_preds)
-                kpss = kpss.reshape((kpss.shape[0], -1, 2))
-                pos_kpss = kpss[pos_inds]
-                kpss_list.append(pos_kpss)
+                kps_batch = self._reshape_insightface_detector_output(
+                    net_outs[idx + fmc * 2],
+                    batch_size=batch_size,
+                    items_per_image=item_count,
+                    channels=10,
+                    label=f"kps@{stride}",
+                )
+            else:
+                kps_batch = None
 
-        return scores_list, bboxes_list, kpss_list
+            for batch_index in range(batch_size):
+                scores = score_batch[batch_index].reshape(-1)
+                bbox_preds = bbox_batch[batch_index] * stride
+                pos_inds = np.where(scores >= det_model.det_thresh)[0]
+                if pos_inds.size == 0:
+                    continue
+                bboxes = distance2bbox(anchor_centers, bbox_preds)
+                per_image_scores[batch_index].append(scores[pos_inds])
+                per_image_bboxes[batch_index].append(bboxes[pos_inds])
 
-    def _detect_faces(
+                if kps_batch is not None:
+                    kps_preds = kps_batch[batch_index] * stride
+                    kpss = distance2kps(anchor_centers, kps_preds)
+                    kpss = kpss.reshape((kpss.shape[0], -1, 2))
+                    per_image_kpss[batch_index].append(kpss[pos_inds])
+
+        return [
+            (per_image_scores[index], per_image_bboxes[index], per_image_kpss[index])
+            for index in range(batch_size)
+        ]
+
+    def _postprocess_insightface_detections(
         self,
         det_model: Any,
-        img: np.ndarray,
-        max_num: int = 0,
-        metric: str = "default",
+        *,
+        scores_list: List[np.ndarray],
+        bboxes_list: List[np.ndarray],
+        kpss_list: List[np.ndarray],
+        det_scale: float,
+        image_shape: Tuple[int, int],
+        max_num: int,
+        metric: str,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        self._normalize_insightface_detector_state(
-            det_model,
-            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
-            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
-            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
-        )
-        assert det_model.input_size is not None
-        input_size = tuple(det_model.input_size)
-        image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
-        im_ratio = float(image.shape[0]) / float(image.shape[1])
-        model_ratio = float(input_size[1]) / float(input_size[0])
-        if im_ratio > model_ratio:
-            new_height = input_size[1]
-            new_width = int(new_height / im_ratio)
-        else:
-            new_width = input_size[0]
-            new_height = int(new_width * im_ratio)
-        det_scale = float(new_height) / float(image.shape[0])
-        resized_img = cv2.resize(image, (new_width, new_height))
-        det_img = np.zeros((input_size[1], input_size[0], 3), dtype=np.uint8)
-        det_img[:new_height, :new_width, :] = resized_img
-
-        scores_list, bboxes_list, kpss_list = self._run_insightface_detector_forward(det_model, det_img)
         if not scores_list:
             return np.empty((0, 5), dtype=np.float32), None
 
@@ -481,7 +626,7 @@ class InsightFaceMixin(ABC):
             kpss = kpss[keep, :, :]
         if 0 < max_num < det.shape[0]:
             area = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
-            img_center = image.shape[0] // 2, image.shape[1] // 2
+            img_center = image_shape[0] // 2, image_shape[1] // 2
             offsets = np.vstack(
                 [
                     (det[:, 0] + det[:, 2]) / 2 - img_center[1],
@@ -495,6 +640,57 @@ class InsightFaceMixin(ABC):
             if kpss is not None:
                 kpss = kpss[bindex, :]
         return det, kpss
+
+    def _detect_faces_batch(
+        self,
+        det_model: Any,
+        prepared_images: List[_PreparedInsightFaceImage],
+        max_num: int = 0,
+        metric: str = "default",
+    ) -> List[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        self._normalize_insightface_detector_state(
+            det_model,
+            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
+            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
+            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
+        )
+        if not prepared_images:
+            return []
+
+        forward_outputs = self._run_insightface_detector_forward_batch(
+            det_model,
+            [item.detector_input for item in prepared_images],
+        )
+        results: List[Tuple[np.ndarray, Optional[np.ndarray]]] = []
+        for prepared, (scores_list, bboxes_list, kpss_list) in zip(prepared_images, forward_outputs):
+            results.append(
+                self._postprocess_insightface_detections(
+                    det_model,
+                    scores_list=scores_list,
+                    bboxes_list=bboxes_list,
+                    kpss_list=kpss_list,
+                    det_scale=prepared.det_scale,
+                    image_shape=prepared.image_shape,
+                    max_num=max_num,
+                    metric=metric,
+                )
+            )
+        return results
+
+    def _detect_faces(
+        self,
+        det_model: Any,
+        img: np.ndarray,
+        max_num: int = 0,
+        metric: str = "default",
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        prepared = self._prepare_insightface_detection_input(img, det_model)
+        return self._detect_faces_batch(
+            det_model,
+            [prepared],
+            max_num=max_num,
+            metric=metric,
+        )[0]
 
     def _get_face_embeddings(self, rec_model: Any, aligned_faces: List[np.ndarray]) -> np.ndarray:
         preprocess_runner = self._face_rec_ppp
@@ -547,8 +743,11 @@ class InsightFaceMixin(ABC):
             std_values=_to_channel_triplet(getattr(rec_model, "input_std", 127.5)),
         )
 
-        self._enable_insightface_opencl_alignment()
-        LOG.info("InsightFace preprocessing configured: OpenCV(OpenCL align) + OpenVINO PPP.")
+        self._enable_insightface_opencl_pipeline()
+        LOG.info(
+            "InsightFace preprocessing configured: OpenCV(OpenCL resize/align) + "
+            "OpenVINO PPP."
+        )
 
     def _resolve_insightface_root(self) -> Path:
         candidate_roots = (self.insightface_model_root, self.insightface_root)
@@ -647,6 +846,66 @@ class InsightFaceMixin(ABC):
                 shutil.copy2(src, dst)
 
     @classmethod
+    def _prepare_batched_insightface_detection_model(cls, src: Path, dst: Path) -> None:
+        if not src.is_file():
+            raise FileNotFoundError(f"InsightFace required model missing: {src}")
+        if onnx is None:
+            raise RuntimeError(
+                "InsightFace batched detection metadata patch requires the 'onnx' package."
+            )
+
+        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            try:
+                existing_model = onnx.load(str(dst))
+                existing_inputs = existing_model.graph.input
+                if existing_inputs:
+                    existing_dims = existing_inputs[0].type.tensor_type.shape.dim
+                    existing_first_dim = existing_dims[0] if existing_dims else None
+                    has_static_dim = bool(
+                        getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
+                    )
+                    if existing_first_dim is not None and not has_static_dim:
+                        return
+            except Exception:
+                pass
+
+        model = onnx.load(str(src))
+        if not model.graph.input:
+            raise RuntimeError(f"InsightFace detection model has no inputs: {src}")
+
+        input_dims = model.graph.input[0].type.tensor_type.shape.dim
+        if not input_dims:
+            raise RuntimeError(
+                "InsightFace detection model input shape metadata is missing. "
+                f"model={src}"
+            )
+        first_input_dim = input_dims[0]
+        if getattr(first_input_dim, "HasField", lambda *_: False)("dim_value"):
+            first_input_dim.ClearField("dim_value")
+        first_input_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
+
+        for output_index, output_value in enumerate(model.graph.output):
+            output_dims = output_value.type.tensor_type.shape.dim
+            if not output_dims:
+                continue
+            first_dim = output_dims[0]
+            if getattr(first_dim, "HasField", lambda *_: False)("dim_value"):
+                first_dim.ClearField("dim_value")
+            first_dim.dim_param = f"anchors_{output_index}"
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = dst.with_suffix(f"{dst.suffix}.tmp")
+        if temp_path.exists():
+            temp_path.unlink()
+        try:
+            onnx.save(model, str(temp_path))
+            os.replace(temp_path, dst)
+            shutil.copystat(src, dst)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    @classmethod
     def _prepare_batched_insightface_recognition_model(cls, src: Path, dst: Path) -> None:
         if not src.is_file():
             raise FileNotFoundError(f"InsightFace required model missing: {src}")
@@ -714,7 +973,7 @@ class InsightFaceMixin(ABC):
         det_primary = primary_model_dir / det_src.name
         rec_primary = primary_model_dir / rec_src.name
 
-        self._ensure_runtime_model_link(det_src, det_primary)
+        self._prepare_batched_insightface_detection_model(det_src, det_primary)
         self._prepare_batched_insightface_recognition_model(rec_src, rec_primary)
         self._ensure_runtime_model_link(det_primary, compat_model_dir / det_src.name)
         self._ensure_runtime_model_link(rec_primary, compat_model_dir / rec_src.name)
@@ -1057,7 +1316,7 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s rec_session_shapes=%s face_workers=%s face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s rec_session_shapes=%s face_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
@@ -1065,7 +1324,9 @@ class InsightFaceMixin(ABC):
                 runtime.provider_runtime,
                 runtime.ppp_execution_devices,
                 runtime.rec_session_shapes,
-                getattr(self._face_executor, "_max_workers", "unknown"),
+                self._face_worker_count,
+                self._face_batch_size,
+                int(self._face_batch_wait_seconds * 1000.0),
                 self._face_admission.capacity,
                 runtime.runtime_root,
             )
@@ -1074,7 +1335,7 @@ class InsightFaceMixin(ABC):
             self._face_det_ppp = None
             self._face_rec_ppp = None
             raise RuntimeError(
-                "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL alignment. "
+                "InsightFace must run with OpenVINOExecutionProvider + OpenCV OpenCL resize/alignment. "
                 "No silent fallback is allowed."
             ) from exc
 
@@ -1083,11 +1344,241 @@ class InsightFaceMixin(ABC):
         if cancel_event is not None and cancel_event.is_set():
             raise _InferenceCancelled("Face task cancelled")
 
-    def _infer_face(
+    @staticmethod
+    def _set_face_task_result(task: _FaceInferenceTask, value: List[RepresentResult]) -> None:
+        if not task.future.done():
+            task.future.set_result(value)
+
+    @staticmethod
+    def _set_face_task_exception(task: _FaceInferenceTask, exc: Exception) -> None:
+        if not task.future.done():
+            task.future.set_exception(exc)
+
+    def _submit_face_task(self, image: np.ndarray) -> _FaceInferenceTask:
+        future: Future[List[RepresentResult]] = Future()
+        task = _FaceInferenceTask(payload=image, future=future, created_at=time.time())
+        if self._stopping:
+            future.set_exception(RuntimeError("模型服务已关闭"))
+            return task
+
+        task_queue = self._face_task_queue
+        if task_queue is None:
+            future.set_exception(RuntimeError("InsightFace batch queue is not initialized."))
+            return task
+
+        try:
+            task_queue.put(task, timeout=max(1.0, float(self._queue_timeout_seconds)))
+        except queue.Full:
+            self._set_face_task_exception(
+                task,
+                RuntimeError(f"推理队列已满（上限 {self._face_queue_capacity}），请稍后重试"),
+            )
+        except Exception as exc:
+            submit_exc = exc if isinstance(exc, RuntimeError) else RuntimeError(str(exc))
+            self._set_face_task_exception(task, submit_exc)
+        return task
+
+    def _cancel_face_task_if_queued(self, task: _FaceInferenceTask, exc: Exception) -> bool:
+        if task.started_event.is_set():
+            return False
+        task.cancel_requested.set()
+        self._set_face_task_exception(task, exc)
+        return True
+
+    def _wait_face_task(self, task: _FaceInferenceTask) -> List[RepresentResult]:
+        if task.future.done():
+            return task.future.result()
+
+        started = bool(task.started_event.wait(timeout=self._queue_timeout_seconds))
+        if not started:
+            if task.future.done():
+                return task.future.result()
+            queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
+            if self._cancel_face_task_if_queued(task, queue_exc):
+                raise queue_exc
+            if not bool(task.started_event.wait(timeout=0.05)) and not task.future.done():
+                raise queue_exc
+
+        try:
+            return task.future.result(timeout=self._execution_timeout_seconds)
+        except FutureTimeoutError as exc:
+            task.cancel_requested.set()
+            try:
+                task.future.result(timeout=max(1.0, float(self._execution_timeout_seconds)))
+            except _InferenceCancelled:
+                pass
+            except Exception as cancel_exc:
+                LOG.warning("Face task cancellation completed with error: %s", cancel_exc)
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
+
+    async def _await_face_task(self, task: _FaceInferenceTask) -> List[RepresentResult]:
+        if task.future.done():
+            return task.future.result()
+
+        started = bool(await asyncio.to_thread(task.started_event.wait, self._queue_timeout_seconds))
+        if not started:
+            if task.future.done():
+                return task.future.result()
+            queue_exc = RuntimeError(f"推理任务排队超时（>{self._queue_timeout_seconds}s）")
+            if self._cancel_face_task_if_queued(task, queue_exc):
+                raise queue_exc
+            started = bool(await asyncio.to_thread(task.started_event.wait, 0.05))
+            if not started and not task.future.done():
+                raise queue_exc
+
+        wrapped = asyncio.wrap_future(task.future)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(wrapped),
+                timeout=self._execution_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            task.cancel_requested.set()
+            try:
+                await wrapped
+            except _InferenceCancelled:
+                pass
+            except Exception as cancel_exc:
+                LOG.warning("Face task cancellation completed with error: %s", cancel_exc)
+            raise RuntimeError(f"推理任务执行超时（>{self._execution_timeout_seconds}s）") from exc
+
+    def _collect_face_task_batch(
         self,
-        image: np.ndarray,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> List[RepresentResult]:
+        first_task: _FaceInferenceTask,
+    ) -> Tuple[List[_FaceInferenceTask], bool]:
+        batch = [first_task]
+        if self._face_batch_size <= 1:
+            return batch, False
+
+        task_queue = self._face_task_queue
+        if task_queue is None:
+            return batch, False
+
+        deadline = time.monotonic() + self._face_batch_wait_seconds
+        stop_after_batch = False
+        while len(batch) < self._face_batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                queued = task_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if queued is None:
+                stop_after_batch = True
+                break
+            batch.append(queued)
+        return batch, stop_after_batch
+
+    def _face_batch_dispatcher_loop(self) -> None:
+        task_queue = self._face_task_queue
+        available_workers = self._face_available_workers
+        if task_queue is None or available_workers is None:
+            return
+
+        while True:
+            queued = task_queue.get()
+            if queued is None:
+                break
+            batch, stop_after_batch = self._collect_face_task_batch(queued)
+            active_batch: List[_FaceInferenceTask] = []
+            for task in batch:
+                if task.cancel_requested.is_set():
+                    if not task.future.done():
+                        self._set_face_task_exception(task, _InferenceCancelled("Face task cancelled"))
+                    continue
+                active_batch.append(task)
+            if active_batch:
+                worker_index = available_workers.get()
+                self._face_worker_queues[worker_index].put(active_batch)
+            if stop_after_batch:
+                break
+
+    def _face_batch_worker_loop(
+        self,
+        worker_index: int,
+        worker_queue: "queue.Queue[Optional[List[_FaceInferenceTask]]]",
+        available_workers: "queue.Queue[int]",
+    ) -> None:
+        available_workers.put(worker_index)
+        while True:
+            batch = worker_queue.get()
+            if batch is None:
+                break
+            try:
+                self._handle_face_task_batch(batch)
+            finally:
+                available_workers.put(worker_index)
+
+    def _start_face_batch_service(self) -> None:
+        if self._face_task_queue is not None:
+            return
+
+        self._face_task_queue = queue.Queue(maxsize=self._face_queue_capacity)
+        self._face_available_workers = queue.Queue(maxsize=self._face_worker_count)
+        self._face_worker_queues = []
+        self._face_batch_workers = []
+        for worker_index in range(self._face_worker_count):
+            worker_queue: "queue.Queue[Optional[List[_FaceInferenceTask]]]" = queue.Queue(maxsize=1)
+            worker_thread = threading.Thread(
+                target=self._face_batch_worker_loop,
+                args=(worker_index, worker_queue, self._face_available_workers),
+                name=f"face-batch-{worker_index}",
+                daemon=True,
+            )
+            self._face_worker_queues.append(worker_queue)
+            self._face_batch_workers.append(worker_thread)
+            worker_thread.start()
+
+        self._face_batch_dispatcher = threading.Thread(
+            target=self._face_batch_dispatcher_loop,
+            name="face-batch-dispatch",
+            daemon=True,
+        )
+        self._face_batch_dispatcher.start()
+        self._face_batch_ready.set()
+
+    def _stop_face_batch_service(self) -> List[_FaceInferenceTask]:
+        pending: List[_FaceInferenceTask] = []
+        task_queue = self._face_task_queue
+        if task_queue is not None:
+            while True:
+                try:
+                    queued = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if queued is None:
+                    continue
+                pending.append(queued)
+            try:
+                task_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        dispatcher = self._face_batch_dispatcher
+        if dispatcher is not None:
+            dispatcher.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+            self._face_batch_dispatcher = None
+
+        for worker_queue in self._face_worker_queues:
+            try:
+                worker_queue.put_nowait(None)
+            except Exception:
+                pass
+        for worker_thread in self._face_batch_workers:
+            worker_thread.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+
+        self._face_task_queue = None
+        self._face_available_workers = None
+        self._face_worker_queues = []
+        self._face_batch_workers = []
+        self._face_batch_ready.clear()
+        return pending
+
+    def _infer_face_batch(
+        self,
+        tasks: List[_FaceInferenceTask],
+    ) -> List[Tuple[Optional[List[RepresentResult]], Optional[Exception]]]:
         if self._face_engine is None:
             raise RuntimeError("Face model is not loaded.")
 
@@ -1096,60 +1587,172 @@ class InsightFaceMixin(ABC):
         if det_model is None or rec_model is None:
             raise RuntimeError("InsightFace detection/recognition model not found.")
 
-        face_input = _as_contiguous_bgr_uint8(image, context="InsightFace")
-        self._raise_if_cancelled(cancel_event)
-        detections, kpss = self._detect_faces(det_model, face_input, max_num=0, metric="default")
-        if detections.shape[0] == 0:
-            return []
+        outcomes: List[Tuple[Optional[List[RepresentResult]], Optional[Exception]]] = [
+            (None, None) for _ in tasks
+        ]
+        prepared_images: List[_PreparedInsightFaceImage] = []
+        prepared_task_indices: List[int] = []
+        for task_index, task in enumerate(tasks):
+            if task.cancel_requested.is_set():
+                outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                continue
+            prepared_images.append(
+                self._prepare_insightface_detection_input(task.payload, det_model)
+            )
+            prepared_task_indices.append(task_index)
 
+        if not prepared_images:
+            return outcomes
+
+        detections_batch = self._detect_faces_batch(
+            det_model,
+            prepared_images,
+            max_num=0,
+            metric="default",
+        )
         rec_image_size = int(rec_model.input_size[0])
-        aligned_faces: List[np.ndarray] = []
-        face_meta: List[Tuple[np.ndarray, float]] = []
-        for index in range(detections.shape[0]):
-            self._raise_if_cancelled(cancel_event)
-            bbox = np.asarray(detections[index, 0:4], dtype=np.float32)
-            det_score = float(detections[index, 4])
+        recognition_items: List[_PendingInsightFaceRecognition] = []
+        for prepared_index, (detections, kpss) in enumerate(detections_batch):
+            task_index = prepared_task_indices[prepared_index]
+            task = tasks[task_index]
+            if task.cancel_requested.is_set():
+                outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                continue
+            if detections.shape[0] == 0:
+                outcomes[task_index] = ([], None)
+                continue
             if kpss is None:
-                raise RuntimeError(
-                    "InsightFace detection returned no landmarks for recognition. "
-                    "No silent fallback is allowed."
-                )
-            aligned_faces.append(
-                self._align_face_opencl(face_input, np.asarray(kpss[index]), rec_image_size)
-            )
-            face_meta.append((bbox, det_score))
-
-        self._raise_if_cancelled(cancel_event)
-        embeddings = self._get_face_embeddings(rec_model, aligned_faces)
-        if embeddings.shape[0] != len(face_meta):
-            raise RuntimeError(
-                "InsightFace recognition output mismatch: "
-                f"expected={len(face_meta)} got={embeddings.shape[0]}"
-            )
-
-        results: List[RepresentResult] = []
-        for index, (bbox, det_score) in enumerate(face_meta):
-            self._raise_if_cancelled(cancel_event)
-            embedding = np.asarray(embeddings[index], dtype=np.float32).reshape(-1)
-            embedding_norm = float(np.linalg.norm(embedding))
-            if embedding_norm <= 0.0:
-                raise RuntimeError("InsightFace recognition produced zero-norm embedding.")
-            normed_embedding = embedding / embedding_norm
-            bbox = np.array(bbox).astype(int)
-            x1, y1, x2, y2 = bbox
-            results.append(
-                RepresentResult(
-                    embedding=[float(value) for value in normed_embedding],
-                    facial_area=FacialArea(
-                        x=int(x1),
-                        y=int(y1),
-                        w=int(x2 - x1),
-                        h=int(y2 - y1),
+                outcomes[task_index] = (
+                    None,
+                    RuntimeError(
+                        "InsightFace detection returned no landmarks for recognition. "
+                        "No silent fallback is allowed."
                     ),
-                    face_confidence=float(det_score),
+                )
+                continue
+
+            aligned_faces: List[np.ndarray] = []
+            face_meta: List[Tuple[np.ndarray, float]] = []
+            for face_index in range(detections.shape[0]):
+                if task.cancel_requested.is_set():
+                    outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                    break
+                bbox = np.asarray(detections[face_index, 0:4], dtype=np.float32)
+                det_score = float(detections[face_index, 4])
+                aligned_faces.append(
+                    self._align_face_opencl(
+                        prepared_images[prepared_index].source_umat,
+                        np.asarray(kpss[face_index]),
+                        rec_image_size,
+                    )
+                )
+                face_meta.append((bbox, det_score))
+            if outcomes[task_index][1] is not None:
+                continue
+            recognition_items.append(
+                _PendingInsightFaceRecognition(
+                    task_index=task_index,
+                    face_meta=face_meta,
+                    aligned_faces=aligned_faces,
                 )
             )
-        return results
+
+        all_aligned_faces: List[np.ndarray] = []
+        recognition_spans: List[Tuple[int, List[Tuple[np.ndarray, float]], int, int]] = []
+        for item in recognition_items:
+            task = tasks[item.task_index]
+            if task.cancel_requested.is_set():
+                outcomes[item.task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                continue
+            start = len(all_aligned_faces)
+            all_aligned_faces.extend(item.aligned_faces)
+            recognition_spans.append(
+                (item.task_index, item.face_meta, start, len(item.aligned_faces))
+            )
+
+        if all_aligned_faces:
+            embeddings = self._get_face_embeddings(rec_model, all_aligned_faces)
+        else:
+            embeddings = np.empty((0, 0), dtype=np.float32)
+
+        for task_index, face_meta, start, count in recognition_spans:
+            task = tasks[task_index]
+            if task.cancel_requested.is_set():
+                outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                continue
+            task_embeddings = embeddings[start : start + count]
+            if task_embeddings.shape[0] != len(face_meta):
+                outcomes[task_index] = (
+                    None,
+                    RuntimeError(
+                        "InsightFace recognition output mismatch: "
+                        f"expected={len(face_meta)} got={task_embeddings.shape[0]}"
+                    ),
+                )
+                continue
+            results: List[RepresentResult] = []
+            for index, (bbox, det_score) in enumerate(face_meta):
+                if task.cancel_requested.is_set():
+                    outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                    break
+                embedding = np.asarray(task_embeddings[index], dtype=np.float32).reshape(-1)
+                embedding_norm = float(np.linalg.norm(embedding))
+                if embedding_norm <= 0.0:
+                    outcomes[task_index] = (
+                        None,
+                        RuntimeError("InsightFace recognition produced zero-norm embedding."),
+                    )
+                    break
+                normed_embedding = embedding / embedding_norm
+                bbox_int = np.array(bbox).astype(int)
+                x1, y1, x2, y2 = bbox_int
+                results.append(
+                    RepresentResult(
+                        embedding=[float(value) for value in normed_embedding],
+                        facial_area=FacialArea(
+                            x=int(x1),
+                            y=int(y1),
+                            w=int(x2 - x1),
+                            h=int(y2 - y1),
+                        ),
+                        face_confidence=float(det_score),
+                    )
+                )
+            if outcomes[task_index][1] is None:
+                outcomes[task_index] = (results, None)
+        return outcomes
+
+    def _handle_face_task_batch(self, tasks: List[_FaceInferenceTask]) -> None:
+        if not tasks:
+            return
+
+        active_tasks: List[_FaceInferenceTask] = []
+        for task in tasks:
+            if task.cancel_requested.is_set():
+                if not task.future.done():
+                    self._set_face_task_exception(task, _InferenceCancelled("Face task cancelled"))
+                continue
+            task.started_at = time.monotonic()
+            task.started_event.set()
+            active_tasks.append(task)
+
+        if not active_tasks:
+            return
+
+        try:
+            outcomes = self._infer_face_batch(active_tasks)
+            for task, (result, exc) in zip(active_tasks, outcomes):
+                if exc is not None:
+                    self._set_face_task_exception(task, exc)
+                else:
+                    self._set_face_task_result(task, result or [])
+        except Exception as exc:
+            LOG.error("Task represent failed: %s", exc, exc_info=True)
+            for task in active_tasks:
+                if task.cancel_requested.is_set():
+                    self._set_face_task_exception(task, _InferenceCancelled("Face task cancelled"))
+                else:
+                    self._set_face_task_exception(task, exc)
 
     def get_face_representation(self, image: np.ndarray) -> List[RepresentResult]:
         with self._non_text_request_scope(
@@ -1158,25 +1761,18 @@ class InsightFaceMixin(ABC):
             admission=self._face_admission,
             ensure_loaded=self._ensure_face_loaded,
         ):
-            return self._infer_face(image)
+            task = self._submit_face_task(_as_contiguous_bgr_uint8(image, context="InsightFace"))
+            return self._wait_face_task(task)
 
     async def get_face_representation_async(self, image: np.ndarray) -> List[RepresentResult]:
-        cancel_event = threading.Event()
         async with self._non_text_request_scope_async(
             family="face",
             label="InsightFace",
             admission=self._face_admission,
             ensure_loaded=self._ensure_face_loaded,
         ):
-            future = self._run_in_executor(
-                self._face_executor,
-                self._infer_face,
-                image,
-                cancel_event,
+            task = await asyncio.to_thread(
+                self._submit_face_task,
+                _as_contiguous_bgr_uint8(image, context="InsightFace"),
             )
-            return await self._await_with_timeout_and_cooperative_cancel(
-                future,
-                cancel_event=cancel_event,
-                timeout_seconds=self._execution_timeout_seconds,
-                task_name="Face task",
-            )
+            return await self._await_face_task(task)

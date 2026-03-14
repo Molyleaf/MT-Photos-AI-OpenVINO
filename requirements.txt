@@ -4,7 +4,7 @@ fastapi
 pydantic
 openvino
 onnx
-# RapidOCR 3.7.0 runs with the upstream OpenVINO CPU path, repo-managed lazy-load/admission/timeout controls, idle non-text release, and no local session replacement in app/models.py.
+# InsightFace keeps using ORT + OpenVINO EP; runtime-only batch metadata patching for scrfd/glintr stays in-process and does not add extra batching dependencies.
 rapidocr==3.7.0
 onnxruntime-openvino
 uvicorn

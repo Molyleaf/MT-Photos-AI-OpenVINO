@@ -530,3 +530,13 @@ class _ClipImageTask:
     started_at: Optional[float] = None
     started_event: threading.Event = field(default_factory=threading.Event)
     cancel_requested: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(slots=True)
+class _FaceInferenceTask:
+    payload: Any
+    future: Future
+    created_at: float
+    started_at: Optional[float] = None
+    started_event: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: threading.Event = field(default_factory=threading.Event)

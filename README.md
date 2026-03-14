@@ -12,7 +12,7 @@
 - 服务入口：`app/server.py`
 - QA-CLIP 离线转换脚本：`convert/convert.py`
 - 源码运行时需保留 `app/models/QA-CLIP/clip`，服务当前仍使用其中的 tokenizer 与词表资源
-- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `glintr100.onnx` 的批量输出元数据，避免批量识别被错误的静态 `{1,512}` 元数据拖回低吞吐路径
+- `requirements.txt` 现显式包含 `onnx`，用于 InsightFace 首次懒加载时校验并修正 `scrfd_10g_bnkps.onnx` / `glintr100.onnx` 的批量元数据，避免 `/represent` 被错误的静态 batch 元数据拖回低吞吐路径
 
 ## 运行时环境变量
 
@@ -59,6 +59,8 @@
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `INSIGHTFACE_MAX_WORKERS`           | `/represent` 应用层 worker 数；默认允许有限并发，避免单 worker 头阻塞        | `2`                                |
 | `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
+| `INSIGHTFACE_BATCH_SIZE`            | `/represent` 跨请求检测/识别微批大小上限；运行时会按 admission 上限自动截断    | `min(INSIGHTFACE_MAX_CONCURRENT_REQUESTS, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
+| `INSIGHTFACE_BATCH_WAIT_MS`         | `/represent` 微批等待窗口（毫秒）                                         | `5`                                |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`；该变量由 OpenCV 运行时直接读取 | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口；对 Docker 镜像入口、容器健康检查和 `python server.py` 生效 | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：作用于 `mt_photos_ai.*`、`uvicorn.*` 和 RapidOCR logger | `WARNING`                          |
@@ -95,7 +97,8 @@
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
 - 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出元数据仍写死为 `{1,512}`，服务会在受控 runtime copy 中把 batch 维修正为动态后再初始化 ORT session；`/represent` 仍保持批量识别，不会回退逐张推理。
 - 服务会兼容旧版 `insightface` 对 `providers` / `allowed_modules` 构造参数的不同行为：若构造阶段不接受这些参数，会自动改为兼容实例化并在 session 级强制设置 `OpenVINOExecutionProvider`，不会因为包版本差异静默回退到 CPUExecutionProvider。
-- `/represent` 默认不再固定单 worker；服务会以有限 worker 并发执行人脸检测/对齐/识别，并在应用层限制最大并发请求数，减少头阻塞和后台队列堆积。
+- `/represent` 现在会通过有界微批队列跨请求聚合人脸检测和识别；OpenCV OpenCL 负责缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转。
+- 服务会在受控 runtime copy 中同时修正 `scrfd_10g_bnkps.onnx` 的输入 batch 元数据和 `glintr100.onnx` 的输出 batch 元数据；仓库内原始模型文件不会被改写。
 
 ## Windows 本机部署
 
@@ -121,6 +124,7 @@ $env:CLIP_INFERENCE_DEVICE="CPU"
 $env:CLIP_IMAGE_BATCH="8"
 $env:RAPIDOCR_DEVICE="CPU"
 $env:INSIGHTFACE_OV_DEVICE="CPU"
+$env:INSIGHTFACE_BATCH_SIZE="4"
 $env:LOG_LEVEL="INFO"
 ```
 
@@ -188,6 +192,7 @@ cp docker-compose.example.yml docker-compose.yml
 - 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；服务固定单进程，不再提供 worker 数配置项
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
+- 若 `/represent` 仍未跑满 GPU，可结合业务流量逐步调大 `INSIGHTFACE_BATCH_SIZE`，并保持 `INSIGHTFACE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 
 4. 启动服务：
 
@@ -222,6 +227,7 @@ docker run -d \
   -e CLIP_IMAGE_BATCH=8 \
   -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=AUTO \
+  -e INSIGHTFACE_BATCH_SIZE=4 \
   -e OCR_EXEC_TIMEOUT=30 \
   -e NON_TEXT_IDLE_RELEASE_SECONDS=60 \
   -e PORT=8060 \
