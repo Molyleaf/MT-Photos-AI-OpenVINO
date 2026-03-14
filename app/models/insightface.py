@@ -571,9 +571,9 @@ class InsightFaceMixin(ABC):
                 kps_batch = None
 
             for batch_index in range(batch_size):
-                scores = score_batch[batch_index].reshape(-1)
+                scores = score_batch[batch_index].reshape(-1, 1)
                 bbox_preds = bbox_batch[batch_index] * stride
-                pos_inds = np.where(scores >= det_model.det_thresh)[0]
+                pos_inds = np.where(scores[:, 0] >= det_model.det_thresh)[0]
                 if pos_inds.size == 0:
                     continue
                 bboxes = distance2bbox(anchor_centers, bbox_preds)
@@ -606,7 +606,12 @@ class InsightFaceMixin(ABC):
         if not scores_list:
             return np.empty((0, 5), dtype=np.float32), None
 
-        scores = np.vstack(scores_list)
+        scores = np.vstack(
+            [
+                np.asarray(score_array, dtype=np.float32).reshape(-1, 1)
+                for score_array in scores_list
+            ]
+        )
         scores_ravel = scores.ravel()
         if scores_ravel.size == 0:
             return np.empty((0, 5), dtype=np.float32), None
