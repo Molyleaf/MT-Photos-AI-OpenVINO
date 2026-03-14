@@ -99,6 +99,7 @@
 - InsightFace 固定使用新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；若当前 `insightface` 包不支持这组参数，服务会直接失败，不再做兼容重试。
 - InsightFace 运行时模型固定物化到 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；服务只会在这里生成动态 batch detector/recognition 运行时模型，不再维护兼容目录或 source/runtime 回退。
 - `INSIGHTFACE_OV_DEVICE=GPU` 时，InsightFace 预处理走 OpenCV OpenCL + OpenVINO PPP；`INSIGHTFACE_OV_DEVICE=CPU` 时，预处理走 OpenCV CPU + OpenVINO PPP，二者都必须保持 `OpenVINOExecutionProvider` 为首位 provider。
+- SCRFD detector 的 batched 输出会在仓库内先恢复为 `spatial x batch x anchors x channels` 再解码 bbox/kps，避免跨请求微批时出现框和关键点串位。
 - `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，GPU 模式使用 OpenCV OpenCL 缩放/对齐，CPU 模式使用 OpenCV CPU 缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
 
 ## Windows 本机部署
@@ -320,7 +321,8 @@ docker run --rm -it \
 - `OpenVINOExecutionProvider` 仍是 detection/recognition 的首位 provider，且 `device_type` 与请求一致
 - 运行时模型目录已经收敛到 `_runtime_models/models/antelopev2`
 - 本地 `/represent` pipeline 与原生 `FaceAnalysis.get` 的检测框、分数和 embedding 语义保持一致
-- batched detection / recognition 与 single-image 路径一致
+- batched SCRFD detection / recognition 与 single-image 路径一致
+- 并发 `/represent` 微批与顺序 `/represent` 路径一致，不会再出现跨请求框/关键点串位
 - `release_models_for_restart()` 后 face runtime 引用已释放，且能够重新加载
 
 服务启动后，也可以再做基础端点检查：

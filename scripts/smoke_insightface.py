@@ -103,6 +103,28 @@ def _resolve_sample_images() -> List[Path]:
     return resolved
 
 
+def _build_smoke_samples() -> List[tuple[str, np.ndarray]]:
+    sample_paths = _resolve_sample_images()
+    samples = [(path.name, _load_bgr(path)) for path in sample_paths]
+    primary_name, primary_image = samples[0]
+    primary_path = Path(primary_name)
+    samples.append(
+        (
+            f"{primary_path.stem}_flip{primary_path.suffix}",
+            np.ascontiguousarray(cv2.flip(primary_image, 1)),
+        )
+    )
+    return samples
+
+
+async def _collect_local_results_concurrent(models: AIModels, images: Sequence[np.ndarray]) -> List[Any]:
+    coroutines = [
+        models.get_face_representation_async(image.copy())
+        for image in images
+    ]
+    return list(await asyncio.gather(*coroutines))
+
+
 def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     left_norm = float(np.linalg.norm(left))
     right_norm = float(np.linalg.norm(right))
@@ -243,6 +265,87 @@ def _compare_detection_batch(models: AIModels, det_model: Any, images: Sequence[
     return comparisons, prepared_images, batch_results
 
 
+def _compare_represent_microbatch(
+    sample_names: Sequence[str],
+    sequential_results: Sequence[Any],
+    concurrent_results: Sequence[Any],
+) -> List[dict[str, Any]]:
+    comparisons: List[dict[str, Any]] = []
+    for sample_name, sequential_result, concurrent_result in zip(
+        sample_names,
+        sequential_results,
+        concurrent_results,
+    ):
+        sequential_sorted = _sort_local_results(sequential_result)
+        concurrent_sorted = _sort_local_results(concurrent_result)
+        if len(sequential_sorted) != len(concurrent_sorted):
+            raise RuntimeError(
+                f"{sample_name}: represent microbatch face count mismatch "
+                f"sequential={len(sequential_sorted)} concurrent={len(concurrent_sorted)}"
+            )
+
+        bbox_delta = 0.0
+        score_delta = 0.0
+        min_cosine = 1.0
+        for sequential_face, concurrent_face in zip(sequential_sorted, concurrent_sorted):
+            sequential_embedding = np.asarray(sequential_face.embedding, dtype=np.float32)
+            concurrent_embedding = np.asarray(concurrent_face.embedding, dtype=np.float32)
+            min_cosine = min(
+                min_cosine,
+                _cosine_similarity(sequential_embedding, concurrent_embedding),
+            )
+            sequential_bbox = np.array(
+                [
+                    sequential_face.facial_area.x,
+                    sequential_face.facial_area.y,
+                    sequential_face.facial_area.x + sequential_face.facial_area.w,
+                    sequential_face.facial_area.y + sequential_face.facial_area.h,
+                ],
+                dtype=np.float32,
+            )
+            concurrent_bbox = np.array(
+                [
+                    concurrent_face.facial_area.x,
+                    concurrent_face.facial_area.y,
+                    concurrent_face.facial_area.x + concurrent_face.facial_area.w,
+                    concurrent_face.facial_area.y + concurrent_face.facial_area.h,
+                ],
+                dtype=np.float32,
+            )
+            bbox_delta = max(
+                bbox_delta,
+                float(np.max(np.abs(sequential_bbox - concurrent_bbox))),
+            )
+            score_delta = max(
+                score_delta,
+                abs(float(sequential_face.face_confidence) - float(concurrent_face.face_confidence)),
+            )
+
+        if bbox_delta > 1e-4:
+            raise RuntimeError(
+                f"{sample_name}: represent microbatch bbox drift too large, max_abs_delta={bbox_delta:.6f}"
+            )
+        if score_delta > 1e-4:
+            raise RuntimeError(
+                f"{sample_name}: represent microbatch score drift too large, max_abs_delta={score_delta:.6f}"
+            )
+        if min_cosine < 0.999999:
+            raise RuntimeError(
+                f"{sample_name}: represent microbatch embedding drift too large, min_cosine={min_cosine:.8f}"
+            )
+
+        comparisons.append(
+            {
+                "image": sample_name,
+                "faces": int(len(sequential_sorted)),
+                "bbox_max_abs_delta": round(bbox_delta, 8),
+                "score_max_abs_delta": round(score_delta, 8),
+                "embedding_min_cosine": round(min_cosine, 8),
+            }
+        )
+    return comparisons
+
+
 def _compare_recognition_batch(
     models: AIModels,
     rec_model: Any,
@@ -330,8 +433,9 @@ def _verify_runtime_layout(face_app: Any) -> dict[str, str]:
 
 
 def main() -> int:
-    sample_paths = _resolve_sample_images()
-    sample_images = [_load_bgr(path) for path in sample_paths]
+    smoke_samples = _build_smoke_samples()
+    sample_names = [name for name, _ in smoke_samples]
+    sample_images = [image for _, image in smoke_samples]
     models = AIModels()
     try:
         models._ensure_face_loaded()
@@ -350,16 +454,17 @@ def main() -> int:
             expected_device_type=ARGS.device,
         )
         local_results = asyncio.run(_collect_local_results(models, sample_images))
+        concurrent_results = asyncio.run(_collect_local_results_concurrent(models, sample_images))
         native_results = [face_app.get(image.copy(), max_num=0) for image in sample_images]
 
         semantic_checks: List[dict[str, Any]] = []
         semantic_sample_count = 0
-        for path, local_result, native_result in zip(sample_paths, local_results, native_results):
+        for sample_name, local_result, native_result in zip(sample_names, local_results, native_results):
             if not native_result:
                 continue
             semantic_sample_count += 1
             semantic_checks.extend(
-                _compare_native_vs_local(path.name, local_result, native_result)
+                _compare_native_vs_local(sample_name, local_result, native_result)
             )
         if semantic_sample_count == 0:
             raise RuntimeError("No InsightFace sample image produced native faces during semantic smoke test.")
@@ -368,6 +473,11 @@ def main() -> int:
             models,
             det_model,
             sample_images,
+        )
+        represent_microbatch_checks = _compare_represent_microbatch(
+            sample_names,
+            local_results,
+            concurrent_results,
         )
         recognition_check = _compare_recognition_batch(
             models,
@@ -396,6 +506,7 @@ def main() -> int:
             "runtime_layout": runtime_layout,
             "semantic_checks": semantic_checks,
             "detection_checks": detection_checks,
+            "represent_microbatch_checks": represent_microbatch_checks,
             "recognition_check": recognition_check,
             "release_check": {
                 "rss_before_release_kb": rss_before_release_kb,

@@ -111,6 +111,7 @@
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 - 当 `antelopev2/glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时必须在受控 runtime root 中把识别输出 batch 维修正为动态后再初始化 ORT session；禁止通过退回逐张识别来规避 `VerifyOutputSizes` warning。
+- SCRFD detector 的动态 batch 扁平输出若来自 `Transpose(...)+Reshape(-1,C)` 头部，仓库内解包逻辑必须先恢复 `spatial x batch x anchors x channels`，再还原到 `batch x items x channels`；禁止把输出直接当成 `[batch * items, C]` 处理，否则会造成 `/represent` 微批中的框/关键点串位。
 - FaceAnalysis 仅用于模型发现、provider 管理与 session 生命周期；检测/对齐/识别链路必须在仓库内本地显式编排，严禁 monkey patch `insightface` 模块或模型实例方法。
 - `/represent` 必须提供应用层有界准入、有限并发 worker 与专用有界批队列；允许跨请求聚合识别批并平滑调度检测，但不得改变单请求响应语义、字段和错误处理规则。
 
@@ -341,6 +342,7 @@
 
 ### 13.2 最近稳定性修复（2026-03）
 
+- 修复 SCRFD detector batched 输出的解包错误：原始 detector 头会把 `batch` 与 `anchors` 一起压进扁平维，若按 `[batch * items, C]` 直接切分，会在 `/represent` 微批场景下造成框和关键点串位；当前实现已按 `spatial x batch x anchors x channels` 还原后再做 bbox/kps 解码，并由 `scripts/smoke_insightface.py` 覆盖 batch/single 与并发微批两类回归。
 
 
 ### 13.3 `/dev/dri` Intel iGPU 上线验收

@@ -487,21 +487,49 @@ class InsightFaceMixin(ABC):
         *,
         batch_size: int,
         items_per_image: int,
+        num_anchors: int,
         channels: int,
         label: str,
     ) -> np.ndarray:
         array = np.asarray(output)
         expected_flat = items_per_image * batch_size
+        if num_anchors <= 0:
+            raise RuntimeError(
+                f"InsightFace detector output invalid num_anchors={num_anchors} for {label}"
+            )
+        if items_per_image % num_anchors != 0:
+            raise RuntimeError(
+                "InsightFace detector output shape mismatch for "
+                f"{label}: items_per_image={items_per_image} is not divisible by "
+                f"num_anchors={num_anchors}"
+            )
+        spatial_positions = items_per_image // num_anchors
         if array.ndim == 3 and array.shape[0] == batch_size:
-            return array.reshape(batch_size, items_per_image, channels)
+            if array.shape[1] == items_per_image and array.shape[2] == channels:
+                return array.reshape(batch_size, items_per_image, channels)
+            if array.shape[1] == spatial_positions and array.shape[2] == num_anchors * channels:
+                return array.reshape(
+                    batch_size,
+                    spatial_positions,
+                    num_anchors,
+                    channels,
+                ).reshape(batch_size, items_per_image, channels)
         if array.ndim == 2 and array.shape[0] == expected_flat:
-            return array.reshape(items_per_image, batch_size, channels).transpose(1, 0, 2)
+            # SCRFD exports flatten detector heads as:
+            #   [H, W, batch, anchors * channels] -> reshape(-1, channels)
+            # Recover batch/items by restoring the anchor axis before transposing.
+            return array.reshape(
+                spatial_positions,
+                batch_size,
+                num_anchors,
+                channels,
+            ).transpose(1, 0, 2, 3).reshape(batch_size, items_per_image, channels)
         if array.ndim == 2 and batch_size == 1 and array.shape[0] == items_per_image:
             return array.reshape(1, items_per_image, channels)
         raise RuntimeError(
             "InsightFace detector output shape mismatch for "
             f"{label}: batch_size={batch_size} items_per_image={items_per_image} "
-            f"channels={channels} got_shape={tuple(array.shape)}"
+            f"num_anchors={num_anchors} channels={channels} got_shape={tuple(array.shape)}"
         )
 
     @staticmethod
@@ -577,6 +605,7 @@ class InsightFaceMixin(ABC):
                 net_outs[idx],
                 batch_size=batch_size,
                 items_per_image=item_count,
+                num_anchors=num_anchors,
                 channels=1,
                 label=f"score@{stride}",
             )
@@ -584,6 +613,7 @@ class InsightFaceMixin(ABC):
                 net_outs[idx + fmc],
                 batch_size=batch_size,
                 items_per_image=item_count,
+                num_anchors=num_anchors,
                 channels=4,
                 label=f"bbox@{stride}",
             )
@@ -598,6 +628,7 @@ class InsightFaceMixin(ABC):
                     net_outs[idx + fmc * 2],
                     batch_size=batch_size,
                     items_per_image=item_count,
+                    num_anchors=num_anchors,
                     channels=10,
                     label=f"kps@{stride}",
                 )
