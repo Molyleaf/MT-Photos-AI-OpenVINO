@@ -194,8 +194,13 @@ class ClipImageMixin(ABC):
         if not tasks:
             return
         try:
-            self._ensure_clip_vision_loaded()
-            payloads = [np.asarray(task.payload, dtype=np.float32) for task in tasks]
+            if (
+                self._clip_vision_model is None
+                or self._clip_vision_request is None
+                or self._clip_vision_ppp is None
+            ):
+                raise RuntimeError("CLIP vision model is not fully loaded.")
+            payloads = [task.payload for task in tasks]
             results = self._infer_clip_image_tensor_batch(payloads)
             for task, result in zip(tasks, results):
                 self._safe_set_result(task.future, result)
@@ -215,7 +220,11 @@ class ClipImageMixin(ABC):
 
     def _ensure_clip_vision_loaded(self) -> None:
         with self._clip_vision_load_lock:
-            if self._clip_vision_model is not None and self._clip_vision_request is not None:
+            if (
+                self._clip_vision_model is not None
+                and self._clip_vision_request is not None
+                and self._clip_vision_ppp is not None
+            ):
                 return
             self._load_family_with_process_lock("vision", self._load_clip_vision_locked)
 

@@ -506,7 +506,12 @@ class RapidOCRMixin(ABC):
 
     def _ensure_rapidocr_loaded(self) -> None:
         with self._rapidocr_load_lock:
-            if self._rapidocr_engine is not None:
+            if (
+                self._rapidocr_engine is not None
+                and self._rapidocr_engines is not None
+                and self._rapidocr_engine_pool is not None
+                and self._rapidocr_runtime_cfg is not None
+            ):
                 return
             self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
 

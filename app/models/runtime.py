@@ -48,6 +48,8 @@ class _NonTextFamilyStateModel:
 
     def __init__(self) -> None:
         self.state = "idle"
+        self.loading_family: Optional[NonTextFamily] = None
+        self.resident_family: Optional[NonTextFamily] = None
 
 
 class _NonTextFamilyStateMachine:
@@ -98,6 +100,30 @@ class _NonTextFamilyStateMachine:
             self._model.activate_ocr()
         else:
             self._model.activate_face()
+
+    def mark_loading(self, family: NonTextFamily) -> None:
+        with self._condition:
+            self._model.loading_family = family
+
+    def mark_loaded(self, family: NonTextFamily) -> None:
+        with self._condition:
+            self._model.loading_family = None
+            self._model.resident_family = family
+
+    def mark_load_failed(self, family: NonTextFamily) -> None:
+        with self._condition:
+            if self._model.loading_family == family:
+                self._model.loading_family = None
+
+    def mark_unloaded(self, unloaded_families: List[str]) -> None:
+        if not unloaded_families:
+            return
+        unloaded = set(unloaded_families)
+        with self._condition:
+            if self._model.loading_family in unloaded:
+                self._model.loading_family = None
+            if self._model.resident_family in unloaded:
+                self._model.resident_family = None
 
     def acquire(
         self,
@@ -181,6 +207,8 @@ class _NonTextFamilyStateMachine:
 
     def finish_release(self) -> None:
         with self._condition:
+            self._model.loading_family = None
+            self._model.resident_family = None
             self._model.release_to_idle()
             self._condition.notify_all()
 
@@ -207,15 +235,20 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._initialize_paths()
         self._initialize_openvino_runtime()
         self._initialize_model_load_locks()
-        self._initialize_text_clip_state()
-        self._initialize_clip_image_state()
-        self._initialize_non_text_model_state()
-        self._initialize_execution_controls()
-        self._initialize_non_text_family_state()
-        self._start_clip_image_worker()
-        self._ensure_text_service_ready(preload=True)
-        self._start_background_services()
-        self._log_ready()
+        self._acquire_single_process_lock()
+        try:
+            self._initialize_text_clip_state()
+            self._initialize_clip_image_state()
+            self._initialize_non_text_model_state()
+            self._initialize_execution_controls()
+            self._initialize_non_text_family_state()
+            self._start_clip_image_worker()
+            self._ensure_text_service_ready(preload=True)
+            self._start_background_services()
+            self._log_ready()
+        except Exception:
+            self._release_single_process_lock()
+            raise
 
     def _initialize_paths(self) -> None:
         self.model_base_path = Path(
@@ -258,10 +291,26 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._clip_vision_load_lock = threading.Lock()
         self._rapidocr_load_lock = threading.Lock()
         self._face_load_lock = threading.Lock()
+        self._single_process_lock = _InterProcessFileLock(
+            self._runtime_state_dir / "single-process.lock"
+        )
         self._family_load_locks = {
             family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
             for family in ("vision", "ocr", "face")
         }
+
+    def _acquire_single_process_lock(self) -> None:
+        acquired = self._single_process_lock.acquire(timeout=0.0, blocking=False)
+        if acquired:
+            return
+        raise RuntimeError(
+            "服务当前固定为单进程运行；检测到已有实例持有运行锁。"
+        )
+
+    def _release_single_process_lock(self) -> None:
+        lock = getattr(self, "_single_process_lock", None)
+        if lock is not None:
+            lock.release()
 
     def _initialize_text_clip_state(self) -> None:
         self._clip_text_model: Optional[ov.CompiledModel] = None
@@ -368,7 +417,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
 
         self._request_activity_lock = threading.Lock()
-        self._last_request_monotonic = time.monotonic()
+        self._last_non_text_request_monotonic = time.monotonic()
         self._idle_release_stop = threading.Event()
         self._idle_release_wakeup = threading.Event()
         self._idle_release_thread: Optional[threading.Thread] = None
@@ -475,19 +524,25 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
         self._idle_release_thread.start()
 
-    def mark_request_activity(self) -> None:
+    def mark_non_text_request_activity(self) -> None:
         with self._request_activity_lock:
-            self._last_request_monotonic = time.monotonic()
+            self._last_non_text_request_monotonic = time.monotonic()
         self._idle_release_wakeup.set()
 
-    def _snapshot_last_request_monotonic(self) -> float:
+    def mark_request_activity(self) -> None:
+        self.mark_non_text_request_activity()
+
+    def _snapshot_last_non_text_request_monotonic(self) -> float:
         with self._request_activity_lock:
-            return self._last_request_monotonic
+            return self._last_non_text_request_monotonic
 
     def _idle_release_loop(self) -> None:
         poll_seconds = min(5.0, max(0.5, self._idle_release_timeout_seconds / 6.0))
         while not self._idle_release_stop.is_set():
-            deadline = self._snapshot_last_request_monotonic() + self._idle_release_timeout_seconds
+            deadline = (
+                self._snapshot_last_non_text_request_monotonic()
+                + self._idle_release_timeout_seconds
+            )
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 self._idle_release_wakeup.wait(timeout=min(poll_seconds, remaining))
@@ -505,7 +560,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 LOG.warning("Idle non-text model release failed: %s", exc, exc_info=True)
             finally:
                 with self._request_activity_lock:
-                    self._last_request_monotonic = time.monotonic()
+                    self._last_non_text_request_monotonic = time.monotonic()
 
     def _join_idle_release_thread(self, timeout_seconds: Optional[float]) -> None:
         thread = self._idle_release_thread
@@ -791,6 +846,9 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             or self._clip_vision_request is not None
             or self._clip_vision_ppp is not None
             or self._rapidocr_engine is not None
+            or self._rapidocr_engines is not None
+            or self._rapidocr_engine_pool is not None
+            or self._rapidocr_runtime_cfg is not None
             or self._face_engine is not None
             or self._face_det_ppp is not None
             or self._face_rec_ppp is not None
@@ -838,7 +896,12 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         ):
             self._unload_clip_vision_model_locked()
             unloaded.append("vision")
-        if keep_family != "ocr" and self._rapidocr_engine is not None:
+        if keep_family != "ocr" and (
+            self._rapidocr_engine is not None
+            or self._rapidocr_engines is not None
+            or self._rapidocr_engine_pool is not None
+            or self._rapidocr_runtime_cfg is not None
+        ):
             self._unload_rapidocr_model_locked()
             unloaded.append("ocr")
         if keep_family != "face" and (
@@ -856,6 +919,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     ) -> List[str]:
         with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
             unloaded = self._unload_non_text_models_locked(keep_family=keep_family)
+            self._non_text_state.mark_unloaded(unloaded)
         if unloaded:
             gc.collect()
         return unloaded
@@ -892,8 +956,10 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     ) -> None:
         lock = self._family_load_locks[family]
         started_at = time.monotonic()
+        self._non_text_state.mark_loading(family)
         acquired = lock.acquire(timeout=self._load_lock_timeout_seconds, blocking=True)
         if not acquired:
+            self._non_text_state.mark_load_failed(family)
             raise RuntimeError(
                 f"{family} 模型加载等待跨进程锁超时（>{self._load_lock_timeout_seconds:.0f}s）"
             )
@@ -907,6 +973,10 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                     self._pid,
                 )
             loader()
+            self._non_text_state.mark_loaded(family)
+        except Exception:
+            self._non_text_state.mark_load_failed(family)
+            raise
         finally:
             lock.release()
 
@@ -1055,54 +1125,57 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._release_non_text_models_sync(reason="restart")
 
     def release_all_models(self) -> None:
-        self._idle_release_stop.set()
-        self._idle_release_wakeup.set()
-        self._join_idle_release_thread(
-            timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
-        )
-        self._background_prewarm_cancel.set()
-        self._release_non_text_models_sync(
-            reason="shutdown",
-            cancel_background_prewarm=False,
-            join_background_prewarm=True,
-        )
-
-        if self._stopping:
-            return
-        self._stopping = True
-        pending_tasks: List[_ClipImageTask] = []
-        clip_queue_loop = self._clip_image_dispatch_loop
-        if clip_queue_loop is not None:
-            shutdown_future = asyncio.run_coroutine_threadsafe(
-                self._shutdown_clip_image_queue_async(),
-                clip_queue_loop,
+        try:
+            self._idle_release_stop.set()
+            self._idle_release_wakeup.set()
+            self._join_idle_release_thread(
+                timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
             )
-            try:
-                pending_tasks = shutdown_future.result(
-                    timeout=max(2.0, float(self._execution_timeout_seconds))
+            self._background_prewarm_cancel.set()
+            self._release_non_text_models_sync(
+                reason="shutdown",
+                cancel_background_prewarm=False,
+                join_background_prewarm=True,
+            )
+
+            if self._stopping:
+                return
+            self._stopping = True
+            pending_tasks: List[_ClipImageTask] = []
+            clip_queue_loop = self._clip_image_dispatch_loop
+            if clip_queue_loop is not None:
+                shutdown_future = asyncio.run_coroutine_threadsafe(
+                    self._shutdown_clip_image_queue_async(),
+                    clip_queue_loop,
                 )
-            except Exception as exc:
-                LOG.warning("Failed to drain CLIP image queue during shutdown: %s", exc)
-            clip_queue_loop.call_soon_threadsafe(clip_queue_loop.stop)
+                try:
+                    pending_tasks = shutdown_future.result(
+                        timeout=max(2.0, float(self._execution_timeout_seconds))
+                    )
+                except Exception as exc:
+                    LOG.warning("Failed to drain CLIP image queue during shutdown: %s", exc)
+                clip_queue_loop.call_soon_threadsafe(clip_queue_loop.stop)
 
-        for task in pending_tasks:
-            self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
+            for task in pending_tasks:
+                self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
 
-        if self._clip_image_worker is not None:
-            self._clip_image_worker.join()
-        self._join_background_prewarm_thread(
-            timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
-        )
+            if self._clip_image_worker is not None:
+                self._clip_image_worker.join()
+            self._join_background_prewarm_thread(
+                timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
+            )
 
-        for executor in (
-            self._control_executor,
-            self._shared_cpu_executor,
-            self._ocr_executor,
-            self._face_executor,
-        ):
-            executor.shutdown(wait=True, cancel_futures=True)
+            for executor in (
+                self._control_executor,
+                self._shared_cpu_executor,
+                self._ocr_executor,
+                self._face_executor,
+            ):
+                executor.shutdown(wait=True, cancel_futures=True)
 
-        self._shutdown_text_service()
-        with self._model_lock:
-            self._unload_everything_locked()
-        LOG.info("All models released.")
+            self._shutdown_text_service()
+            with self._model_lock:
+                self._unload_everything_locked()
+            LOG.info("All models released.")
+        finally:
+            self._release_single_process_lock()

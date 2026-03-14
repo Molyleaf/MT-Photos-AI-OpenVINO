@@ -324,6 +324,33 @@ class InsightFaceMixin(ABC):
         if getattr(det_model, "input_size", None) is None:
             det_model.input_size = tuple(int(value) for value in det_size)
 
+    @classmethod
+    def _prepare_insightface_detector(
+        cls,
+        face_app: FaceAnalysis,
+        *,
+        det_size: Tuple[int, int],
+        det_thresh: float,
+    ) -> None:
+        det_model = getattr(face_app, "det_model", None)
+        if det_model is None:
+            raise RuntimeError("InsightFace detection model is missing.")
+
+        prepare = getattr(det_model, "prepare", None)
+        if callable(prepare):
+            prepare(
+                0,
+                input_size=tuple(int(value) for value in det_size),
+                det_thresh=float(det_thresh),
+            )
+        face_app.det_thresh = float(det_thresh)
+        face_app.det_size = tuple(int(value) for value in det_size)
+        cls._normalize_insightface_detector_state(
+            det_model,
+            det_size=det_size,
+            det_thresh=float(det_thresh),
+        )
+
     def _run_insightface_detector_forward(self, det_model: Any, img: np.ndarray) -> Any:
         preprocess_runner = self._face_det_ppp
         if preprocess_runner is None:
@@ -628,6 +655,21 @@ class InsightFaceMixin(ABC):
                 "InsightFace batched recognition metadata patch requires the 'onnx' package."
             )
 
+        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            try:
+                existing_model = onnx.load(str(dst))
+                existing_dims = existing_model.graph.output[0].type.tensor_type.shape.dim
+                existing_first_dim = existing_dims[0] if existing_dims else None
+                existing_has_static_dim = bool(
+                    getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
+                )
+                if existing_first_dim is not None and (
+                    not existing_has_static_dim or int(existing_first_dim.dim_value) != 1
+                ):
+                    return
+            except Exception:
+                pass
+
         model = onnx.load(str(src))
         if not model.graph.output:
             raise RuntimeError(f"InsightFace recognition model has no outputs: {src}")
@@ -643,21 +685,6 @@ class InsightFaceMixin(ABC):
         if not has_static_dim or int(first_dim.dim_value) != 1:
             cls._ensure_runtime_model_link(src, dst)
             return
-
-        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
-            try:
-                existing_model = onnx.load(str(dst))
-                existing_dims = existing_model.graph.output[0].type.tensor_type.shape.dim
-                existing_first_dim = existing_dims[0] if existing_dims else None
-                existing_has_static_dim = bool(
-                    getattr(existing_first_dim, "HasField", lambda *_: False)("dim_value")
-                )
-                if existing_first_dim is not None and (
-                    not existing_has_static_dim or int(existing_first_dim.dim_value) != 1
-                ):
-                    return
-            except Exception:
-                pass
 
         first_dim.ClearField("dim_value")
         first_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
@@ -750,12 +777,35 @@ class InsightFaceMixin(ABC):
         )
 
     @staticmethod
-    def _build_insightface_init_attempts(
-        source_root: Path,
+    def _strip_insightface_unsupported_init_kwargs(
+        kwargs: Dict[str, Any],
+        exc: Exception,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        message = str(exc)
+        stripped_kwargs = dict(kwargs)
+        stripped_keys: List[str] = []
+        for key in ("provider_options", "providers", "allowed_modules"):
+            if key in stripped_kwargs and key in message:
+                stripped_kwargs.pop(key, None)
+                stripped_keys.append(key)
+        if stripped_keys:
+            return stripped_kwargs, stripped_keys
+
+        if any(keyword in message for keyword in ("providers", "provider_options", "allowed_modules")):
+            for key in ("provider_options", "providers", "allowed_modules"):
+                if key in stripped_kwargs:
+                    stripped_kwargs.pop(key, None)
+                    stripped_keys.append(key)
+        return stripped_kwargs, stripped_keys
+
+    @staticmethod
+    def _build_insightface_init_attempt(
         runtime_root: Path,
         provider_names: List[str],
         provider_options: Dict[str, str],
-    ) -> List[_InsightFaceInitAttempt]:
+        *,
+        attempt_name: str,
+    ) -> _InsightFaceInitAttempt:
         init_signature = inspect.signature(FaceAnalysis.__init__)
         init_parameters = init_signature.parameters
         supports_var_kwargs = any(
@@ -766,99 +816,55 @@ class InsightFaceMixin(ABC):
         supports_provider_kwargs = "providers" in init_parameters or supports_var_kwargs
         supports_provider_options = "provider_options" in init_parameters or supports_var_kwargs
 
-        def _build_kwargs(
-            root: Path,
-            *,
-            include_provider_kwargs: bool,
-            include_allowed_modules: bool,
-        ) -> Dict[str, Any]:
-            kwargs: Dict[str, Any] = {
-                "name": MODEL_NAME,
-                "root": str(root),
-            }
-            if include_allowed_modules:
-                kwargs["allowed_modules"] = ["detection", "recognition"]
-            if include_provider_kwargs:
-                kwargs["providers"] = list(provider_names)
-                if supports_provider_options:
-                    kwargs["provider_options"] = [dict(provider_options)]
-            return kwargs
-
-        return [
-            _InsightFaceInitAttempt(
-                "runtime-with-provider-kwargs",
-                runtime_root,
-                _build_kwargs(
-                    runtime_root,
-                    include_provider_kwargs=supports_provider_kwargs,
-                    include_allowed_modules=supports_allowed_modules,
-                ),
-            ),
-            _InsightFaceInitAttempt(
-                "runtime-without-provider-kwargs",
-                runtime_root,
-                _build_kwargs(
-                    runtime_root,
-                    include_provider_kwargs=False,
-                    include_allowed_modules=supports_allowed_modules,
-                ),
-            ),
-            _InsightFaceInitAttempt(
-                "source-with-provider-kwargs",
-                source_root,
-                _build_kwargs(
-                    source_root,
-                    include_provider_kwargs=supports_provider_kwargs,
-                    include_allowed_modules=supports_allowed_modules,
-                ),
-            ),
-            _InsightFaceInitAttempt(
-                "source-without-provider-kwargs",
-                source_root,
-                _build_kwargs(
-                    source_root,
-                    include_provider_kwargs=False,
-                    include_allowed_modules=supports_allowed_modules,
-                ),
-            ),
-            _InsightFaceInitAttempt(
-                "legacy-with-provider-kwargs",
-                runtime_root,
-                _build_kwargs(
-                    runtime_root,
-                    include_provider_kwargs=supports_provider_kwargs,
-                    include_allowed_modules=supports_allowed_modules,
-                ),
-            ),
-            _InsightFaceInitAttempt(
-                "legacy-minimal-kwargs",
-                runtime_root,
-                _build_kwargs(
-                    runtime_root,
-                    include_provider_kwargs=False,
-                    include_allowed_modules=False,
-                ),
-            ),
-        ]
+        kwargs: Dict[str, Any] = {
+            "name": MODEL_NAME,
+            "root": str(runtime_root),
+        }
+        if supports_allowed_modules:
+            kwargs["allowed_modules"] = ["detection", "recognition"]
+        if supports_provider_kwargs:
+            kwargs["providers"] = list(provider_names)
+            if supports_provider_options:
+                kwargs["provider_options"] = [dict(provider_options)]
+        return _InsightFaceInitAttempt(attempt_name, runtime_root, kwargs)
 
     def _instantiate_insightface_face_analysis(
         self,
         provider_names: List[str],
         provider_options: Dict[str, str],
     ) -> Tuple[FaceAnalysis, Path]:
-        source_root = self._resolve_insightface_root()
-        runtime_root = self._prepare_insightface_runtime_root(source_root)
-        attempts = self._build_insightface_init_attempts(
-            source_root,
-            runtime_root,
-            provider_names,
-            provider_options,
+        source_model_root = self._resolve_insightface_root()
+        source_init_root = (
+            source_model_root.parent
+            if source_model_root.name.lower() == "models"
+            else source_model_root
         )
+        runtime_root = self._prepare_insightface_runtime_root(source_model_root)
+        pending_attempts: List[_InsightFaceInitAttempt] = [
+            self._build_insightface_init_attempt(
+                runtime_root,
+                provider_names,
+                provider_options,
+                attempt_name="runtime-preferred",
+            )
+        ]
+        source_fallback_added = False
+        if source_init_root != runtime_root:
+            source_fallback_added = True
+            pending_attempts.append(
+                self._build_insightface_init_attempt(
+                    source_init_root,
+                    provider_names,
+                    provider_options,
+                    attempt_name="source-preferred",
+                )
+            )
 
         seen_attempts: set[Tuple[str, str]] = set()
         attempt_errors: List[str] = []
         last_exc: Optional[Exception] = None
-        for attempt in attempts:
+        while pending_attempts:
+            attempt = pending_attempts.pop(0)
             attempt_key = (
                 str(attempt.runtime_root),
                 json.dumps(attempt.kwargs, sort_keys=True, ensure_ascii=True),
@@ -871,10 +877,7 @@ class InsightFaceMixin(ABC):
                 self._normalize_insightface_recognition_state(
                     getattr(face_app, "models", {}).get("recognition")
                 )
-                if attempt.name not in {
-                    "runtime-with-provider-kwargs",
-                    "source-with-provider-kwargs",
-                }:
+                if attempt.name != "runtime-preferred":
                     LOG.warning(
                         "InsightFace initialized via compatibility path %s (runtime_root=%s)",
                         attempt.name,
@@ -885,17 +888,43 @@ class InsightFaceMixin(ABC):
                 last_exc = exc
                 attempt_errors.append(f"{attempt.name}: {exc}")
                 if self._is_insightface_init_kwargs_error(exc):
-                    LOG.warning(
-                        "InsightFace init retry after unsupported kwargs on %s: %s",
-                        attempt.name,
+                    stripped_kwargs, stripped_keys = self._strip_insightface_unsupported_init_kwargs(
+                        attempt.kwargs,
                         exc,
                     )
-                else:
-                    LOG.warning(
-                        "InsightFace init attempt %s failed (runtime_root=%s): %s",
-                        attempt.name,
-                        attempt.runtime_root,
-                        exc,
+                    if stripped_keys and stripped_kwargs != attempt.kwargs:
+                        LOG.warning(
+                            "InsightFace init retry after unsupported kwargs on %s: removed=%s error=%s",
+                            attempt.name,
+                            ",".join(stripped_keys),
+                            exc,
+                        )
+                        pending_attempts.insert(
+                            0,
+                            _InsightFaceInitAttempt(
+                                f"{attempt.name}-compat",
+                                attempt.runtime_root,
+                                stripped_kwargs,
+                            ),
+                        )
+                        continue
+
+                LOG.warning(
+                    "InsightFace init attempt %s failed (runtime_root=%s): %s",
+                    attempt.name,
+                    attempt.runtime_root,
+                    exc,
+                )
+                if not source_fallback_added and attempt.runtime_root != source_init_root:
+                    source_fallback_added = True
+                    fallback_kwargs = dict(attempt.kwargs)
+                    fallback_kwargs["root"] = str(source_init_root)
+                    pending_attempts.append(
+                        _InsightFaceInitAttempt(
+                            "source-fallback",
+                            source_init_root,
+                            fallback_kwargs,
+                        )
                     )
 
         summary = "; ".join(attempt_errors) or "no attempts executed"
@@ -914,14 +943,12 @@ class InsightFaceMixin(ABC):
             provider_names,
             provider_options,
         )
-        self._enforce_insightface_openvino_provider(face_app, provider_options)
-        face_app.prepare(ctx_id=0, det_thresh=0.5, det_size=(640, 640))
-        self._enforce_insightface_openvino_provider(face_app, provider_options)
-        self._normalize_insightface_detector_state(
-            getattr(face_app, "det_model"),
+        self._prepare_insightface_detector(
+            face_app,
             det_size=(640, 640),
-            det_thresh=float(getattr(face_app, "det_thresh", 0.5) or 0.5),
+            det_thresh=0.5,
         )
+        self._enforce_insightface_openvino_provider(face_app, provider_options)
         rec_session_shapes = self._normalize_insightface_recognition_state(
             getattr(face_app, "models", {}).get("recognition")
         )
@@ -1003,7 +1030,11 @@ class InsightFaceMixin(ABC):
 
     def _ensure_face_loaded(self) -> None:
         with self._face_load_lock:
-            if self._face_engine is not None:
+            if (
+                self._face_engine is not None
+                and self._face_det_ppp is not None
+                and self._face_rec_ppp is not None
+            ):
                 return
             self._load_family_with_process_lock("face", self._load_face_locked)
 

@@ -45,7 +45,6 @@ services:
       INSIGHTFACE_OV_DEVICE: "AUTO"
       OPENCV_OPENCL_DEVICE: "Intel:GPU:0"
       PORT: "8060"
-      WEB_CONCURRENCY: "1"
       LOG_LEVEL: "WARNING"
     devices:
       # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。

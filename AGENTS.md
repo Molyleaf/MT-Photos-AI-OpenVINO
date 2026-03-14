@@ -132,6 +132,7 @@
   - 关闭时释放全部模型
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
+- 服务必须固定为**单进程**；禁止继续暴露 `WEB_CONCURRENCY` 一类 worker 配置项，也禁止让第二个服务进程在同一工作目录下成功启动。
 - Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
@@ -203,9 +204,10 @@
 7. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 5 条把 OCR 与其他非文本模型族并行常驻。
 8. InsightFace 使用独立执行路径；但其准入必须遵守第 5 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
 9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
-10. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
-11. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
-12. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
+10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
+11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+12. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
+13. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
 ---
 
@@ -213,6 +215,7 @@
 
 - 推荐结构：**单进程 FastAPI 异步服务 + 有界批队列/阶段执行器**。
 - 禁止在单进程无限堆线程“硬顶并行度”。
+- 必须在运行时对单进程做硬约束；同一工作目录下的第二个服务进程必须因运行锁直接失败，而不是并行持有另一份非文本模型。
 - 非文本模型族准入必须显式串行化，确保“单活模型族 + 常驻 Text-CLIP”的内存上界可控。
 - 必须控制总并行度：
   - `总并行度 = 各阶段执行器线程数之和`
@@ -364,7 +367,6 @@ services:
       - OCR_EXEC_TIMEOUT=30
       - NON_TEXT_IDLE_RELEASE_SECONDS=60
       - PORT=8060
-      - WEB_CONCURRENCY=1
       - LOG_LEVEL=WARNING
 ```
 
@@ -374,7 +376,6 @@ services:
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
 - `PORT` 当前会同时影响 Docker 入口命令与容器健康检查；若修改它，`docker-compose` 里的 `ports:` 映射也必须同步修改。
-- `WEB_CONCURRENCY` 当前只由 Docker 入口命令读取；手动执行 `uvicorn server:app` 时需改用 `--workers`。
 - `VIDEO_GID/RENDER_GID` 必须与宿主机 `video/render` 组一致。
 
 #### B. 启动与设备可见性判定

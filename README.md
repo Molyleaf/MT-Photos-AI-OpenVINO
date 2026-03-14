@@ -61,7 +61,6 @@
 | `INSIGHTFACE_MAX_CONCURRENT_REQUESTS` | `/represent` 应用层最大并发请求数；用于限制 executor 积压，且不会超过共享图片总名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, INSIGHTFACE_MAX_WORKERS*2))` |
 | `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`；该变量由 OpenCV 运行时直接读取 | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口；对 Docker 镜像入口、容器健康检查和 `python server.py` 生效 | `8060`                             |
-| `WEB_CONCURRENCY`                   | 仅 Docker 镜像入口读取的 worker 数                               | `1`                                |
 | `LOG_LEVEL`                         | 日志级别：作用于 `mt_photos_ai.*`、`uvicorn.*` 和 RapidOCR logger | `WARNING`                          |
 
 补充说明：
@@ -71,13 +70,14 @@
 - 服务会在 `uvicorn server:app` 和 `python server.py` 两种启动路径下都把 `mt_photos_ai.*` 日志输出到控制台；Windows 直接运行时还会追加写入 `<repo>/server.log`。
 - 如需看到启动自检、模型族切换和 `/restart` 释放日志，请显式设置 `LOG_LEVEL=INFO`。
 - `PORT` 当前对 Docker 镜像入口、容器健康检查和 `python server.py` 生效；如果手动执行 `uvicorn server:app`，请显式传 `--port`。
-- `WEB_CONCURRENCY` 仅被 Docker 镜像入口读取；手动执行 `uvicorn server:app` 时请显式传 `--workers`。
+- 服务固定为单进程；容器入口和 `python server.py` 都会以单 worker 运行，若同一工作目录下已有实例持有运行锁，新的进程会直接启动失败。
 - `CLIP_IMAGE_BATCH_SIZE` 仍作为兼容别名被读取；仅在未设置 `CLIP_IMAGE_BATCH` 时才会生效。
 - `RAPIDOCR_DET_DEVICE` / `RAPIDOCR_CLS_DEVICE` / `RAPIDOCR_REC_DEVICE` 当前只用于兼容告警，不参与实际 stage 选路。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
 - Text-CLIP 常驻在单线程后台服务中，始终复用单个模型实例。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
+- 非文本空闲释放计时现在只由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2` 和 `/clip/txt` 不会再阻止 Vision-CLIP / OCR / InsightFace 自动释放。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再通过专用 `asyncio.Queue` 做受控微批，并以 `np.stack` 一次送入动态 batch 视觉模型。
 - 为避免 MT-Photos 客户端在积压时主动取消，服务会对 `/clip/img`、`/ocr`、`/represent` 共享一个图片请求名额池；默认值和运行时硬上限都是 `10`，第 `11` 张会立即失败而不是继续挂起等待。
 - RapidOCR 现已回到库内原生 `RapidOCR.__call__` CPU 执行链：服务只负责懒加载、应用层准入和超时控制，不再替换 session、也不再维护自定义 stage 级预处理/批调度。
@@ -185,7 +185,7 @@ cp docker-compose.example.yml docker-compose.yml
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
-- 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；如需修改 worker 数，请调整 `WEB_CONCURRENCY`
+- 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；服务固定单进程，不再提供 worker 数配置项
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整 `MODEL_PATH`、`RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`、`OV_CACHE_DIR`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 
@@ -225,7 +225,6 @@ docker run -d \
   -e OCR_EXEC_TIMEOUT=30 \
   -e NON_TEXT_IDLE_RELEASE_SECONDS=60 \
   -e PORT=8060 \
-  -e WEB_CONCURRENCY=1 \
   -e LOG_LEVEL=WARNING \
   mt-photos-ai-openvino
 ```
