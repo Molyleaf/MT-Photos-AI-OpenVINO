@@ -6,10 +6,15 @@ import threading
 import time
 from abc import abstractmethod, ABC
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+)
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -32,7 +37,7 @@ from .common import (
     _to_opencv_umat,
     _to_channel_triplet,
 )
-from .constants import INFERENCE_DEVICE, LOG, MODEL_NAME
+from .constants import INFERENCE_DEVICE, INSIGHTFACE_SINGLE_LANE, LOG, MODEL_NAME
 from .schemas import FacialArea, RepresentResult
 
 _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
@@ -169,7 +174,7 @@ class InsightFaceMixin(ABC):
     _face_rec_ppp: Optional[_OpenVinoPreprocessRunner]
     _face_load_lock: Any
     _face_admission: _AdmissionController
-    _face_worker_count: int
+    _face_preprocess_worker_count: int
     _face_batch_size: int
     _face_batch_wait_seconds: float
     _face_queue_capacity: int
@@ -177,6 +182,7 @@ class InsightFaceMixin(ABC):
     _face_task_queue: Optional[asyncio.Queue[Optional[_FaceInferenceTask]]]
     _face_loop_ready: Any
     _face_worker: Optional[threading.Thread]
+    _face_preprocess_executor: ThreadPoolExecutor
     _face_preprocess_device: Optional[str]
     _face_use_opencl: bool
     _execution_timeout_seconds: int
@@ -1416,7 +1422,7 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
@@ -1425,8 +1431,8 @@ class InsightFaceMixin(ABC):
                 runtime.ppp_execution_devices,
                 runtime.det_session_shapes,
                 runtime.rec_session_shapes,
-                1,
-                self._face_worker_count,
+                INSIGHTFACE_SINGLE_LANE,
+                self._face_preprocess_worker_count,
                 self._face_batch_size,
                 int(self._face_batch_wait_seconds * 1000.0),
                 self._face_admission.capacity,
@@ -1459,6 +1465,85 @@ class InsightFaceMixin(ABC):
         task.payload = None
         if not task.future.done():
             task.future.set_exception(exc)
+
+    def _run_face_preprocess_stage(
+        self,
+        jobs: List[Callable[[], Any]],
+    ) -> List[Any]:
+        if not jobs:
+            return []
+        if self._face_preprocess_worker_count <= 1 or len(jobs) <= 1:
+            return [job() for job in jobs]
+
+        futures = {
+            self._face_preprocess_executor.submit(job): index
+            for index, job in enumerate(jobs)
+        }
+        results: List[Any] = [None] * len(jobs)
+        try:
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
+        return results
+
+    def _build_pending_face_recognition(
+        self,
+        *,
+        task_index: int,
+        detections: np.ndarray,
+        kpss: np.ndarray,
+        source_frame: Any,
+        rec_image_size: int,
+        cancel_event: threading.Event,
+    ) -> _PendingInsightFaceRecognition:
+        face_meta: List[Tuple[np.ndarray, float]] = []
+        aligned_faces: List[np.ndarray] = []
+        for face_index in range(detections.shape[0]):
+            self._raise_if_cancelled(cancel_event)
+            bbox = np.asarray(detections[face_index, 0:4], dtype=np.float32)
+            det_score = float(detections[face_index, 4])
+            aligned_faces.append(
+                self._align_face(
+                    source_frame,
+                    np.asarray(kpss[face_index]),
+                    rec_image_size,
+                )
+            )
+            face_meta.append((bbox, det_score))
+        return _PendingInsightFaceRecognition(
+            task_index=task_index,
+            face_meta=face_meta,
+            aligned_faces=aligned_faces,
+        )
+
+    def _build_pending_face_recognition_result(
+        self,
+        *,
+        task_index: int,
+        detections: np.ndarray,
+        kpss: np.ndarray,
+        source_frame: Any,
+        rec_image_size: int,
+        cancel_event: threading.Event,
+    ) -> Tuple[int, Optional[_PendingInsightFaceRecognition], Optional[Exception]]:
+        try:
+            return (
+                task_index,
+                self._build_pending_face_recognition(
+                    task_index=task_index,
+                    detections=detections,
+                    kpss=kpss,
+                    source_frame=source_frame,
+                    rec_image_size=rec_image_size,
+                    cancel_event=cancel_event,
+                ),
+                None,
+            )
+        except _InferenceCancelled as exc:
+            return task_index, None, exc
 
     def _submit_face_task(self, image: np.ndarray) -> _FaceInferenceTask:
         future: Future[List[RepresentResult]] = Future()
@@ -1709,16 +1794,24 @@ class InsightFaceMixin(ABC):
         outcomes: List[Tuple[Optional[List[RepresentResult]], Optional[Exception]]] = [
             (None, None) for _ in tasks
         ]
-        prepared_images: List[_PreparedInsightFaceImage] = []
         prepared_task_indices: List[int] = []
+        prepare_jobs: List[Callable[[], _PreparedInsightFaceImage]] = []
         for task_index, task in enumerate(tasks):
             if task.cancel_requested.is_set():
                 outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
                 continue
-            prepared_images.append(
-                self._prepare_insightface_detection_input(task.payload, det_model)
-            )
             prepared_task_indices.append(task_index)
+            prepare_jobs.append(
+                lambda payload=task.payload: self._prepare_insightface_detection_input(
+                    payload,
+                    det_model,
+                )
+            )
+
+        prepared_images = cast(
+            List[_PreparedInsightFaceImage],
+            self._run_face_preprocess_stage(prepare_jobs),
+        )
 
         if not prepared_images:
             return outcomes
@@ -1730,7 +1823,10 @@ class InsightFaceMixin(ABC):
             metric="default",
         )
         rec_image_size = int(rec_model.input_size[0])
-        recognition_items: List[_PendingInsightFaceRecognition] = []
+        recognition_job_task_indices: List[int] = []
+        recognition_jobs: List[
+            Callable[[], Tuple[int, Optional[_PendingInsightFaceRecognition], Optional[Exception]]]
+        ] = []
         for prepared_index, (detections, kpss) in enumerate(detections_batch):
             task_index = prepared_task_indices[prepared_index]
             task = tasks[task_index]
@@ -1750,35 +1846,39 @@ class InsightFaceMixin(ABC):
                 )
                 continue
 
-            aligned_faces: List[np.ndarray] = []
-            face_meta: List[Tuple[np.ndarray, float]] = []
-            for face_index in range(detections.shape[0]):
-                if task.cancel_requested.is_set():
-                    outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
-                    break
-                bbox = np.asarray(detections[face_index, 0:4], dtype=np.float32)
-                det_score = float(detections[face_index, 4])
-                aligned_faces.append(
-                    self._align_face(
-                        prepared_images[prepared_index].source_frame,
-                        np.asarray(kpss[face_index]),
-                        rec_image_size,
-                    )
-                )
-                face_meta.append((bbox, det_score))
-            if outcomes[task_index][1] is not None:
-                continue
-            recognition_items.append(
-                _PendingInsightFaceRecognition(
+            recognition_job_task_indices.append(task_index)
+            recognition_jobs.append(
+                lambda task_index=task_index,
+                detections=np.asarray(detections, dtype=np.float32),
+                kpss=np.asarray(kpss, dtype=np.float32),
+                source_frame=prepared_images[prepared_index].source_frame,
+                cancel_event=task.cancel_requested: self._build_pending_face_recognition_result(
                     task_index=task_index,
-                    face_meta=face_meta,
-                    aligned_faces=aligned_faces,
+                    detections=detections,
+                    kpss=kpss,
+                    source_frame=source_frame,
+                    rec_image_size=rec_image_size,
+                    cancel_event=cancel_event,
                 )
             )
 
+        recognition_items_by_task: Dict[int, _PendingInsightFaceRecognition] = {}
+        for task_index, item, exc in cast(
+            List[Tuple[int, Optional[_PendingInsightFaceRecognition], Optional[Exception]]],
+            self._run_face_preprocess_stage(recognition_jobs),
+        ):
+            if exc is not None:
+                outcomes[task_index] = (None, exc)
+                continue
+            if item is not None:
+                recognition_items_by_task[task_index] = item
+
         all_aligned_faces: List[np.ndarray] = []
         recognition_spans: List[Tuple[int, List[Tuple[np.ndarray, float]], int, int]] = []
-        for item in recognition_items:
+        for task_index in recognition_job_task_indices:
+            item = recognition_items_by_task.get(task_index)
+            if item is None:
+                continue
             task = tasks[item.task_index]
             if task.cancel_requested.is_set():
                 outcomes[item.task_index] = (None, _InferenceCancelled("Face task cancelled"))

@@ -105,16 +105,22 @@ def _resolve_sample_images() -> List[Path]:
 
 def _build_smoke_samples() -> List[tuple[str, np.ndarray]]:
     sample_paths = _resolve_sample_images()
-    samples = [(path.name, _load_bgr(path)) for path in sample_paths]
-    primary_name, primary_image = samples[0]
-    primary_path = Path(primary_name)
-    samples.append(
-        (
-            f"{primary_path.stem}_flip{primary_path.suffix}",
-            np.ascontiguousarray(cv2.flip(primary_image, 1)),
+    base_samples = [(path.name, _load_bgr(path)) for path in sample_paths]
+    samples = list(base_samples)
+    augment_index = 0
+    while len(samples) < 4:
+        source_name, source_image = base_samples[augment_index % len(base_samples)]
+        source_path = Path(source_name)
+        flip_code = 1 if augment_index % 2 == 0 else 0
+        suffix = "hflip" if flip_code == 1 else "vflip"
+        samples.append(
+            (
+                f"{source_path.stem}_{suffix}{source_path.suffix}",
+                np.ascontiguousarray(cv2.flip(source_image, flip_code)),
+            )
         )
-    )
-    return samples
+        augment_index += 1
+    return samples[:4]
 
 
 async def _collect_local_results_concurrent(models: AIModels, images: Sequence[np.ndarray]) -> List[Any]:
@@ -508,6 +514,12 @@ def main() -> int:
             "provider_runtime": provider_runtime,
             "preprocess_device": models._face_preprocess_device,
             "preprocess_use_opencl": bool(models._face_use_opencl),
+            "face_runtime": {
+                "lane": 1,
+                "preprocess_workers": models._face_preprocess_worker_count,
+                "batch_size": models._face_batch_size,
+                "admission": models._face_admission.capacity,
+            },
             "runtime_layout": runtime_layout,
             "semantic_checks": semantic_checks,
             "detection_checks": detection_checks,

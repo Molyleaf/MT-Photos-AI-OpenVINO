@@ -33,6 +33,9 @@ from .constants import (
     APP_DIR,
     CLIP_INFERENCE_DEVICE,
     EXEC_TIMEOUT_SECONDS,
+    INSIGHTFACE_PREPROCESS_WORKERS,
+    INSIGHTFACE_REQUEST_CAPACITY,
+    INSIGHTFACE_SINGLE_LANE,
     LOG,
     MAX_PENDING_IMAGE_REQUESTS,
     PROJECT_ROOT,
@@ -343,25 +346,24 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             1,
             _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2),
         )
-        self._face_worker_count = self._resolve_face_worker_count()
+        self._face_preprocess_worker_count = max(
+            1,
+            min(
+                self._queue_capacity,
+                INSIGHTFACE_REQUEST_CAPACITY,
+                INSIGHTFACE_PREPROCESS_WORKERS,
+                os.cpu_count() or INSIGHTFACE_PREPROCESS_WORKERS,
+            ),
+        )
         self._ocr_admission = _AdmissionController(
             "ocr",
             self._resolve_ocr_request_capacity(self._ocr_worker_count),
         )
         self._face_admission = _AdmissionController(
             "face",
-            self._resolve_face_request_capacity(self._face_worker_count),
+            max(1, min(self._queue_capacity, INSIGHTFACE_REQUEST_CAPACITY)),
         )
-        self._face_batch_size = max(
-            1,
-            min(
-                self._face_admission.capacity,
-                _as_int(
-                    os.environ.get("INSIGHTFACE_BATCH_SIZE"),
-                    max(2, min(self._face_admission.capacity, self._face_worker_count * 2)),
-                ),
-            ),
-        )
+        self._face_batch_size = self._face_admission.capacity
         self._face_batch_wait_seconds = max(
             0.0,
             _as_float(os.environ.get("INSIGHTFACE_BATCH_WAIT_MS"), 5.0) / 1000.0,
@@ -379,6 +381,10 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ocr_executor = ThreadPoolExecutor(
             max_workers=self._ocr_worker_count,
             thread_name_prefix="ocr",
+        )
+        self._face_preprocess_executor = ThreadPoolExecutor(
+            max_workers=self._face_preprocess_worker_count,
+            thread_name_prefix="face-pre",
         )
 
         self._request_activity_lock = threading.Lock()
@@ -414,7 +420,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -428,8 +434,8 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
-            1,
-            self._face_worker_count,
+            INSIGHTFACE_SINGLE_LANE,
+            self._face_preprocess_worker_count,
             self._face_batch_size,
             int(self._face_batch_wait_seconds * 1000.0),
             self._face_admission.capacity,
@@ -444,18 +450,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     def _resolve_ocr_request_capacity(self, worker_count: int) -> int:
         default_capacity = max(2, int(worker_count) * 2)
         configured = _as_int(os.environ.get("OCR_MAX_CONCURRENT_REQUESTS"), default_capacity)
-        return max(1, min(self._queue_capacity, configured))
-
-    def _resolve_face_worker_count(self) -> int:
-        configured = _as_int(os.environ.get("INSIGHTFACE_MAX_WORKERS"), 2)
-        return max(1, min(self._queue_capacity, configured))
-
-    def _resolve_face_request_capacity(self, worker_count: int) -> int:
-        default_capacity = max(2, int(worker_count) * 2)
-        configured = _as_int(
-            os.environ.get("INSIGHTFACE_MAX_CONCURRENT_REQUESTS"),
-            default_capacity,
-        )
         return max(1, min(self._queue_capacity, configured))
 
     def _acquire_image_request_slot(self, label: str) -> None:
@@ -1123,6 +1117,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
             for executor in (
                 self._control_executor,
+                self._face_preprocess_executor,
                 self._shared_cpu_executor,
                 self._ocr_executor,
             ):
