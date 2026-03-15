@@ -255,7 +255,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         return {"result": [], "msg": str(exc)}
 
 
-if __name__ == "__main__":
+def run_server() -> None:
     import uvicorn
 
     _configure_standalone_logging()
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     log_level, _ = _resolve_log_level()
 
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
         port=port,
         reload=False,
@@ -271,3 +271,7 @@ if __name__ == "__main__":
         log_level=log_level.lower(),
         access_log=False,
     )
+
+
+if __name__ == "__main__":
+    run_server()

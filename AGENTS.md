@@ -17,7 +17,7 @@
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
 - Text-CLIP 独立服务入口：`text-clip/app/server.py`。
-- Windows 本地 CUDA Image-CLIP 并行子项目入口：`image-clip/app/server.py`，依赖文件为 `image-clip/requirement.txt`。
+- Windows 本地 CUDA Image-CLIP 并行子项目命令行入口：`image-clip/starter.py`；服务实现入口：`image-clip/app/server.py`；依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
@@ -286,7 +286,10 @@
 - `python -m compileall app`
 - `python -m compileall text-clip/app`
 - `python -m compileall scripts`
+- `python -m compileall image-clip tests`
+- `cd image-clip && python starter.py`
 - `python scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
+- `python -m unittest discover -s tests -p "test_image_clip_starter.py"`
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`

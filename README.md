@@ -11,7 +11,8 @@
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 主服务入口：`app/server.py`
 - Text-CLIP 服务入口：`text-clip/app/server.py`
-- Windows 本地 CUDA Image-CLIP 子项目入口：`image-clip/app/server.py`
+- Windows 本地 CUDA Image-CLIP 子项目命令行入口：`image-clip/starter.py`
+- Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据；`scrfd_10g_bnkps.onnx` 保持原生 detector 路径
@@ -142,7 +143,7 @@ cd app
 python server.py
 ```
 
-如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，启动方式见 [image-clip/README.md](image-clip/README.md)。
+如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，可在仓库根目录直接执行 `python image-clip\starter.py`，或进入 `image-clip\` 后执行 `python starter.py`。更完整的环境变量与冒烟说明见 [image-clip/README.md](image-clip/README.md)。
 
 如需手动执行 `uvicorn server:app`，请显式传入 `--port` / `--log-level`，例如 `uvicorn server:app --host 0.0.0.0 --port 8060 --log-level info`。
 

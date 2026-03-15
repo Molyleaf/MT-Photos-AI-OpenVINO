@@ -4,7 +4,8 @@
 
 ## 目录
 
-- 服务入口：`image-clip/app/server.py`
+- 命令行启动入口：`image-clip/starter.py`
+- 服务实现入口：`image-clip/app/server.py`
 - 依赖文件：`image-clip/requirement.txt`
 - 模型：固定使用 `TencentARC/QA-CLIP-ViT-L-14`
 - 输出维度：固定 `768`
@@ -50,13 +51,22 @@ pip install -r image-clip\requirement.txt
 ```powershell
 $env:IMAGE_CLIP_DEVICE="cuda"
 $env:LOG_LEVEL="INFO"
-cd image-clip\app
-python server.py
+cd image-clip
+python starter.py
 ```
+
+如果你当前位于仓库根目录，也可以直接执行：
+
+```powershell
+python image-clip\starter.py
+```
+
+`starter.py` 会自动补齐 `image-clip/app` 到 `sys.path`，并复用 `image-clip/app/server.py` 内的 `PORT` / `LOG_LEVEL` 启动逻辑；如需调试服务实现本身，仍可进入 `image-clip/app` 后执行 `python server.py`。
 
 ## 冒烟
 
 ```powershell
+python -m unittest discover -s tests -p "test_image_clip_starter.py"
 python scripts\smoke_image_clip.py --device cuda
 python scripts\smoke_image_clip.py --device cuda --image C:\path\to\image.jpg
 
