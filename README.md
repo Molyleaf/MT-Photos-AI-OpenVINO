@@ -193,6 +193,11 @@ apt-get update && apt-get install -y --no-install-recommends \
 cp docker-compose.example.yml docker-compose.yml
 ```
 
+说明：
+- `text-clip/DockerFile-TextCLIP` 必须以仓库根目录作为 Docker build context；命令行示例是 `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
+- 如果在 IDE 里单独部署该 Dockerfile，`Dockerfile` 路径应指向 `text-clip/DockerFile-TextCLIP`，但 `Build context folder` 必须设为仓库根目录，而不是 `text-clip/`
+- 如果构建日志里出现 `load build context => transferring context: 2B`，基本就说明 build context 错设成了 `text-clip/` 或其他空目录；这时 `COPY sources.list`、`COPY models/...`、`COPY text-clip/app` 会全部失败
+
 2. 按宿主机实际情况修改 `group_add` 中的 `video` / `render` GID（Debian 默认通常是 `44` / `109`）。
 
 3. 按需调整 `docker-compose.yml`：
