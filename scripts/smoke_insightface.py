@@ -216,59 +216,44 @@ def _compare_native_vs_local(image_name: str, local_results: Sequence[Any], nati
     return comparisons
 
 
-def _compare_detection_batch(models: AIModels, det_model: Any, images: Sequence[np.ndarray]) -> tuple[list[dict[str, Any]], list[Any], list[Any]]:
-    prepared_images = [
-        models._prepare_insightface_detection_input(image, det_model)
-        for image in images
-    ]
-    batch_results = models._detect_faces_batch(det_model, prepared_images, max_num=0, metric="default")
-    single_results = [
-        models._detect_faces(det_model, image, max_num=0, metric="default")
-        for image in images
-    ]
-
-    comparisons: List[dict[str, Any]] = []
-    for index, (batch_item, single_item) in enumerate(zip(batch_results, single_results)):
-        batch_det, batch_kps = batch_item
-        single_det, single_kps = single_item
-        if batch_det.shape != single_det.shape:
-            raise RuntimeError(
-                f"detection batch/single shape mismatch at image={index}: "
-                f"batch={batch_det.shape} single={single_det.shape}"
-            )
-        det_delta = (
-            float(np.max(np.abs(batch_det - single_det)))
-            if batch_det.size
-            else 0.0
+def _collect_aligned_faces(
+    models: AIModels,
+    det_model: Any,
+    rec_model: Any,
+    images: Sequence[np.ndarray],
+) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    aligned_faces: List[np.ndarray] = []
+    detection_checks: List[dict[str, Any]] = []
+    rec_image_size = int(rec_model.input_size[0])
+    for index, image in enumerate(images):
+        detections, kpss = models._detect_faces_native(
+            det_model,
+            image.copy(),
+            max_num=0,
+            metric="default",
         )
-        if det_delta > 1e-4:
+        if detections.shape[0] == 0:
+            detection_checks.append({"image_index": index, "faces": 0})
+            continue
+        if kpss is None:
             raise RuntimeError(
-                f"detection batch/single drift too large at image={index}: det_delta={det_delta:.6f}"
+                f"Detection returned faces without landmarks during smoke test at image={index}."
             )
-        if (batch_kps is None) != (single_kps is None):
-            raise RuntimeError(f"detection batch/single landmark presence mismatch at image={index}")
-        kps_delta = 0.0
-        if batch_kps is not None and single_kps is not None:
-            if batch_kps.shape != single_kps.shape:
-                raise RuntimeError(
-                    f"detection batch/single landmark shape mismatch at image={index}: "
-                    f"batch={batch_kps.shape} single={single_kps.shape}"
+        for face_index in range(detections.shape[0]):
+            aligned_faces.append(
+                models._align_face(
+                    image,
+                    np.asarray(kpss[face_index]),
+                    rec_image_size,
                 )
-            kps_delta = float(np.max(np.abs(batch_kps - single_kps))) if batch_kps.size else 0.0
-            if kps_delta > 1e-4:
-                raise RuntimeError(
-                    f"detection batch/single landmark drift too large at image={index}: "
-                    f"kps_delta={kps_delta:.6f}"
-                )
-        comparisons.append(
+            )
+        detection_checks.append(
             {
                 "image_index": index,
-                "faces": int(batch_det.shape[0]),
-                "det_max_abs_delta": round(det_delta, 8),
-                "kps_max_abs_delta": round(kps_delta, 8),
+                "faces": int(detections.shape[0]),
             }
         )
-    return comparisons, prepared_images, batch_results
+    return aligned_faces, detection_checks
 
 
 def _compare_represent_microbatch(
@@ -353,34 +338,23 @@ def _compare_represent_microbatch(
 
 
 def _compare_recognition_batch(
-    models: AIModels,
     rec_model: Any,
-    prepared_images: Sequence[Any],
-    detections_batch: Sequence[Any],
+    aligned_faces: Sequence[np.ndarray],
 ) -> dict[str, Any]:
-    aligned_faces: List[np.ndarray] = []
-    rec_image_size = int(rec_model.input_size[0])
-    for prepared, (detections, kpss) in zip(prepared_images, detections_batch):
-        if detections.shape[0] == 0:
-            continue
-        if kpss is None:
-            raise RuntimeError("Detection returned faces without landmarks during recognition smoke test.")
-        for face_index in range(detections.shape[0]):
-            aligned_faces.append(
-                models._align_face(
-                    prepared.source_frame,
-                    np.asarray(kpss[face_index]),
-                    rec_image_size,
-                )
-            )
-
     if not aligned_faces:
         raise RuntimeError("Recognition smoke test found no aligned faces in the sample set.")
 
-    batch_embeddings = models._get_face_embeddings(rec_model, aligned_faces)
-    single_embeddings = np.vstack(
-        [models._get_face_embeddings(rec_model, [face]) for face in aligned_faces]
-    )
+    batch_embeddings = np.asarray(rec_model.get_feat(list(aligned_faces)), dtype=np.float32)
+    if batch_embeddings.ndim == 1:
+        batch_embeddings = batch_embeddings.reshape(1, -1)
+
+    single_embeddings_list: List[np.ndarray] = []
+    for face in aligned_faces:
+        single_embedding = np.asarray(rec_model.get_feat(face), dtype=np.float32)
+        if single_embedding.ndim == 1:
+            single_embedding = single_embedding.reshape(1, -1)
+        single_embeddings_list.append(single_embedding)
+    single_embeddings = np.vstack(single_embeddings_list)
     if batch_embeddings.shape != single_embeddings.shape:
         raise RuntimeError(
             "Recognition batch/single shape mismatch: "
@@ -480,9 +454,10 @@ def main() -> int:
         if semantic_sample_count == 0:
             raise RuntimeError("No InsightFace sample image produced native faces during semantic smoke test.")
 
-        detection_checks, prepared_images, detections_batch = _compare_detection_batch(
+        aligned_faces, detection_checks = _collect_aligned_faces(
             models,
             det_model,
+            rec_model,
             sample_images,
         )
         represent_microbatch_checks = _compare_represent_microbatch(
@@ -490,12 +465,7 @@ def main() -> int:
             local_results,
             concurrent_results,
         )
-        recognition_check = _compare_recognition_batch(
-            models,
-            rec_model,
-            prepared_images,
-            detections_batch,
-        )
+        recognition_check = _compare_recognition_batch(rec_model, aligned_faces)
 
         rss_before_release_kb = _read_rss_kb()
         models.release_models_for_restart()

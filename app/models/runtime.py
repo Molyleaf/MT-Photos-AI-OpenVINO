@@ -307,8 +307,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
         self._face_engine = None
-        self._face_det_ppp: Optional[_OpenVinoPreprocessRunner] = None
-        self._face_rec_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._face_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
         self._face_task_queue = None
         self._face_loop_ready = threading.Event()
@@ -816,8 +814,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             loaded.append("ocr")
         if (
             self._face_engine is not None
-            or self._face_det_ppp is not None
-            or self._face_rec_ppp is not None
         ):
             loaded.append("face")
         return loaded
@@ -874,8 +870,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             unloaded.append("ocr")
         if keep_family != "face" and (
             self._face_engine is not None
-            or self._face_det_ppp is not None
-            or self._face_rec_ppp is not None
         ):
             self._unload_face_model_locked()
             unloaded.append("face")

@@ -1,7 +1,6 @@
 import asyncio
 import os
 import shutil
-import sys
 import threading
 import time
 from abc import abstractmethod, ABC
@@ -26,14 +25,11 @@ from .common import (
     _FaceInferenceTask,
     _InferenceCancelled,
     NonTextFamily,
-    _OpenVinoPreprocessRunner,
     _as_bool,
     _as_contiguous_bgr_uint8,
     _as_int,
-    _get_compiled_model_execution_devices,
     _normalize_non_text_openvino_device,
     _resolve_non_text_openvino_runtime_device,
-    _to_channel_triplet,
 )
 from .constants import INFERENCE_DEVICE, INSIGHTFACE_SINGLE_LANE, LOG, MODEL_NAME
 from .schemas import FacialArea, RepresentResult
@@ -49,7 +45,6 @@ _INSIGHTFACE_ARCFACE_TEMPLATE = np.array(
     dtype=np.float32,
 )
 _INSIGHTFACE_BATCH_DIM_PARAM = "batch"
-_INSIGHTFACE_BATCH_FLAT_PARAM = "batch_flat"
 
 
 @dataclass(frozen=True)
@@ -57,17 +52,8 @@ class _LoadedInsightFaceRuntime:
     face_app: FaceAnalysis
     runtime_root: Path
     provider_runtime: Dict[str, Dict[str, Any]]
-    ppp_execution_devices: Dict[str, List[str]]
     det_session_shapes: Dict[str, Any]
     rec_session_shapes: Dict[str, Any]
-
-
-@dataclass(slots=True)
-class _PreparedInsightFaceImage:
-    detector_input: np.ndarray
-    det_scale: float
-    image_shape: Tuple[int, int]
-    source_frame: Any
 
 
 @dataclass(slots=True)
@@ -168,8 +154,6 @@ class InsightFaceMixin(ABC):
     insightface_root: Path
     insightface_model_root: Path
     _face_engine: Optional[FaceAnalysis]
-    _face_det_ppp: Optional[_OpenVinoPreprocessRunner]
-    _face_rec_ppp: Optional[_OpenVinoPreprocessRunner]
     _face_load_lock: Any
     _face_admission: _AdmissionController
     _face_preprocess_worker_count: int
@@ -183,18 +167,6 @@ class InsightFaceMixin(ABC):
     _face_preprocess_executor: ThreadPoolExecutor
     _face_preprocess_device: Optional[str]
     _execution_timeout_seconds: int
-
-    @abstractmethod
-    def _build_openvino_preprocess_runner(
-        self,
-        runner_name: str,
-        device_name: str,
-        output_height: int,
-        output_width: int,
-        mean_values: List[float],
-        std_values: List[float],
-    ) -> _OpenVinoPreprocessRunner:
-        raise NotImplementedError
 
     @abstractmethod
     def _load_family_serialized(self, family: NonTextFamily, loader: Any) -> None:
@@ -242,19 +214,11 @@ class InsightFaceMixin(ABC):
     ) -> Any:
         raise NotImplementedError
 
-    @staticmethod
-    def _to_int_pair(value: Any, default: Tuple[int, int]) -> Tuple[int, int]:
-        try:
-            first, second = value
-            return int(first), int(second)
-        except Exception:
-            return default
-
     def _configure_insightface_preprocess_backend(self, device_name: str) -> None:
         normalized_device = str(device_name or "").strip().upper()
         self._face_preprocess_device = "CPU"
         LOG.info(
-            "InsightFace preprocessing backend: provider_device=%s OpenCV=CPU(threaded/vectorized) OpenVINO_PPP=CPU",
+            "InsightFace preprocessing backend: provider_device=%s detection=insightface-native(CPU) alignment=local-OpenCV(CPU) recognition_blob=insightface-native(CPU)",
             normalized_device or "CPU",
         )
 
@@ -287,424 +251,57 @@ class InsightFaceMixin(ABC):
 
         return _as_contiguous_bgr_uint8(aligned, context="InsightFace alignment")
 
-    def _prepare_insightface_detection_input(
-        self,
-        img: np.ndarray,
-        det_model: Any,
-    ) -> _PreparedInsightFaceImage:
-        image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
-        input_size = tuple(det_model.input_size)
-        im_ratio = float(image.shape[0]) / float(image.shape[1])
-        model_ratio = float(input_size[1]) / float(input_size[0])
-        if im_ratio > model_ratio:
-            new_height = input_size[1]
-            new_width = int(new_height / im_ratio)
-        else:
-            new_width = input_size[0]
-            new_height = int(new_width * im_ratio)
-        det_scale = float(new_height) / float(image.shape[0])
-
-        try:
-            source_frame = image
-            resized = cv2.resize(
-                image,
-                (new_width, new_height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            detector_input = cv2.copyMakeBorder(
-                resized,
-                0,
-                int(input_size[1] - new_height),
-                0,
-                int(input_size[0] - new_width),
-                cv2.BORDER_CONSTANT,
-                value=(0, 0, 0),
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "OpenCV CPU detector resize/letterbox failed in InsightFace preprocessing."
-            ) from exc
-
-        return _PreparedInsightFaceImage(
-            detector_input=_as_contiguous_bgr_uint8(
-                detector_input,
-                context="InsightFace detector",
-            ),
-            det_scale=det_scale,
-            image_shape=(int(image.shape[0]), int(image.shape[1])),
-            source_frame=source_frame,
-        )
-
     @staticmethod
-    def _resolve_insightface_detector_helpers(
-        det_model: Any,
-    ) -> Tuple[Any, Optional[Any]]:
-        module = sys.modules.get(det_model.__class__.__module__)
-        if module is None:
-            raise RuntimeError(
-                f"Cannot resolve module for detector class: {det_model.__class__.__module__}"
-            )
-        distance2bbox = getattr(module, "distance2bbox", None)
-        distance2kps = getattr(module, "distance2kps", None)
-        if distance2bbox is None:
-            raise RuntimeError("InsightFace detector module missing distance2bbox helper.")
-        if getattr(det_model, "use_kps", False) and distance2kps is None:
-            raise RuntimeError("InsightFace detector module missing distance2kps helper.")
-        return distance2bbox, distance2kps
-
-    @staticmethod
-    def _normalize_insightface_detector_state(
-        det_model: Any,
-        *,
-        det_size: Tuple[int, int],
-        det_thresh: float,
-        nms_thresh: float = 0.4,
-    ) -> None:
-        init_vars = getattr(det_model, "_init_vars", None)
-        required_attrs = (
-            "input_name",
-            "output_names",
-            "fmc",
-            "_feat_stride_fpn",
-            "_num_anchors",
-            "use_kps",
-            "input_mean",
-            "input_std",
-        )
-        if callable(init_vars) and any(not hasattr(det_model, attr) for attr in required_attrs):
-            init_vars()
-
-        if not hasattr(det_model, "center_cache") or getattr(det_model, "center_cache") is None:
-            det_model.center_cache = {}
-        if getattr(det_model, "det_thresh", None) is None:
-            det_model.det_thresh = float(det_thresh)
-        if getattr(det_model, "nms_thresh", None) is None:
-            det_model.nms_thresh = float(nms_thresh)
-        if getattr(det_model, "input_size", None) is None:
-            det_model.input_size = tuple(int(value) for value in det_size)
-
-    @classmethod
-    def _prepare_insightface_detector(
-        cls,
+    def _prepare_insightface_models(
         face_app: FaceAnalysis,
         *,
         det_size: Tuple[int, int],
         det_thresh: float,
     ) -> None:
         det_model = getattr(face_app, "det_model", None)
-        if det_model is None:
-            raise RuntimeError("InsightFace detection model is missing.")
+        rec_model = getattr(face_app, "models", {}).get("recognition")
+        if det_model is None or rec_model is None:
+            raise RuntimeError("InsightFace detection/recognition model not found.")
 
-        prepare = getattr(det_model, "prepare", None)
-        if callable(prepare):
-            prepare(
+        prepare_det = getattr(det_model, "prepare", None)
+        if callable(prepare_det):
+            prepare_det(
                 0,
                 input_size=tuple(int(value) for value in det_size),
                 det_thresh=float(det_thresh),
             )
+        prepare_rec = getattr(rec_model, "prepare", None)
+        if callable(prepare_rec):
+            prepare_rec(0)
+
+        if not hasattr(det_model, "center_cache") or getattr(det_model, "center_cache", None) is None:
+            det_model.center_cache = {}
+        if getattr(det_model, "input_size", None) is None:
+            det_model.input_size = tuple(int(value) for value in det_size)
+        if getattr(det_model, "det_thresh", None) is None:
+            det_model.det_thresh = float(det_thresh)
+
         face_app.det_thresh = float(det_thresh)
         face_app.det_size = tuple(int(value) for value in det_size)
-        cls._normalize_insightface_detector_state(
-            det_model,
-            det_size=det_size,
-            det_thresh=float(det_thresh),
-        )
-        input_width, input_height = tuple(int(value) for value in det_model.input_size)
-        num_anchors = int(getattr(det_model, "_num_anchors"))
-        for stride in list(getattr(det_model, "_feat_stride_fpn", [])):
-            cls._get_insightface_anchor_centers(
-                det_model,
-                height=input_height // int(stride),
-                width=input_width // int(stride),
-                stride=int(stride),
-                num_anchors=num_anchors,
-            )
 
-    @staticmethod
-    def _reshape_insightface_detector_output(
-        output: Any,
-        *,
-        batch_size: int,
-        items_per_image: int,
-        num_anchors: int,
-        channels: int,
-        label: str,
-    ) -> np.ndarray:
-        array = np.asarray(output)
-        expected_flat = items_per_image * batch_size
-        if num_anchors <= 0:
-            raise RuntimeError(
-                f"InsightFace detector output invalid num_anchors={num_anchors} for {label}"
-            )
-        if items_per_image % num_anchors != 0:
-            raise RuntimeError(
-                "InsightFace detector output shape mismatch for "
-                f"{label}: items_per_image={items_per_image} is not divisible by "
-                f"num_anchors={num_anchors}"
-            )
-        spatial_positions = items_per_image // num_anchors
-        if array.ndim == 3 and array.shape[0] == batch_size:
-            if array.shape[1] == items_per_image and array.shape[2] == channels:
-                return array.reshape(batch_size, items_per_image, channels)
-            if array.shape[1] == spatial_positions and array.shape[2] == num_anchors * channels:
-                return array.reshape(
-                    batch_size,
-                    spatial_positions,
-                    num_anchors,
-                    channels,
-                ).reshape(batch_size, items_per_image, channels)
-        if array.ndim == 2 and array.shape[0] == expected_flat:
-            # SCRFD exports flatten detector heads as:
-            #   [H, W, batch, anchors * channels] -> reshape(-1, channels)
-            # Recover batch/items by restoring the anchor axis before transposing.
-            return array.reshape(
-                spatial_positions,
-                batch_size,
-                num_anchors,
-                channels,
-            ).transpose(1, 0, 2, 3).reshape(batch_size, items_per_image, channels)
-        if array.ndim == 2 and batch_size == 1 and array.shape[0] == items_per_image:
-            return array.reshape(1, items_per_image, channels)
-        raise RuntimeError(
-            "InsightFace detector output shape mismatch for "
-            f"{label}: batch_size={batch_size} items_per_image={items_per_image} "
-            f"num_anchors={num_anchors} channels={channels} got_shape={tuple(array.shape)}"
-        )
-
-    @staticmethod
-    def _get_insightface_anchor_centers(
-        det_model: Any,
-        *,
-        height: int,
-        width: int,
-        stride: int,
-        num_anchors: int,
-    ) -> np.ndarray:
-        key = (height, width, stride)
-        anchor_centers = det_model.center_cache.get(key)
-        if anchor_centers is not None:
-            return anchor_centers
-
-        anchor_centers = np.stack(
-            cast(Any, np.mgrid[:height, :width][::-1]),
-            axis=-1,
-        ).astype(np.float32)
-        anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-        if num_anchors > 1:
-            anchor_centers = np.stack([anchor_centers] * num_anchors, axis=1)
-            anchor_centers = anchor_centers.reshape((-1, 2))
-        if len(det_model.center_cache) < 100:
-            det_model.center_cache[key] = anchor_centers
-        return anchor_centers
-
-    def _run_insightface_detector_forward_batch(
-        self,
-        det_model: Any,
-        det_images: List[np.ndarray],
-    ) -> List[Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]]:
-        preprocess_runner = self._face_det_ppp
-        if preprocess_runner is None:
-            raise RuntimeError("InsightFace detection PPP runner is not initialized.")
-        if not det_images:
-            return []
-
-        self._normalize_insightface_detector_state(
-            det_model,
-            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
-            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
-            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
-        )
-        distance2bbox, distance2kps = self._resolve_insightface_detector_helpers(det_model)
-        batch = np.ascontiguousarray(np.stack(det_images, axis=0), dtype=np.uint8)
-        blob = preprocess_runner.run(batch)
-        net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: blob})
-
-        batch_size = int(blob.shape[0])
-        input_height = int(blob.shape[2])
-        input_width = int(blob.shape[3])
-        fmc = det_model.fmc
-        feat_stride_fpn = list(getattr(det_model, "_feat_stride_fpn"))
-        num_anchors = int(getattr(det_model, "_num_anchors"))
-        per_image_scores: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
-        per_image_bboxes: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
-        per_image_kpss: List[List[np.ndarray]] = [[] for _ in range(batch_size)]
-
-        for idx, stride in enumerate(feat_stride_fpn):
-            height = input_height // stride
-            width = input_width // stride
-            item_count = height * width * num_anchors
-            anchor_centers = self._get_insightface_anchor_centers(
-                det_model,
-                height=height,
-                width=width,
-                stride=stride,
-                num_anchors=num_anchors,
-            )
-            score_batch = self._reshape_insightface_detector_output(
-                net_outs[idx],
-                batch_size=batch_size,
-                items_per_image=item_count,
-                num_anchors=num_anchors,
-                channels=1,
-                label=f"score@{stride}",
-            )
-            bbox_batch = self._reshape_insightface_detector_output(
-                net_outs[idx + fmc],
-                batch_size=batch_size,
-                items_per_image=item_count,
-                num_anchors=num_anchors,
-                channels=4,
-                label=f"bbox@{stride}",
-            )
-
-            if det_model.use_kps:
-                if distance2kps is None:
-                    raise RuntimeError(
-                        "InsightFace detector module missing distance2kps for a "
-                        "keypoint-enabled model."
-                    )
-                kps_batch = self._reshape_insightface_detector_output(
-                    net_outs[idx + fmc * 2],
-                    batch_size=batch_size,
-                    items_per_image=item_count,
-                    num_anchors=num_anchors,
-                    channels=10,
-                    label=f"kps@{stride}",
-                )
-            else:
-                kps_batch = None
-
-            for batch_index in range(batch_size):
-                scores = score_batch[batch_index].reshape(-1, 1)
-                bbox_preds = bbox_batch[batch_index] * stride
-                pos_inds = np.where(scores[:, 0] >= det_model.det_thresh)[0]
-                if pos_inds.size == 0:
-                    continue
-                bboxes = distance2bbox(anchor_centers, bbox_preds)
-                per_image_scores[batch_index].append(scores[pos_inds])
-                per_image_bboxes[batch_index].append(bboxes[pos_inds])
-
-                if kps_batch is not None:
-                    kps_preds = kps_batch[batch_index] * stride
-                    kpss = distance2kps(anchor_centers, kps_preds)
-                    kpss = kpss.reshape((kpss.shape[0], -1, 2))
-                    per_image_kpss[batch_index].append(kpss[pos_inds])
-
-        return [
-            (per_image_scores[index], per_image_bboxes[index], per_image_kpss[index])
-            for index in range(batch_size)
-        ]
-
-    def _postprocess_insightface_detections(
-        self,
-        det_model: Any,
-        *,
-        scores_list: List[np.ndarray],
-        bboxes_list: List[np.ndarray],
-        kpss_list: List[np.ndarray],
-        det_scale: float,
-        image_shape: Tuple[int, int],
-        max_num: int,
-        metric: str,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        if not scores_list:
-            return np.empty((0, 5), dtype=np.float32), None
-
-        scores = np.vstack(
-            [
-                np.asarray(score_array, dtype=np.float32).reshape(-1, 1)
-                for score_array in scores_list
-            ]
-        )
-        scores_ravel = scores.ravel()
-        if scores_ravel.size == 0:
-            return np.empty((0, 5), dtype=np.float32), None
-
-        order = scores_ravel.argsort()[::-1]
-        bboxes = np.vstack(bboxes_list) / det_scale
-        if det_model.use_kps and kpss_list:
-            kpss = np.vstack(kpss_list) / det_scale
-        else:
-            kpss = None
-        pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
-        pre_det = pre_det[order, :]
-        keep = det_model.nms(pre_det)
-        det = pre_det[keep, :]
-        if kpss is not None:
-            kpss = kpss[order, :, :]
-            kpss = kpss[keep, :, :]
-        if 0 < max_num < det.shape[0]:
-            area = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
-            img_center = image_shape[0] // 2, image_shape[1] // 2
-            offsets = np.vstack(
-                [
-                    (det[:, 0] + det[:, 2]) / 2 - img_center[1],
-                    (det[:, 1] + det[:, 3]) / 2 - img_center[0],
-                ]
-            )
-            offset_dist_squared = np.sum(np.power(offsets, 2.0), 0)
-            values = area if metric == "max" else area - offset_dist_squared * 2.0
-            bindex = np.argsort(values)[::-1][:max_num]
-            det = det[bindex, :]
-            if kpss is not None:
-                kpss = kpss[bindex, :]
-        return det, kpss
-
-    def _detect_faces_batch(
-        self,
-        det_model: Any,
-        prepared_images: List[_PreparedInsightFaceImage],
-        max_num: int = 0,
-        metric: str = "default",
-    ) -> List[Tuple[np.ndarray, Optional[np.ndarray]]]:
-        self._normalize_insightface_detector_state(
-            det_model,
-            det_size=self._to_int_pair(getattr(det_model, "input_size", (640, 640)), (640, 640)),
-            det_thresh=float(getattr(det_model, "det_thresh", 0.5) or 0.5),
-            nms_thresh=float(getattr(det_model, "nms_thresh", 0.4) or 0.4),
-        )
-        if not prepared_images:
-            return []
-
-        forward_outputs = self._run_insightface_detector_forward_batch(
-            det_model,
-            [item.detector_input for item in prepared_images],
-        )
-        results: List[Tuple[np.ndarray, Optional[np.ndarray]]] = []
-        for prepared, (scores_list, bboxes_list, kpss_list) in zip(prepared_images, forward_outputs):
-            results.append(
-                self._postprocess_insightface_detections(
-                    det_model,
-                    scores_list=scores_list,
-                    bboxes_list=bboxes_list,
-                    kpss_list=kpss_list,
-                    det_scale=prepared.det_scale,
-                    image_shape=prepared.image_shape,
-                    max_num=max_num,
-                    metric=metric,
-                )
-            )
-        return results
-
-    def _detect_faces(
+    def _detect_faces_native(
         self,
         det_model: Any,
         img: np.ndarray,
         max_num: int = 0,
         metric: str = "default",
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        prepared = self._prepare_insightface_detection_input(img, det_model)
-        return self._detect_faces_batch(
-            det_model,
-            [prepared],
-            max_num=max_num,
-            metric=metric,
-        )[0]
+        image = _as_contiguous_bgr_uint8(img, context="InsightFace detector")
+        try:
+            detections, kpss = det_model.detect(image, max_num=max_num, metric=metric)
+        except Exception as exc:
+            raise RuntimeError("InsightFace native detector.detect() failed.") from exc
+        return (
+            np.asarray(detections, dtype=np.float32),
+            None if kpss is None else np.asarray(kpss, dtype=np.float32),
+        )
 
-    def _get_face_embeddings(self, rec_model: Any, aligned_faces: List[np.ndarray]) -> np.ndarray:
-        preprocess_runner = self._face_rec_ppp
-        if preprocess_runner is None:
-            raise RuntimeError("InsightFace recognition PPP runner is not initialized.")
+    def _get_face_embeddings_native(self, rec_model: Any, aligned_faces: List[np.ndarray]) -> np.ndarray:
         if not aligned_faces:
             return np.empty((0, 0), dtype=np.float32)
 
@@ -712,11 +309,10 @@ class InsightFaceMixin(ABC):
             _as_contiguous_bgr_uint8(np.asarray(item), context="InsightFace recognition")
             for item in aligned_faces
         ]
-        batch = np.stack(prepared, axis=0)
-        blob = preprocess_runner.run(batch)
-        features = np.asarray(
-            rec_model.session.run(rec_model.output_names, {rec_model.input_name: blob})[0]
-        )
+        try:
+            features = np.asarray(rec_model.get_feat(prepared))
+        except Exception as exc:
+            raise RuntimeError("InsightFace native recognition get_feat() failed.") from exc
         if features.ndim == 1:
             features = features.reshape(1, -1)
         if features.shape[0] != len(prepared):
@@ -724,39 +320,7 @@ class InsightFaceMixin(ABC):
                 "InsightFace recognition output mismatch after batched run: "
                 f"expected_batch={len(prepared)} got_shape={tuple(features.shape)}"
             )
-        return features
-
-    def _attach_insightface_preprocess(self, face_app: FaceAnalysis, device_name: str) -> None:
-        det_model = getattr(face_app, "det_model", None)
-        rec_model = getattr(face_app, "models", {}).get("recognition")
-        if det_model is None or rec_model is None:
-            raise RuntimeError("InsightFace detection/recognition model not found.")
-
-        det_width, det_height = map(int, det_model.input_size)
-        rec_width, rec_height = map(int, rec_model.input_size)
-        preprocess_device = "CPU"
-
-        self._face_det_ppp = self._build_openvino_preprocess_runner(
-            runner_name="insightface_det",
-            device_name=preprocess_device,
-            output_height=det_height,
-            output_width=det_width,
-            mean_values=_to_channel_triplet(getattr(det_model, "input_mean", 127.5)),
-            std_values=_to_channel_triplet(getattr(det_model, "input_std", 127.5)),
-        )
-        self._face_rec_ppp = self._build_openvino_preprocess_runner(
-            runner_name="insightface_rec",
-            device_name=preprocess_device,
-            output_height=rec_height,
-            output_width=rec_width,
-            mean_values=_to_channel_triplet(getattr(rec_model, "input_mean", 127.5)),
-            std_values=_to_channel_triplet(getattr(rec_model, "input_std", 127.5)),
-        )
-        self._configure_insightface_preprocess_backend(device_name)
-        LOG.info(
-            "InsightFace preprocessing configured: OpenCV(CPU) + OpenVINO PPP(%s).",
-            preprocess_device,
-        )
+        return np.asarray(features, dtype=np.float32)
 
     def _resolve_insightface_source_model_dir(self) -> Path:
         model_dir = self.insightface_model_root / MODEL_NAME
@@ -802,13 +366,6 @@ class InsightFaceMixin(ABC):
             return False
         return True
 
-    @staticmethod
-    def _onnx_dim_has_param(dim: Any) -> bool:
-        has_field = getattr(dim, "HasField", None)
-        if callable(has_field):
-            return bool(has_field("dim_param"))
-        return bool(str(getattr(dim, "dim_param", "")).strip())
-
     @classmethod
     def _onnx_dim_value(cls, dim: Any) -> Optional[int]:
         if not cls._onnx_dim_has_value(dim):
@@ -828,19 +385,6 @@ class InsightFaceMixin(ABC):
         finally:
             if temp_path.exists():
                 temp_path.unlink()
-
-    @classmethod
-    def _insightface_detector_model_has_dynamic_batch_metadata(cls, model: Any) -> bool:
-        if not model.graph.input or not model.graph.output:
-            return False
-        input_dims = model.graph.input[0].type.tensor_type.shape.dim
-        if not input_dims or cls._onnx_dim_value(input_dims[0]) is not None:
-            return False
-        for output in model.graph.output:
-            output_dims = output.type.tensor_type.shape.dim
-            if not output_dims or cls._onnx_dim_value(output_dims[0]) is not None:
-                return False
-        return True
 
     @classmethod
     def _insightface_recognition_model_has_dynamic_output_batch(cls, model: Any) -> bool:
@@ -909,28 +453,6 @@ class InsightFaceMixin(ABC):
         det_model.input_shape = list(input_shape)
         det_model.output_shapes = [list(shape) for shape in output_shapes]
 
-        if cls._shape_has_static_batch_one(input_shape):
-            raise RuntimeError(
-                "InsightFace detection input metadata is pinned to batch=1. "
-                "Cross-request batched detection requires a dynamic input batch dimension."
-            )
-
-        static_output_dims = []
-        for output_meta, output_shape in zip(outputs, output_shapes):
-            if not output_shape:
-                continue
-            first_dim = output_shape[0]
-            try:
-                static_value = int(first_dim)
-            except (TypeError, ValueError):
-                continue
-            static_output_dims.append((str(getattr(output_meta, "name", "?")), static_value))
-        if static_output_dims:
-            raise RuntimeError(
-                "InsightFace detection output metadata is pinned to a static flattened batch "
-                f"dimension: {static_output_dims}. Batched detection requires dynamic output metadata."
-            )
-
         return {
             "input_shape": cls._format_ort_shape(input_shape),
             "output_shapes": [cls._format_ort_shape(shape) for shape in output_shapes],
@@ -993,70 +515,6 @@ class InsightFaceMixin(ABC):
 
         cls._save_patched_insightface_model(model, src, dst)
 
-    @classmethod
-    def _prepare_batched_insightface_detector_model(cls, src: Path, dst: Path) -> None:
-        if not src.is_file():
-            raise FileNotFoundError(f"InsightFace required model missing: {src}")
-        if onnx is None:
-            raise RuntimeError(
-                "InsightFace batched detector metadata patch requires the 'onnx' package."
-            )
-
-        if dst.is_file() and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns:
-            try:
-                existing_model = onnx.load(str(dst))
-                if cls._insightface_detector_model_has_dynamic_batch_metadata(existing_model):
-                    return
-            except Exception:
-                pass
-
-        model = onnx.load(str(src))
-        if not model.graph.input or not model.graph.output:
-            raise RuntimeError(f"InsightFace detection model is missing inputs/outputs: {src}")
-
-        input_dims = model.graph.input[0].type.tensor_type.shape.dim
-        if not input_dims:
-            raise RuntimeError(
-                "InsightFace detection model input shape metadata is missing. "
-                f"model={src}"
-            )
-
-        patched = False
-        input_first_dim = input_dims[0]
-        if cls._onnx_dim_value(input_first_dim) is not None:
-            input_first_dim.ClearField("dim_value")
-            input_first_dim.dim_param = _INSIGHTFACE_BATCH_DIM_PARAM
-            patched = True
-        elif not cls._onnx_dim_has_param(input_first_dim):
-            raise RuntimeError(
-                "InsightFace detection model input batch metadata is missing. "
-                f"model={src}"
-            )
-
-        for output in model.graph.output:
-            output_dims = output.type.tensor_type.shape.dim
-            if not output_dims:
-                raise RuntimeError(
-                    "InsightFace detection model output shape metadata is missing. "
-                    f"model={src} output={output.name}"
-                )
-            output_first_dim = output_dims[0]
-            if cls._onnx_dim_value(output_first_dim) is not None:
-                output_first_dim.ClearField("dim_value")
-                output_first_dim.dim_param = _INSIGHTFACE_BATCH_FLAT_PARAM
-                patched = True
-            elif not cls._onnx_dim_has_param(output_first_dim):
-                raise RuntimeError(
-                    "InsightFace detection model output batch metadata is missing. "
-                    f"model={src} output={output.name}"
-                )
-
-        if not patched:
-            cls._copy_runtime_insightface_model(src, dst)
-            return
-
-        cls._save_patched_insightface_model(model, src, dst)
-
     def _prepare_insightface_runtime_root(self, source_model_dir: Path) -> Path:
         runtime_root = self.insightface_root / "_runtime_models"
         runtime_model_dir = runtime_root / "models" / MODEL_NAME
@@ -1073,7 +531,7 @@ class InsightFaceMixin(ABC):
         det_runtime = runtime_model_dir / det_src.name
         rec_runtime = runtime_model_dir / rec_src.name
 
-        self._prepare_batched_insightface_detector_model(det_src, det_runtime)
+        self._copy_runtime_insightface_model(det_src, det_runtime)
         self._prepare_batched_insightface_recognition_model(rec_src, rec_runtime)
         return runtime_root
 
@@ -1152,7 +610,7 @@ class InsightFaceMixin(ABC):
             det_session_shapes = self._normalize_insightface_detector_session_state(
                 getattr(face_app, "det_model", None)
             )
-            self._prepare_insightface_detector(
+            self._prepare_insightface_models(
                 face_app,
                 det_size=(640, 640),
                 det_thresh=0.5,
@@ -1165,27 +623,16 @@ class InsightFaceMixin(ABC):
                 face_app,
                 expected_device_type=provider_device,
             )
-            self._attach_insightface_preprocess(face_app, device_name=provider_device)
-            ppp_execution_devices = {
-                "det": _get_compiled_model_execution_devices(
-                    getattr(self._face_det_ppp, "compiled_model", None)
-                ),
-                "rec": _get_compiled_model_execution_devices(
-                    getattr(self._face_rec_ppp, "compiled_model", None)
-                ),
-            }
+            self._configure_insightface_preprocess_backend(provider_device)
             return _LoadedInsightFaceRuntime(
                 face_app=face_app,
                 runtime_root=runtime_root,
                 provider_runtime=provider_runtime,
-                ppp_execution_devices=ppp_execution_devices,
                 det_session_shapes=det_session_shapes,
                 rec_session_shapes=rec_session_shapes,
             )
         except Exception:
             self._dispose_insightface_face_analysis(face_app)
-            self._face_det_ppp = None
-            self._face_rec_ppp = None
             self._face_preprocess_device = None
             raise
 
@@ -1317,8 +764,6 @@ class InsightFaceMixin(ABC):
     def _unload_face_model_locked(self) -> None:
         self._dispose_insightface_face_analysis(self._face_engine)
         self._face_engine = None
-        self._face_det_ppp = None
-        self._face_rec_ppp = None
         self._face_preprocess_device = None
 
     def _unload_face_model(self) -> None:
@@ -1327,11 +772,7 @@ class InsightFaceMixin(ABC):
 
     def _ensure_face_loaded(self) -> None:
         with self._face_load_lock:
-            if (
-                self._face_engine is not None
-                and self._face_det_ppp is not None
-                and self._face_rec_ppp is not None
-            ):
+            if self._face_engine is not None:
                 return
             self._load_family_serialized("face", self._load_face_locked)
 
@@ -1354,14 +795,13 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s preprocess_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s preprocess_device=%s provider_options=%s provider_runtime=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s pipeline=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 self._face_preprocess_device or "CPU",
                 provider_options,
                 runtime.provider_runtime,
-                runtime.ppp_execution_devices,
                 runtime.det_session_shapes,
                 runtime.rec_session_shapes,
                 INSIGHTFACE_SINGLE_LANE,
@@ -1369,15 +809,14 @@ class InsightFaceMixin(ABC):
                 self._face_batch_size,
                 int(self._face_batch_wait_seconds * 1000.0),
                 self._face_admission.capacity,
+                "native-detect/native-recognition+local-align",
                 runtime.runtime_root,
             )
         except Exception as exc:
             self._face_engine = None
-            self._face_det_ppp = None
-            self._face_rec_ppp = None
             self._face_preprocess_device = None
             raise RuntimeError(
-                "InsightFace must run with OpenVINOExecutionProvider + OpenCV resize/alignment + OpenVINO PPP. "
+                "InsightFace must run with OpenVINOExecutionProvider + insightface native CPU preprocessing + local CPU alignment. "
                 "No silent fallback is allowed."
             ) from exc
 
@@ -1726,41 +1165,22 @@ class InsightFaceMixin(ABC):
         outcomes: List[Tuple[Optional[List[RepresentResult]], Optional[Exception]]] = [
             (None, None) for _ in tasks
         ]
-        prepared_task_indices: List[int] = []
-        prepare_jobs: List[Callable[[], _PreparedInsightFaceImage]] = []
-        for task_index, task in enumerate(tasks):
-            if task.cancel_requested.is_set():
-                outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
-                continue
-            prepared_task_indices.append(task_index)
-            prepare_jobs.append(
-                lambda payload=task.payload: self._prepare_insightface_detection_input(
-                    payload,
-                    det_model,
-                )
-            )
-
-        prepared_images = cast(
-            List[_PreparedInsightFaceImage],
-            self._run_face_preprocess_stage(prepare_jobs),
-        )
-
-        if not prepared_images:
-            return outcomes
-
-        detections_batch = self._detect_faces_batch(
-            det_model,
-            prepared_images,
-            max_num=0,
-            metric="default",
-        )
         rec_image_size = int(rec_model.input_size[0])
         recognition_job_task_indices: List[int] = []
         recognition_jobs: List[
             Callable[[], Tuple[int, Optional[_PendingInsightFaceRecognition], Optional[Exception]]]
         ] = []
-        for prepared_index, (detections, kpss) in enumerate(detections_batch):
-            task_index = prepared_task_indices[prepared_index]
+        for task_index, task in enumerate(tasks):
+            if task.cancel_requested.is_set():
+                outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
+                continue
+
+            detections, kpss = self._detect_faces_native(
+                det_model,
+                cast(np.ndarray, task.payload),
+                max_num=0,
+                metric="default",
+            )
             task = tasks[task_index]
             if task.cancel_requested.is_set():
                 outcomes[task_index] = (None, _InferenceCancelled("Face task cancelled"))
@@ -1783,7 +1203,7 @@ class InsightFaceMixin(ABC):
                 lambda task_index=task_index,
                 detections=np.asarray(detections, dtype=np.float32),
                 kpss=np.asarray(kpss, dtype=np.float32),
-                source_frame=prepared_images[prepared_index].source_frame,
+                source_frame=task.payload,
                 cancel_event=task.cancel_requested: self._build_pending_face_recognition_result(
                     task_index=task_index,
                     detections=detections,
@@ -1822,7 +1242,7 @@ class InsightFaceMixin(ABC):
             )
 
         if all_aligned_faces:
-            embeddings = self._get_face_embeddings(rec_model, all_aligned_faces)
+            embeddings = self._get_face_embeddings_native(rec_model, all_aligned_faces)
         else:
             embeddings = np.empty((0, 0), dtype=np.float32)
 
