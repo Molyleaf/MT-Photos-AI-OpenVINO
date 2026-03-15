@@ -39,14 +39,12 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 RUN set -eux; \
     groupadd --gid "${APP_GID}" appgroup; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
-    mkdir -p /cache/openvino /models/qa-clip/openvino /app/models/QA-CLIP/clip; \
+    mkdir -p /cache/openvino /models/qa-clip/openvino; \
     chmod -R 777 /cache; \
     chown -R appuser:appgroup /app /models /cache
 
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.xml /models/qa-clip/openvino/openvino_text_fp16.xml
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.bin /models/qa-clip/openvino/openvino_text_fp16.bin
-COPY --chown=appuser:appgroup app/models/QA-CLIP/clip/bert_tokenizer.py /app/models/QA-CLIP/clip/bert_tokenizer.py
-COPY --chown=appuser:appgroup app/models/QA-CLIP/clip/vocab.txt /app/models/QA-CLIP/clip/vocab.txt
 COPY --chown=appuser:appgroup text-clip/app /app
 
 RUN set -eux; \
@@ -62,4 +60,4 @@ EXPOSE 8061
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD sh -c "python -c \"import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8061') + '/', timeout=3)\" || exit 1"
 
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8061} --log-level ${LOG_LEVEL:-warning}"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8061} --log-level $(printf '%s' \"${LOG_LEVEL:-warning}\" | tr '[:upper:]' '[:lower:]')"]

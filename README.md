@@ -1,6 +1,6 @@
 # MT-Photos AI (OpenVINO)
 
-主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace），并通过独立 `Text-CLIP` CPU 服务兼容提供 `/clip/txt`。本文档仅保留最终用户部署、运行和配置说明。
+主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace）；`Text-CLIP` 现已拆为独立 CPU 服务，单独对外提供 `/clip/txt`。本文档仅保留最终用户部署、运行和配置说明。
 
 ## 部署前准备
 
@@ -12,7 +12,7 @@
 - 主服务入口：`app/server.py`
 - Text-CLIP 服务入口：`text-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
-- 源码运行时需保留 `app/models/QA-CLIP/clip`，独立 Text-CLIP 服务当前仍使用其中的 tokenizer 与词表资源
+- 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时把 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx` 物化为动态 batch 运行时模型
 
 ## 运行时环境变量
@@ -22,8 +22,6 @@
 | `API_AUTH_KEY`                      | API Key；`no-key` 或空字符串表示关闭鉴权                              | `mt_photos_ai_extra`               |
 | `INFERENCE_DEVICE`                  | OpenVINO 设备字符串，如 `GPU` / `CPU` / `AUTO`                 | `AUTO`                             |
 | `CLIP_INFERENCE_DEVICE`             | 仅覆盖主服务 `/clip/img` 的 QA-CLIP 视觉设备；请求 `AUTO/GPU` 时需保证 GPU 可用，且会强制初始化 GPU Remote Context | 跟随 `INFERENCE_DEVICE`              |
-| `TEXT_CLIP_BASE_URL`               | 主服务转发 `/clip/txt` 时访问的独立 Text-CLIP 服务地址 | `http://127.0.0.1:8061`             |
-| `TEXT_CLIP_API_KEY`                | 可选：主服务访问独立 Text-CLIP 服务时使用的 `api-key`；未设置时默认复用 `API_AUTH_KEY` | 跟随 `API_AUTH_KEY`                  |
 | `MODEL_PATH`                        | 模型根目录路径                                                   | `<repo>/models`                    |
 | `INFERENCE_QUEUE_MAX_SIZE`          | 跨 `/clip/img`、`/ocr`、`/represent` 共享的图片请求总名额（排队+执行）；运行时硬上限 `10`，超出会立即拒绝 | `10`                               |
 | `INFERENCE_TASK_TIMEOUT`            | 兼容旧配置的总超时基线；未显式设置新变量时用作排队超时默认值，并为执行超时提供下限 | `10`                               |
@@ -80,9 +78,9 @@
 - `RAPIDOCR_DET_DEVICE` / `RAPIDOCR_CLS_DEVICE` / `RAPIDOCR_REC_DEVICE` 当前只用于兼容告警，不参与实际 stage 选路。
 - 当 `CLIP_INFERENCE_DEVICE` 请求 `GPU` 或 `AUTO` 时，服务会强制初始化 OpenVINO GPU Remote Context。
 - Remote Context 初始化会依次尝试默认 `GPU`、具体 `GPU.*` 设备，以及 `create_context("GPU", {})` 兼容路径；全部失败时直接终止启动，不允许 silent fallback。
-- 主服务不再常驻 Text-CLIP 模型；`/clip/txt` 会转发到 `TEXT_CLIP_BASE_URL` 指向的独立 Text-CLIP CPU 服务。
+- 主服务不再包含 Text-CLIP 模型，也不再提供 `/clip/txt`；该端点仅由独立 Text-CLIP CPU 服务提供。
 - Vision-CLIP / OCR / InsightFace 采用“单活非文本模型族”切换策略：切换到新模型族前，会先等待当前已受理任务退场并同步释放旧族模型，避免三个大模型长期同时驻留。
-- 非文本空闲释放计时现在只由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2` 和 `/clip/txt` 不会再阻止 Vision-CLIP / OCR / InsightFace 自动释放。
+- 非文本空闲释放计时现在只由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2` 不会再阻止 Vision-CLIP / OCR / InsightFace 自动释放。
 - `/clip/img` 会先执行标准预处理（缩放、中心裁剪、PPP 归一化），再通过专用 `asyncio.Queue` 做受控微批，并以 `np.stack` 一次送入动态 batch 视觉模型。
 - 为避免 MT-Photos 客户端在积压时主动取消，服务会对 `/clip/img`、`/ocr`、`/represent` 共享一个图片请求名额池；默认值和运行时硬上限都是 `10`，第 `11` 张会立即失败而不是继续挂起等待。
 - RapidOCR 现已回到库内原生 `RapidOCR.__call__` CPU 执行链：服务只负责懒加载、应用层准入和超时控制，不再替换 session、也不再维护自定义 stage 级预处理/批调度。
@@ -96,7 +94,7 @@
 - 服务现在默认启用本地 OpenVINO 编译缓存目录 `<repo>/cache/openvino`；如果需要自定义路径，可显式设置 `OV_CACHE_DIR`。
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - 默认还会在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 服务不受该计时器影响。如需调整主容器释放窗口，可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。
-- `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 服务保持可用。返回 `{"result":"pass"}` 时本轮释放已经完成。
+- `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；Text-CLIP 服务不参与该流程。返回 `{"result":"pass"}` 时本轮释放已经完成。
 - InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
 - 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出 batch 元数据仍写死为 `{1,512}`，或 `scrfd_10g_bnkps.onnx` 的输入/输出 batch 元数据仍固定为单 batch，服务会在受控 runtime copy 中统一修正为动态后再初始化 ORT session；仓库内原始模型文件不会被改写。
 - InsightFace 固定使用新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；若当前 `insightface` 包不支持这组参数，服务会直接失败，不再做兼容重试。
@@ -126,7 +124,6 @@ python -m venv .venv
 $env:API_AUTH_KEY="your_secret_key"
 $env:INFERENCE_DEVICE="CPU"
 $env:CLIP_INFERENCE_DEVICE="CPU"
-$env:TEXT_CLIP_BASE_URL="http://127.0.0.1:8061"
 $env:CLIP_IMAGE_BATCH="8"
 $env:RAPIDOCR_DEVICE="CPU"
 $env:INSIGHTFACE_OV_DEVICE="CPU"
@@ -134,14 +131,14 @@ $env:INSIGHTFACE_BATCH_SIZE="4"
 $env:LOG_LEVEL="INFO"
 ```
 
-4. 先启动独立 Text-CLIP 服务：
+4. 如需使用 `/clip/txt`，先启动独立 Text-CLIP 服务：
 
 ```powershell
 cd text-clip\app
 python server.py
 ```
 
-5. 另开终端启动主服务：
+5. 如需使用主服务接口，再另开终端启动主服务：
 
 ```powershell
 cd app
@@ -201,7 +198,7 @@ cp docker-compose.example.yml docker-compose.yml
 3. 按需调整 `docker-compose.yml`：
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
-- `mt-photos-ai-text-clip` 为独立 CPU 容器，主服务会通过 `TEXT_CLIP_BASE_URL=http://mt-photos-ai-text-clip:8061` 转发 `/clip/txt`
+- `mt-photos-ai-text-clip` 为独立 CPU 容器，直接对外提供 `/clip/txt`
 - 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
 - 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；服务固定单进程，不再提供 worker 数配置项
@@ -225,8 +222,6 @@ docker compose logs -f mt-photos-ai-openvino mt-photos-ai-text-clip
 ### 方式二：docker run
 
 ```bash
-docker network create mt-photos-ai || true
-
 docker build \
   --build-arg APP_UID=$(id -u) \
   --build-arg APP_GID=$(id -g) \
@@ -240,8 +235,8 @@ docker build \
 
 docker run -d \
   --name mt-photos-ai-text-clip \
-  --network mt-photos-ai \
   --init \
+  -p 8061:8061 \
   -e API_AUTH_KEY=mt_photos_ai_extra \
   -e MODEL_PATH=/models \
   -e OV_CACHE_DIR=/cache/openvino \
@@ -251,7 +246,6 @@ docker run -d \
 
 docker run -d \
   --name mt-photos-ai-openvino \
-  --network mt-photos-ai \
   --init \
   -p 8060:8060 \
   --device /dev/dri:/dev/dri \
@@ -260,7 +254,6 @@ docker run -d \
   -e API_AUTH_KEY=mt_photos_ai_extra \
   -e INFERENCE_DEVICE=AUTO \
   -e CLIP_INFERENCE_DEVICE=AUTO \
-  -e TEXT_CLIP_BASE_URL=http://mt-photos-ai-text-clip:8061 \
   -e MODEL_PATH=/models \
   -e CLIP_IMAGE_BATCH=8 \
   -e RAPIDOCR_DEVICE=CPU \
@@ -273,7 +266,7 @@ docker run -d \
   mt-photos-ai-openvino
 ```
 
-如需修改主服务 `PORT`，请同步调整 `-p <host_port>:<container_port>`；若同时调整 Text-CLIP 服务端口，请一并修改 `TEXT_CLIP_BASE_URL`。
+如需修改任一服务的 `PORT`，请同步调整对应的 `-p <host_port>:<container_port>`。
 
 ### 容器内设备检查
 
@@ -366,10 +359,9 @@ docker run --rm -it \
 ```bash
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
-curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
+curl -s -X POST http://127.0.0.1:8061/check -H "api-key: mt_photos_ai_extra"
+curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 ```
-
-其中 `/clip/txt` 仍从主服务入口访问，但会被主服务转发到独立 Text-CLIP 容器。
 
 除 `GET /` 外，业务端点在启用鉴权时都需要携带 `api-key` 请求头。
 

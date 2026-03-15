@@ -1,0 +1,12 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="text-clip/DockerFile-TextCLIP" type="docker-deploy" factoryName="dockerfile" server-name="Docker">
+    <deployment type="dockerfile">
+      <settings>
+        <option name="imageTag" value="molyleaf/mt-photos-ai-textclip:1.0.0" />
+        <option name="containerName" value="" />
+        <option name="sourceFilePath" value="text-clip/DockerFile-TextCLIP" />
+      </settings>
+    </deployment>
+    <method v="2" />
+  </configuration>
+</component>

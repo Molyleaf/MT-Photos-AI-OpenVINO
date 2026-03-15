@@ -9,7 +9,6 @@ PROJECT_ROOT = TEXT_CLIP_ROOT.parent
 
 QA_CLIP_CLIP_PATH_CANDIDATES = (
     PACKAGE_DIR / "QA-CLIP" / "clip",
-    PROJECT_ROOT / "app" / "models" / "QA-CLIP" / "clip",
 )
 
 MODEL_PATH = Path(

@@ -24,10 +24,6 @@ class OCRResult(BaseModel):
     boxes: List[OCRBox]
 
 
-class TextClipRequest(BaseModel):
-    text: str
-
-
 class FacialArea(BaseModel):
     x: int
     y: int

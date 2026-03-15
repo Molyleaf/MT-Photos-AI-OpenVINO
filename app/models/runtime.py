@@ -12,7 +12,6 @@ import openvino as ov
 from transitions import Machine
 
 from .clip_image import ClipImageMixin
-from .clip_text import ClipTextMixin
 from .common import (
     _AdmissionController,
     _FaceInferenceTask,
@@ -214,9 +213,8 @@ class _NonTextFamilyStateMachine:
             self._condition.notify_all()
 
 
-class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
+class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     """
-    Text-CLIP is provided by a dedicated external CPU service.
     Image-CLIP uses a dedicated batch queue after standardized preprocessing.
     Non-text families are lazy-loaded and switch synchronously so only one
     vision/OCR/face family stays resident at a time, with idle release.
@@ -238,7 +236,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._initialize_model_load_locks()
         self._acquire_single_process_lock()
         try:
-            self._initialize_text_clip_client()
             self._initialize_clip_image_state()
             self._initialize_non_text_model_state()
             self._initialize_execution_controls()
@@ -450,7 +447,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_clip=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -461,7 +458,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._ocr_execution_timeout_seconds,
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
-            self._text_clip_base_url,
             _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,

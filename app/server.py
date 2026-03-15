@@ -94,7 +94,6 @@ from models.constants import MODEL_NAME
 from models.runtime import AIModels
 from models.schemas import (
     CheckResponse,
-    TextClipRequest,
     RestartResponse,
 )
 
@@ -217,7 +216,7 @@ async def lifespan(app: FastAPI):
     global models_instance
     _configure_application_logging()
     _startup_self_check_dri()
-    LOGGER.info("应用启动：初始化主 AIModels 实例；/clip/txt 通过独立 Text-CLIP 服务处理，非文本模型按首次请求懒加载。")
+    LOGGER.info("应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。")
     models_instance = AIModels()
 
     yield
@@ -308,7 +307,7 @@ async def check_service():
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
-    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。独立 Text-CLIP 服务保持可用。")
+    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。")
     if models_instance:
         await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}
@@ -360,19 +359,6 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
         return {"result": result_strings}
     except Exception as e:
         LOGGER.error("处理 CLIP 请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
-        return {"result": [], "msg": str(e)}
-
-@app.post("/clip/txt", dependencies=[Depends(get_api_key)])
-async def clip_text_endpoint(request: TextClipRequest):
-    if not models_instance:
-        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
-
-    try:
-        embedding = await models_instance.get_text_embedding_async(request.text)
-        result_strings = [f"{f:.16f}" for f in embedding]
-        return {"result": result_strings}
-    except Exception as e:
-        LOGGER.error("处理 CLIP 文本请求失败: '%s...', 错误: %s", request.text[:50], e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
 @app.post("/represent", dependencies=[Depends(get_api_key)])

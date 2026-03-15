@@ -17,26 +17,25 @@
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
 - Text-CLIP 独立服务入口：`text-clip/app/server.py`。
-- 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
+- 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
-- QA-CLIP 子库：`app/models/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
+- Text-CLIP tokenizer 资源：`text-clip/app/models/QA-CLIP/clip`（保留 `bert_tokenizer.py` 与 `vocab.txt`）。
 - 配置存储：`app/config`。
 - 参考文件（对齐端点用）：`example/`。
 
 ---
 
-## 2. QA-CLIP 子库边界（硬约束）
+## 2. QA-CLIP tokenizer 资源边界（硬约束）
 
-1. `app/models/QA-CLIP` 视为上游镜像目录，默认**禁止功能性改动**。
+1. `text-clip/app/models/QA-CLIP/clip` 当前仅承载 Text-CLIP 所需 tokenizer 与词表资源。
 2. 允许改动仅限：
   - 兼容性修复（Python/OpenVINO/依赖版本适配）
-  - 只优化性能且不改变语义的改动
-3. CLIP 相关依赖必须从 `app/models/QA-CLIP/clip` 引用；禁止继续依赖历史 `/app/clip` 路径。
-4. 当前运行时仍直接依赖 `app/models/QA-CLIP/clip/bert_tokenizer.py` 与 `vocab.txt`；在未迁出 tokenizer 资源前，**禁止整体删除 `app/models/QA-CLIP`**。
-5. 若确需改动 `app/models/QA-CLIP`，必须在提交说明里写清楚：
+  - 只优化性能且不改变 tokenizer 语义的改动
+3. Text-CLIP 若仍引用 QA-CLIP tokenizer 资源，必须从 `text-clip/app/models/QA-CLIP/clip` 引用；禁止继续依赖历史 `/app/clip` 路径。
+4. 若确需改动这些资源，必须在提交说明里写清楚：
   - 改动类型（兼容性 or 性能）
-  - 不改语义的证据（接口/输出维度/精度基线）
+  - 不改语义的证据（分词规则/词表/输出维度基线）
 
 ---
 
@@ -50,7 +49,7 @@
 - 主服务 `/clip/img` 的 OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例、RPC 子服务或文本 tokenizer 运行链。
 - 独立 Text-CLIP 容器固定使用 OpenVINO `CPU`；**禁止**为它保留 GPU Remote Context、`/dev/dri` 依赖或 Intel GPU runtime 裁剪以外的冗余包。
-- 主服务 `/clip/txt` 可保留原端点语义，但实现必须转发到独立 Text-CLIP 服务，不能在主容器内本地推理。
+- 主服务不得再提供 `/clip/txt`；该端点仅允许由独立 Text-CLIP 服务暴露。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
 - `/clip/img` 必须支持 **标准预处理后的受控批处理**：单张请求先完成缩放、中心裁剪与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 聚合成批；批处理不得改变单请求输入输出语义。
@@ -133,7 +132,7 @@
   - 鉴权失败：HTTP 401，`detail="Invalid API key"`
   - 鉴权范围：除 `GET /` 外的所有业务端点
 - 生命周期：
-- 启动时初始化主服务 `AIModels`；`/clip/txt` 依赖独立 Text-CLIP 容器
+- 启动时初始化主服务 `AIModels`
   - 关闭时释放全部模型
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
@@ -181,13 +180,7 @@
 - 成功：`{"result":[<16位小数字符串>...]}`（成功时不返回 `msg`）
 - 异常：`{"result":[],"msg":<异常文本>}`
 
-7. `POST /clip/txt`
-- 入参：`{"text": "..."}`
-- 运行方式：主服务端点允许保留，但必须转发到独立 Text-CLIP 容器；不得在主容器内回退本地推理
-- 成功：`{"result":[<16位小数字符串>...]}`（成功时不返回 `msg`）
-- 异常：`{"result":[],"msg":<异常文本>}`
-
-8. `POST /represent`
+7. `POST /represent`
 - 入参：`file`。
 - 读图失败：`{"result":[],"msg":<错误信息>}`
 - 成功：
@@ -202,19 +195,18 @@
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
 1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例。
-2. `/clip/txt` 不进入 Vision-CLIP / OCR / InsightFace 的任何共享队列。
-3. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
-4. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
-5. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
-6. 非文本模型族切换状态机必须显式建模，当前基线为 `transitions`；禁止再回到多布尔位 + 条件变量拼接出的隐式状态机。状态机事件必须由 `transitions` 绑定或由显式包装器触发，禁止在 model 上预先定义同名 `NotImplementedError` 占位方法覆盖 trigger 入口。
-7. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 5 条把 OCR 与其他非文本模型族并行常驻。
-8. InsightFace 使用独立执行路径；但其准入必须遵守第 5 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
-9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
-10. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 5 条让多个非文本模型族并行常驻。
-11. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
-12. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
-13. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
-14. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
+2. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
+3. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
+4. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
+5. 非文本模型族切换状态机必须显式建模，当前基线为 `transitions`；禁止再回到多布尔位 + 条件变量拼接出的隐式状态机。状态机事件必须由 `transitions` 绑定或由显式包装器触发，禁止在 model 上预先定义同名 `NotImplementedError` 占位方法覆盖 trigger 入口。
+6. RapidOCR 必须拆成检测 / 分类 / 识别三个独立异步阶段；这些阶段是 OCR 模型族内部并行，不得绕开第 4 条把 OCR 与其他非文本模型族并行常驻。
+7. InsightFace 使用独立执行路径；但其准入必须遵守第 4 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
+8. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
+9. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 4 条让多个非文本模型族并行常驻。
+10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
+11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
+12. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
+13. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
 ---
 
@@ -234,7 +226,7 @@
 
 ## 7. AI 常见坏味道（黑名单：硬性禁止）
 
-1. 修改 `app/models/QA-CLIP` 语义代码（非兼容性/纯性能优化）。
+1. 修改 `text-clip/app/models/QA-CLIP/clip` 语义代码（非兼容性/纯性能优化）。
 2. 继续使用 `/app/clip` 旧引用路径。
 3. 把 RapidOCR 回退为 `rapidocr-openvino` 或对其模型私自量化。
 4. 未经说明地变更端点响应字段、`msg` 出现时机、错误处理语义。
@@ -296,14 +288,14 @@
 - `uvicorn server:app --host 0.0.0.0 --port 8061`（在 `text-clip/app/` 目录）
 - 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
 - 如需验证独立 Text-CLIP 服务的 `PORT` / `LOG_LEVEL`，可在 `text-clip/app/` 目录执行 `python server.py`
-- 关键端点冒烟：主服务 `/check`、`/clip/txt`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
+- 关键端点冒烟：主服务 `/check`、`/clip/img`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
 
 ---
 
 ## 11. 最终自检清单（必须逐条勾选）
 
-- [ ] 是否保持 QA-CLIP 子库边界（未做语义改动，或已说明兼容/性能理由）
-- [ ] 是否完全切换到 `app/models/QA-CLIP/clip` 引用路径
+- [ ] 是否保持 Text-CLIP tokenizer 资源边界（未做语义改动，或已说明兼容/性能理由）
+- [ ] 若仍需要 tokenizer 资源，是否完全切换到 `text-clip/app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
@@ -364,9 +356,6 @@
 ```yaml
 services:
   mt-photos-ai-openvino:
-    depends_on:
-      mt-photos-ai-text-clip:
-        condition: service_healthy
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -376,7 +365,6 @@ services:
       - API_AUTH_KEY=mt_photos_ai_extra
       - INFERENCE_DEVICE=AUTO
       - CLIP_INFERENCE_DEVICE=AUTO
-      - TEXT_CLIP_BASE_URL=http://mt-photos-ai-text-clip:8061
       - RAPIDOCR_DEVICE=CPU
       - INSIGHTFACE_OV_DEVICE=AUTO
       - INSIGHTFACE_BATCH_SIZE=4
@@ -400,7 +388,7 @@ services:
 
 说明：
 - `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace EP/PPP 仍收敛到 `GPU`。
-- `mt-photos-ai-text-clip` 固定走 CPU，主服务通过 `TEXT_CLIP_BASE_URL` 转发 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`。
+- `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`。
 - `INSIGHTFACE_BATCH_SIZE` 建议从 `4` 起步；如需调优，优先在保持 `INSIGHTFACE_BATCH_WAIT_MS` 为个位数毫秒的前提下逐步增大，避免明显放大单请求尾延迟。
 - `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
@@ -426,7 +414,6 @@ services:
 
 通过标准：
 - `POST /check` 返回 `{"result":"pass", ...}`。
-- `POST /clip/txt` 成功返回 `768` 维字符串数组（成功无 `msg`）。
 - `POST /clip/img` 成功返回 `768` 维字符串数组（成功无 `msg`）。
 - `POST /ocr` 成功返回 `{"result":{"texts","scores","boxes"}}`（成功无 `msg`）。
 - `POST /represent` 返回 `{"detector_backend":"insightface","recognition_model":"antelopev2","result":[...]}` 或在人脸不存在时 `result=[]`。
@@ -447,7 +434,8 @@ docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPI
 
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
-curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
+curl -s -X POST http://127.0.0.1:8061/check -H "api-key: mt_photos_ai_extra"
+curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 ```
 
 ---
