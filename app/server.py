@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
     global models_instance
     _configure_application_logging()
     _startup_self_check_dri()
-    LOGGER.info("应用启动：初始化 AIModels 实例并启动常驻 Text-CLIP 服务；非文本模型按首次请求懒加载。")
+    LOGGER.info("应用启动：初始化主 AIModels 实例；/clip/txt 通过独立 Text-CLIP 服务处理，非文本模型按首次请求懒加载。")
     models_instance = AIModels()
 
     yield
@@ -308,7 +308,7 @@ async def check_service():
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
-    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。常驻 Text-CLIP 保持可用。")
+    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。独立 Text-CLIP 服务保持可用。")
     if models_instance:
         await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}

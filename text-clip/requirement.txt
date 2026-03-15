@@ -1,0 +1,6 @@
+numpy==2.3.5
+fastapi
+pydantic
+openvino
+uvicorn
+six

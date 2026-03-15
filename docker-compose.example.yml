@@ -2,10 +2,16 @@ services:
   mt-photos-ai-openvino:
     # 按需替换为你实际发布的镜像标签。
     image: mt-photos-ai-openvino:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: mt-photos-ai-openvino
     init: true
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      mt-photos-ai-text-clip:
+        condition: service_healthy
     ports:
       - "${PORT:-8060}:${PORT:-8060}"
     group_add:
@@ -18,6 +24,7 @@ services:
       API_AUTH_KEY: "mt_photos_ai_extra"
       INFERENCE_DEVICE: "AUTO"
       CLIP_INFERENCE_DEVICE: "AUTO"
+      TEXT_CLIP_BASE_URL: "http://mt-photos-ai-text-clip:8061"
       MODEL_PATH: "/models"
       INFERENCE_QUEUE_MAX_SIZE: "10"
       INFERENCE_TASK_TIMEOUT: "10"
@@ -49,4 +56,24 @@ services:
     devices:
       # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。
       - /dev/dri:/dev/dri
+    restart: unless-stopped
+
+  mt-photos-ai-text-clip:
+    # Text-CLIP 独立容器固定走 CPU，不需要 /dev/dri。
+    image: mt-photos-ai-text-clip:latest
+    build:
+      context: .
+      dockerfile: text-clip/DockerFile-TextCLIP
+    container_name: mt-photos-ai-text-clip
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8061"
+    environment:
+      API_AUTH_KEY: "mt_photos_ai_extra"
+      MODEL_PATH: "/models"
+      OV_CACHE_DIR: "/cache/openvino"
+      PORT: "8061"
+      LOG_LEVEL: "WARNING"
     restart: unless-stopped

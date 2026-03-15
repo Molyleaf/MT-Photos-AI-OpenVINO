@@ -56,15 +56,14 @@ RUN set -eux; \
     chmod 777 /cache; \
     chown -R appuser:appgroup /app /models
 
-COPY --chown=appuser:appgroup models/qa-clip/openvino /models/qa-clip/openvino
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image_fp16.xml /models/qa-clip/openvino/openvino_image_fp16.xml
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image_fp16.bin /models/qa-clip/openvino/openvino_image_fp16.bin
 COPY --chown=appuser:appgroup models/insightface/models/antelopev2 /models/insightface/models/antelopev2
 COPY --chown=appuser:appgroup models/rapidocr /models/rapidocr
 
 RUN set -eux; \
     test -f /models/qa-clip/openvino/openvino_image_fp16.xml; \
     test -f /models/qa-clip/openvino/openvino_image_fp16.bin; \
-    test -f /models/qa-clip/openvino/openvino_text_fp16.xml; \
-    test -f /models/qa-clip/openvino/openvino_text_fp16.bin; \
     test -f /models/insightface/models/antelopev2/glintr100.onnx; \
     test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx; \
     test -f /models/rapidocr/ch_PP-OCRv5_mobile_det.onnx; \

@@ -216,7 +216,7 @@ class _NonTextFamilyStateMachine:
 
 class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     """
-    Text-CLIP stays resident as a single-threaded singleton service.
+    Text-CLIP is provided by a dedicated external CPU service.
     Image-CLIP uses a dedicated batch queue after standardized preprocessing.
     Non-text families are lazy-loaded and switch synchronously so only one
     vision/OCR/face family stays resident at a time, with idle release.
@@ -238,14 +238,13 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._initialize_model_load_locks()
         self._acquire_single_process_lock()
         try:
-            self._initialize_text_clip_state()
+            self._initialize_text_clip_client()
             self._initialize_clip_image_state()
             self._initialize_non_text_model_state()
             self._initialize_execution_controls()
             self._initialize_non_text_family_state()
             self._start_clip_image_worker()
             self._start_face_batch_service()
-            self._ensure_text_service_ready(preload=True)
             self._start_background_services()
             self._log_ready()
         except Exception:
@@ -313,23 +312,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         lock = getattr(self, "_single_process_lock", None)
         if lock is not None:
             lock.release()
-
-    def _initialize_text_clip_state(self) -> None:
-        self._clip_text_model: Optional[ov.CompiledModel] = None
-        self._clip_text_request: Optional[ov.InferRequest] = None
-        self._clip_text_host_input_cache: Dict[
-            int, tuple[ov.Tensor, Any, ov.Tensor, Any]
-        ] = {}
-        self._clip_text_host_tensor_enabled = self._clip_remote_context is not None
-        self._clip_text_lock = threading.Lock()
-        self._text_service_meta_path = self._runtime_state_dir / "text-clip-service.json"
-        self._text_service_lock = _InterProcessFileLock(
-            self._runtime_state_dir / "text-clip-service.lock"
-        )
-        self._text_service_owner = False
-        self._text_service_server = None
-        self._text_service_thread: Optional[threading.Thread] = None
-        self._text_service_port: Optional[int] = None
 
     def _initialize_clip_image_state(self) -> None:
         self._clip_vision_model: Optional[ov.CompiledModel] = None
@@ -468,7 +450,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_service=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
+            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms text_clip=%s ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_budget=%s face_batch=%s/%sms face_admission=%s",
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -479,7 +461,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._ocr_execution_timeout_seconds,
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
-            "owner" if self._text_service_owner else "client",
+            self._text_clip_base_url,
             _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
@@ -1002,15 +984,7 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         finally:
             lock.release()
 
-    def _unload_text_model_locked(self) -> None:
-        self._clip_text_request = None
-        self._clip_text_model = None
-        self._clip_text_host_input_cache.clear()
-        self._text_service_port = None
-        gc.collect()
-
     def _unload_everything_locked(self) -> None:
-        self._unload_text_model_locked()
         self._unload_clip_vision_model_locked()
         self._unload_rapidocr_model_locked()
         self._unload_face_model_locked()
@@ -1199,7 +1173,6 @@ class AIModels(ClipTextMixin, ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             ):
                 executor.shutdown(wait=True, cancel_futures=True)
 
-            self._shutdown_text_service()
             with self._model_lock:
                 self._unload_everything_locked()
             LOG.info("All models released.")

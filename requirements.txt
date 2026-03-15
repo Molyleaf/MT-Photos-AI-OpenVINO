@@ -9,5 +9,4 @@ onnxruntime-openvino
 uvicorn
 python-multipart
 pyyaml
-six
 transitions

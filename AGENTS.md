@@ -15,8 +15,9 @@
 - 语言与运行时：**Python 3.12**（目标平台：Windows Server + Debian 13 容器）。
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 使用 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
-- 服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
-- 模型编排：`app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）。
+- 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
+- Text-CLIP 独立服务入口：`text-clip/app/server.py`。
+- 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_text.py`、`clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
 - QA-CLIP 子库：`app/models/QA-CLIP`（来自 TencentARC-QQ 官方仓库）。
@@ -45,8 +46,11 @@
 
 - 模型固定为：`TencentARC/QA-CLIP-ViT-L-14`。
 - 向量维度固定：`768`。
-- 推理目标设备：`GPU`（Intel Xe 核显），优先减少 Host<->Device 数据搬运。
-- OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
+- 主服务 `/clip/img` 推理目标设备：`GPU`（Intel Xe 核显），优先减少 Host<->Device 数据搬运。
+- 主服务 `/clip/img` 的 OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
+- Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例、RPC 子服务或文本 tokenizer 运行链。
+- 独立 Text-CLIP 容器固定使用 OpenVINO `CPU`；**禁止**为它保留 GPU Remote Context、`/dev/dri` 依赖或 Intel GPU runtime 裁剪以外的冗余包。
+- 主服务 `/clip/txt` 可保留原端点语义，但实现必须转发到独立 Text-CLIP 服务，不能在主容器内本地推理。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
 - `/clip/img` 必须支持 **标准预处理后的受控批处理**：单张请求先完成缩放、中心裁剪与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 聚合成批；批处理不得改变单请求输入输出语义。
@@ -95,7 +99,7 @@
 - OCR 必须提供应用层有界准入；执行超时后必须先触发协作取消，再等待已受理任务退场，禁止把超时任务脱离调用方继续在后台无界堆积。
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
-- 默认应在连续 `60s` 未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace，只保留 Text-CLIP；允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
+- 默认应在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 容器不参与这一路径。允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
 
 ### 3.4 InsightFace
 
@@ -129,12 +133,12 @@
   - 鉴权失败：HTTP 401，`detail="Invalid API key"`
   - 鉴权范围：除 `GET /` 外的所有业务端点
 - 生命周期：
-- 启动时初始化 `AIModels` 并启动常驻的 Text-CLIP 单例服务
+- 启动时初始化主服务 `AIModels`；`/clip/txt` 依赖独立 Text-CLIP 容器
   - 关闭时释放全部模型
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
 - 服务必须固定为**单进程**；禁止继续暴露 `WEB_CONCURRENCY` 一类 worker 配置项，也禁止让第二个服务进程在同一工作目录下成功启动。
-- Text-CLIP 常驻内存并保持单线程后台实例；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。
+- 主容器不得常驻 Text-CLIP 模型；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。独立 Text-CLIP 容器常驻其自身模型即可。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
@@ -179,6 +183,7 @@
 
 7. `POST /clip/txt`
 - 入参：`{"text": "..."}`
+- 运行方式：主服务端点允许保留，但必须转发到独立 Text-CLIP 容器；不得在主容器内回退本地推理
 - 成功：`{"result":[<16位小数字符串>...]}`（成功时不返回 `msg`）
 - 异常：`{"result":[],"msg":<异常文本>}`
 
@@ -196,7 +201,7 @@
 
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
-1. Text-CLIP 作为独立单例服务常驻内存，始终保持单线程后台实例。
+1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例。
 2. `/clip/txt` 不进入 Vision-CLIP / OCR / InsightFace 的任何共享队列。
 3. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
 4. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
@@ -207,7 +212,7 @@
 9. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
 10. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 5 条让多个非文本模型族并行常驻。
 11. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
-12. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；常驻 Text-CLIP 服务保持可用，除非进程关闭或 `/restart_v2`。
+12. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
 13. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
 14. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
@@ -218,7 +223,7 @@
 - 推荐结构：**单进程 FastAPI 异步服务 + 有界批队列/阶段执行器**。
 - 禁止在单进程无限堆线程“硬顶并行度”。
 - 必须在运行时对单进程做硬约束；同一工作目录下的第二个服务进程必须因运行锁直接失败，而不是并行持有另一份非文本模型。
-- 非文本模型族准入必须显式串行化，确保“单活模型族 + 常驻 Text-CLIP”的内存上界可控。
+- 非文本模型族准入必须显式串行化，确保“单活模型族 + 独立 Text-CLIP 容器”的内存上界可控。
 - 必须控制总并行度：
   - `总并行度 = 各阶段执行器线程数之和`
 - 原因：
@@ -271,6 +276,7 @@
   - `AGENTS.md`
   - `README.md`
   - `requirements.txt`
+  - `text-clip/requirement.txt`（若改动独立 Text-CLIP 容器）
 - 若引入/调整 RapidOCR OpenVINO 参数文件，需提供示例 `cfg_openvino_cpu.yaml` 并说明关键参数（含设备与批量策略）。
 
 ---
@@ -281,12 +287,16 @@
 - `python -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`
+- `python -m compileall text-clip/app`
 - `python -m compileall scripts`
 - `docker build -t mt-photos-ai-openvino .`
+- `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
+- `uvicorn server:app --host 0.0.0.0 --port 8061`（在 `text-clip/app/` 目录）
 - 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
-- 关键端点冒烟：`/check`、`/clip/txt`、`/ocr`、`/represent`
+- 如需验证独立 Text-CLIP 服务的 `PORT` / `LOG_LEVEL`，可在 `text-clip/app/` 目录执行 `python server.py`
+- 关键端点冒烟：主服务 `/check`、`/clip/txt`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
 
 ---
 
@@ -299,10 +309,10 @@
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
 - [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO（当前固定走库内原生 CPU 路径）+ PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP
-- [ ] 是否遵守“Text-CLIP 独立常驻单例 + 非文本单模型族串行切换”策略
+- [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
 - [ ] 是否保持 OCR 默认懒加载，且显式预热后会立即释放
 - [ ] 是否采用单进程 FastAPI 异步服务 + 有界批队列/阶段执行器，并规避线程过度订阅
-- [ ] 是否同步更新 `README.md` 与 `requirements.txt`
+- [ ] 是否同步更新 `README.md`、`requirements.txt` 与 `text-clip/requirement.txt`
 
 ---
 
@@ -330,11 +340,13 @@
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
 - 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，以及 Python/OpenCV 运行时基础库 `ca-certificates`、`libglib2.0-0`、`libgomp1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
+- 独立 Text-CLIP 镜像固定使用 CPU；其基线依赖仅保留 Python/OpenVINO CPU 运行所需最小集合，不安装 Intel GPU runtime，也不映射 `/dev/dri`。
 - Docker 构建阶段在 `pip install -r requirements.txt` 后，必须移除传递安装的 GUI 版 OpenCV（至少 `opencv-python`，如存在也移除 `opencv-contrib-python`），清理 pip 缓存，并显式安装 `opencv-python-headless`。
 - 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 OpenCL/`warpAffine` 路径，镜像默认不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
+- 主服务镜像不再打包 `openvino_text_fp16.*`；这些文件仅应进入独立 Text-CLIP 镜像。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - 启动阶段必须增加 `/dev/dri` 自检：请求 GPU 推理时，`/dev/dri` 不可用则直接报错并终止启动。
@@ -352,6 +364,9 @@
 ```yaml
 services:
   mt-photos-ai-openvino:
+    depends_on:
+      mt-photos-ai-text-clip:
+        condition: service_healthy
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -361,6 +376,7 @@ services:
       - API_AUTH_KEY=mt_photos_ai_extra
       - INFERENCE_DEVICE=AUTO
       - CLIP_INFERENCE_DEVICE=AUTO
+      - TEXT_CLIP_BASE_URL=http://mt-photos-ai-text-clip:8061
       - RAPIDOCR_DEVICE=CPU
       - INSIGHTFACE_OV_DEVICE=AUTO
       - INSIGHTFACE_BATCH_SIZE=4
@@ -373,10 +389,18 @@ services:
       - NON_TEXT_IDLE_RELEASE_SECONDS=60
       - PORT=8060
       - LOG_LEVEL=WARNING
+  mt-photos-ai-text-clip:
+    environment:
+      - API_AUTH_KEY=mt_photos_ai_extra
+      - MODEL_PATH=/models
+      - OV_CACHE_DIR=/cache/openvino
+      - PORT=8061
+      - LOG_LEVEL=WARNING
 ```
 
 说明：
 - `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace EP/PPP 仍收敛到 `GPU`。
+- `mt-photos-ai-text-clip` 固定走 CPU，主服务通过 `TEXT_CLIP_BASE_URL` 转发 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`。
 - `INSIGHTFACE_BATCH_SIZE` 建议从 `4` 起步；如需调优，优先在保持 `INSIGHTFACE_BATCH_WAIT_MS` 为个位数毫秒的前提下逐步增大，避免明显放大单请求尾延迟。
 - `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
@@ -418,6 +442,7 @@ services:
 docker compose up -d --build
 docker compose ps
 docker compose logs --tail=200 mt-photos-ai-openvino
+docker compose logs --tail=200 mt-photos-ai-text-clip
 docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU
 
 curl -s http://127.0.0.1:8060/
