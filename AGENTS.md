@@ -106,22 +106,22 @@
 
 - 固定为 **ONNX Runtime + OpenVINO Execution Provider**。
 - 识别模型固定为 `antelopev2`；禁止切回 `buffalo_l`。
-- InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时；当 `AUTO` 且 GPU 可见时，运行时必须显式收敛到 `GPU`，并在日志里输出 `configured_device/runtime_device/provider_runtime`。
+- InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时；当 `AUTO` 且 GPU 可见时，运行时必须显式收敛到 `GPU`，并在日志里输出 `configured_device/runtime_device/preprocess_device/provider_runtime`。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
 - 必须固定到新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；禁止 compat dataclass、构造参数重试、source fallback、`set_providers` 后置修正。
 - InsightFace 运行时模型目录固定为 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；禁止再维护额外的兼容目录、双 root 或 source/runtime 回退。
-- InsightFace 必须支持 `INSIGHTFACE_OV_DEVICE=GPU|CPU|AUTO` 三种显式运行模式；`GPU` 模式走 OpenCV OpenCL + PPP，`CPU` 模式走 OpenCV CPU + PPP，二者都必须保持 OpenVINOExecutionProvider 为首位 provider。
+- InsightFace 必须支持 `INSIGHTFACE_OV_DEVICE=GPU|CPU|AUTO` 三种显式推理模式；无论推理设备取值为何，仓库内预处理（`resize/letterbox/align + PPP`）都必须固定走 CPU，其中 OpenCV CPU 路径负责缩放/对齐，OpenVINO PPP 固定编译到 `CPU`，且 OpenVINOExecutionProvider 必须保持首位 provider。
 - `/represent` 当前固定为**单个 detector/recognition lane**；允许扩的是检测前 resize/letterbox 与按请求分组的人脸对齐预处理并行度，禁止把 ORT/OpenVINO detection/recognition backend 直接扩成多 lane。
 - `/represent` 应用层准入与微批上限当前固定收敛为 `4`；若共享图片总名额更小，则继续受共享名额池截断。
-- InsightFace 预处理执行器当前固定收敛为 `4` 个 worker 上限，并继续复用 `GPU=OpenCV OpenCL + PPP` / `CPU=OpenCV CPU + PPP` 路径；禁止再暴露与单 lane 事实不一致的 `INSIGHTFACE_MAX_WORKERS`、`INSIGHTFACE_MAX_CONCURRENT_REQUESTS`、`INSIGHTFACE_BATCH_SIZE` 一类环境变量。
-- 同一张输入图的对齐阶段必须复用单次准备后的源图对象；GPU 模式复用单次上传后的 OpenCL/UMat，CPU 模式复用同一份连续 `numpy` 源图，禁止重复拷贝链。
+- InsightFace 预处理执行器当前固定收敛为 `4` 个 worker 上限，并继续复用 `OpenCV CPU + OpenVINO PPP(CPU)` 路径；禁止再暴露与单 lane 事实不一致的 `INSIGHTFACE_MAX_WORKERS`、`INSIGHTFACE_MAX_CONCURRENT_REQUESTS`、`INSIGHTFACE_BATCH_SIZE` 一类环境变量。
+- 同一张输入图的对齐阶段必须复用单次准备后的连续 `numpy BGR` 源图对象，禁止重复拷贝链。
 - InsightFace 五点对齐仿射矩阵必须由仓库内本地实现生成，禁止继续依赖 `insightface.utils.face_align.estimate_norm` 内部已弃用的 `SimilarityTransform.estimate` 路径。
 - 检测/识别模型输入的归一化与通道转换必须使用 OpenVINO PrePostProcessing (PPP) API，禁止继续依赖 `cv2.dnn.blobFromImage(s)`。
 - 当 `antelopev2/glintr100.onnx` 输出元数据仍声明静态 `{1,512}` 时，运行时必须在受控 runtime root 中把识别输出 batch 维修正为动态后再初始化 ORT session；禁止通过退回逐张识别来规避 `VerifyOutputSizes` warning。
 - SCRFD detector 的动态 batch 扁平输出若来自 `Transpose(...)+Reshape(-1,C)` 头部，仓库内解包逻辑必须先恢复 `spatial x batch x anchors x channels`，再还原到 `batch x items x channels`；禁止把输出直接当成 `[batch * items, C]` 处理，否则会造成 `/represent` 微批中的框/关键点串位。
 - FaceAnalysis 仅用于模型发现、provider 管理与 session 生命周期；检测/对齐/识别链路必须在仓库内本地显式编排，严禁 monkey patch `insightface` 模块或模型实例方法。
-- `/represent` 必须提供应用层有界准入、单 lane GPU 执行 worker、有限预处理 worker 与专用有界批队列；允许跨请求聚合识别批并平滑调度检测，但不得改变单请求响应语义、字段和错误处理规则。
+- `/represent` 必须提供应用层有界准入、单 lane OpenVINO EP 执行 worker、有限预处理 worker 与专用有界批队列；允许跨请求聚合识别批并平滑调度检测，但不得改变单请求响应语义、字段和错误处理规则。
 
 ---
 
@@ -341,7 +341,7 @@
 - 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，以及 Python/OpenCV 运行时基础库 `ca-certificates`、`libglib2.0-0`、`libgomp1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 独立 Text-CLIP 镜像固定使用 CPU；其基线依赖仅保留 Python/OpenVINO CPU 运行所需最小集合，不安装 Intel GPU runtime，也不映射 `/dev/dri`。
 - Docker 构建阶段在 `pip install -r requirements.txt` 后，必须移除传递安装的 GUI 版 OpenCV（至少 `opencv-python`，如存在也移除 `opencv-contrib-python`），清理 pip 缓存，并显式安装 `opencv-python-headless`。
-- 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 OpenCL/`warpAffine` 路径，镜像默认不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
+- 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 CPU `resize`/`warpAffine` 路径，镜像默认不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
@@ -374,7 +374,6 @@ services:
       - CLIP_INFERENCE_DEVICE=AUTO
       - RAPIDOCR_DEVICE=CPU
       - INSIGHTFACE_OV_DEVICE=AUTO
-      - OPENCV_OPENCL_DEVICE=Intel:GPU:0
       - CLIP_IMAGE_BATCH=8
       - INFERENCE_QUEUE_MAX_SIZE=10
       - INFERENCE_TASK_TIMEOUT=10
@@ -393,9 +392,9 @@ services:
 ```
 
 说明：
-- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace EP/PPP 仍收敛到 `GPU`。
+- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace 仅推理侧 EP 会收敛到 `GPU`，仓库内预处理固定走 `CPU`。
 - `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`。
-- `/represent` 当前固定为单 lane GPU + 4 请求微批预算 + 4 路预处理 worker；如需权衡吞吐与尾延迟，只允许小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不要重新引入额外的 worker/batch 容量环境变量。
+- `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求微批预算 + 4 路 CPU 预处理 worker；如需权衡吞吐与尾延迟，只允许小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不要重新引入额外的 worker/batch 容量环境变量。
 - `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
@@ -426,7 +425,7 @@ services:
 
 失败判定（任一命中即失败）：
 - 日志出现 `No silent fallback is allowed`（排除主动构造失败用例）。
-- 日志出现 `OpenCL is unavailable` 或非 Intel OpenCL 设备错误。
+- 日志显示 `preprocess_device` 非 `CPU`，或 `ppp_execution_devices` 未收敛到 `CPU`。
 - 日志出现 `provider validation failed` 或 `OpenVINOExecutionProvider` 非首位。
 
 #### D. 回归脚本建议（最小）

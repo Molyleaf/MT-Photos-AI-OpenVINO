@@ -30,11 +30,9 @@ from .common import (
     _as_bool,
     _as_contiguous_bgr_uint8,
     _as_int,
-    _ensure_intel_opencl_device,
     _get_compiled_model_execution_devices,
     _normalize_non_text_openvino_device,
     _resolve_non_text_openvino_runtime_device,
-    _to_opencv_umat,
     _to_channel_triplet,
 )
 from .constants import INFERENCE_DEVICE, INSIGHTFACE_SINGLE_LANE, LOG, MODEL_NAME
@@ -184,7 +182,6 @@ class InsightFaceMixin(ABC):
     _face_worker: Optional[threading.Thread]
     _face_preprocess_executor: ThreadPoolExecutor
     _face_preprocess_device: Optional[str]
-    _face_use_opencl: bool
     _execution_timeout_seconds: int
 
     @abstractmethod
@@ -255,22 +252,11 @@ class InsightFaceMixin(ABC):
 
     def _configure_insightface_preprocess_backend(self, device_name: str) -> None:
         normalized_device = str(device_name or "").strip().upper()
-        use_opencl = normalized_device == "GPU"
-        if use_opencl:
-            name, vendor = _ensure_intel_opencl_device("InsightFace preprocessing/alignment")
-            LOG.info(
-                "InsightFace preprocessing backend: device=%s OpenCV=OpenCL(%s / %s) OpenVINO_PPP=true",
-                normalized_device,
-                name,
-                vendor,
-            )
-        else:
-            LOG.info(
-                "InsightFace preprocessing backend: device=%s OpenCV=CPU OpenVINO_PPP=true",
-                normalized_device or "CPU",
-            )
-        self._face_preprocess_device = normalized_device or "CPU"
-        self._face_use_opencl = use_opencl
+        self._face_preprocess_device = "CPU"
+        LOG.info(
+            "InsightFace preprocessing backend: provider_device=%s OpenCV=CPU(threaded/vectorized) OpenVINO_PPP=CPU",
+            normalized_device or "CPU",
+        )
 
     def _align_face(
         self,
@@ -285,46 +271,19 @@ class InsightFaceMixin(ABC):
                 f"{matrix.shape}"
             )
 
-        if self._face_use_opencl:
-            if not cv2.ocl.useOpenCL():
-                raise RuntimeError(
-                    "OpenCV OpenCL was disabled during InsightFace GPU alignment. "
-                    "No silent fallback is allowed."
-                )
-            if isinstance(img, cv2.UMat):
-                source = img
-            else:
-                source = _to_opencv_umat(
-                    _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
-                )
-            try:
-                warped = cv2.warpAffine(
-                    source,
-                    cast(Any, matrix),
-                    (int(image_size), int(image_size)),
-                    borderValue=0.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "OpenCV OpenCL warpAffine failed in InsightFace GPU alignment. "
-                    "No silent fallback is allowed."
-                ) from exc
-
-            aligned = warped.get() if isinstance(warped, cv2.UMat) else np.asarray(warped)
-        else:
-            source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
-            try:
-                aligned = cv2.warpAffine(
-                    source,
-                    cast(Any, matrix),
-                    (int(image_size), int(image_size)),
-                    flags=cv2.INTER_LINEAR,
-                    borderValue=0.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "OpenCV CPU warpAffine failed in InsightFace CPU alignment."
-                ) from exc
+        source = _as_contiguous_bgr_uint8(img, context="InsightFace alignment")
+        try:
+            aligned = cv2.warpAffine(
+                source,
+                cast(Any, matrix),
+                (int(image_size), int(image_size)),
+                flags=cv2.INTER_LINEAR,
+                borderValue=0.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenCV CPU warpAffine failed in InsightFace CPU alignment."
+            ) from exc
 
         return _as_contiguous_bgr_uint8(aligned, context="InsightFace alignment")
 
@@ -346,50 +305,24 @@ class InsightFaceMixin(ABC):
         det_scale = float(new_height) / float(image.shape[0])
 
         try:
-            if self._face_use_opencl:
-                if not cv2.ocl.useOpenCL():
-                    raise RuntimeError(
-                        "OpenCV OpenCL was disabled during InsightFace GPU detector preprocessing. "
-                        "No silent fallback is allowed."
-                    )
-                source_frame = _to_opencv_umat(image)
-                resized = cv2.resize(
-                    source_frame,
-                    (new_width, new_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                det_frame = cv2.copyMakeBorder(
-                    resized,
-                    0,
-                    int(input_size[1] - new_height),
-                    0,
-                    int(input_size[0] - new_width),
-                    cv2.BORDER_CONSTANT,
-                    value=(0, 0, 0),
-                )
-                detector_input = (
-                    det_frame.get() if isinstance(det_frame, cv2.UMat) else np.asarray(det_frame)
-                )
-            else:
-                source_frame = image
-                resized = cv2.resize(
-                    image,
-                    (new_width, new_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                detector_input = cv2.copyMakeBorder(
-                    resized,
-                    0,
-                    int(input_size[1] - new_height),
-                    0,
-                    int(input_size[0] - new_width),
-                    cv2.BORDER_CONSTANT,
-                    value=(0, 0, 0),
-                )
+            source_frame = image
+            resized = cv2.resize(
+                image,
+                (new_width, new_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            detector_input = cv2.copyMakeBorder(
+                resized,
+                0,
+                int(input_size[1] - new_height),
+                0,
+                int(input_size[0] - new_width),
+                cv2.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
         except Exception as exc:
-            backend = "GPU/OpenCL" if self._face_use_opencl else "CPU"
             raise RuntimeError(
-                f"OpenCV {backend} detector resize/letterbox failed in InsightFace preprocessing."
+                "OpenCV CPU detector resize/letterbox failed in InsightFace preprocessing."
             ) from exc
 
         return _PreparedInsightFaceImage(
@@ -801,10 +734,11 @@ class InsightFaceMixin(ABC):
 
         det_width, det_height = map(int, det_model.input_size)
         rec_width, rec_height = map(int, rec_model.input_size)
+        preprocess_device = "CPU"
 
         self._face_det_ppp = self._build_openvino_preprocess_runner(
             runner_name="insightface_det",
-            device_name=device_name,
+            device_name=preprocess_device,
             output_height=det_height,
             output_width=det_width,
             mean_values=_to_channel_triplet(getattr(det_model, "input_mean", 127.5)),
@@ -812,7 +746,7 @@ class InsightFaceMixin(ABC):
         )
         self._face_rec_ppp = self._build_openvino_preprocess_runner(
             runner_name="insightface_rec",
-            device_name=device_name,
+            device_name=preprocess_device,
             output_height=rec_height,
             output_width=rec_width,
             mean_values=_to_channel_triplet(getattr(rec_model, "input_mean", 127.5)),
@@ -820,8 +754,8 @@ class InsightFaceMixin(ABC):
         )
         self._configure_insightface_preprocess_backend(device_name)
         LOG.info(
-            "InsightFace preprocessing configured: OpenCV(%s) + OpenVINO PPP.",
-            "OpenCL" if self._face_use_opencl else "CPU",
+            "InsightFace preprocessing configured: OpenCV(CPU) + OpenVINO PPP(%s).",
+            preprocess_device,
         )
 
     def _resolve_insightface_source_model_dir(self) -> Path:
@@ -1253,7 +1187,6 @@ class InsightFaceMixin(ABC):
             self._face_det_ppp = None
             self._face_rec_ppp = None
             self._face_preprocess_device = None
-            self._face_use_opencl = False
             raise
 
     @staticmethod
@@ -1387,7 +1320,6 @@ class InsightFaceMixin(ABC):
         self._face_det_ppp = None
         self._face_rec_ppp = None
         self._face_preprocess_device = None
-        self._face_use_opencl = False
 
     def _unload_face_model(self) -> None:
         with self._face_load_lock:
@@ -1422,10 +1354,11 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s preprocess_device=%s provider_options=%s provider_runtime=%s ppp_execution_devices=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
+                self._face_preprocess_device or "CPU",
                 provider_options,
                 runtime.provider_runtime,
                 runtime.ppp_execution_devices,
@@ -1443,7 +1376,6 @@ class InsightFaceMixin(ABC):
             self._face_det_ppp = None
             self._face_rec_ppp = None
             self._face_preprocess_device = None
-            self._face_use_opencl = False
             raise RuntimeError(
                 "InsightFace must run with OpenVINOExecutionProvider + OpenCV resize/alignment + OpenVINO PPP. "
                 "No silent fallback is allowed."

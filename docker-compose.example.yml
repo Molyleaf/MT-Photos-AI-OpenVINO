@@ -46,7 +46,6 @@ services:
       RAPIDOCR_REC_BATCH_NUM: "8"
       RAPIDOCR_CLS_BATCH_NUM: "8"
       INSIGHTFACE_OV_DEVICE: "AUTO"
-      OPENCV_OPENCL_DEVICE: "Intel:GPU:0"
       PORT: "8060"
       LOG_LEVEL: "WARNING"
     devices:

@@ -41,7 +41,7 @@ def _parse_args() -> argparse.Namespace:
         "--device",
         choices=("CPU", "GPU"),
         default="CPU",
-        help="OpenVINOExecutionProvider device_type for InsightFace.",
+        help="OpenVINOExecutionProvider device_type for InsightFace inference.",
     )
     return parser.parse_args()
 
@@ -459,6 +459,11 @@ def main() -> int:
             face_app,
             expected_device_type=ARGS.device,
         )
+        if models._face_preprocess_device != "CPU":
+            raise RuntimeError(
+                "InsightFace preprocessing must stay on CPU, "
+                f"got preprocess_device={models._face_preprocess_device!r}"
+            )
         local_results = asyncio.run(_collect_local_results(models, sample_images))
         concurrent_results = asyncio.run(_collect_local_results_concurrent(models, sample_images))
         native_results = [face_app.get(image.copy(), max_num=0) for image in sample_images]
@@ -513,7 +518,6 @@ def main() -> int:
             "device": ARGS.device,
             "provider_runtime": provider_runtime,
             "preprocess_device": models._face_preprocess_device,
-            "preprocess_use_opencl": bool(models._face_use_opencl),
             "face_runtime": {
                 "lane": 1,
                 "preprocess_workers": models._face_preprocess_worker_count,

@@ -5,9 +5,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Literal, Optional, Tuple, cast
-
-import cv2
+from typing import Any, Callable, List, Literal, Optional, Tuple
 import numpy as np
 import openvino as ov
 
@@ -259,27 +257,6 @@ def _openvino_device_expr_requests_npu(device_expr: str) -> bool:
     return any(token.startswith("NPU") for token in _split_openvino_device_expr(normalized))
 
 
-def _ensure_intel_opencl_device(feature_name: str) -> Tuple[str, str]:
-    cv2.ocl.setUseOpenCL(True)
-    if not cv2.ocl.haveOpenCL() or not cv2.ocl.useOpenCL():
-        raise RuntimeError(
-            f"{feature_name} requires OpenCV OpenCL, but OpenCL is unavailable. "
-            "No silent fallback is allowed."
-        )
-
-    device = cv2.ocl.Device.getDefault()
-    vendor = str(device.vendorName())
-    name = str(device.name())
-    if "INTEL" not in vendor.upper():
-        raise RuntimeError(
-            f"{feature_name} requires Intel OpenCL device. "
-            f"Current OpenCL device: {name} ({vendor}). "
-            "Set OPENCV_OPENCL_DEVICE to Intel GPU and retry. "
-            "No silent fallback is allowed."
-        )
-    return name, vendor
-
-
 def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
     normalized = str(value).strip().lower()
     if normalized in {"max", "min"}:
@@ -288,20 +265,16 @@ def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
 
 
 def _as_contiguous_bgr_uint8(image: Any, context: str) -> np.ndarray:
-    if isinstance(image, cv2.UMat):
-        image = image.get()
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f"{context} expects BGR image with shape (H, W, 3), got {image.shape}")
-    if image.dtype != np.uint8:
-        image = image.astype(np.uint8, copy=False)
-    if image.flags.c_contiguous:
-        return image
-    return np.ascontiguousarray(image)
-
-
-def _to_opencv_umat(image: np.ndarray) -> cv2.UMat:
-    # OpenCV Python accepts ndarray-backed UMat construction, but current stubs miss that overload.
-    return cv2.UMat(cast(Any, image))
+    image_array = np.asarray(image)
+    if image_array.ndim != 3 or image_array.shape[2] != 3:
+        raise ValueError(
+            f"{context} expects BGR image with shape (H, W, 3), got {image_array.shape}"
+        )
+    if image_array.dtype != np.uint8:
+        image_array = image_array.astype(np.uint8, copy=False)
+    if image_array.flags.c_contiguous:
+        return image_array
+    return np.ascontiguousarray(image_array)
 
 
 def _to_channel_triplet(value: Any) -> List[float]:

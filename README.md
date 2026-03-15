@@ -56,11 +56,10 @@
 | `OCR_PREWARM_ENABLED`               | 是否启用一次性后台 RapidOCR 预热；预热完成后会立即释放 OCR 模型                 | `false`                             |
 | `OCR_PREWARM_DELAY_SECONDS`         | RapidOCR 一次性后台预热延迟（秒）；仅在 `OCR_PREWARM_ENABLED=true` 时生效      | `1.0`                               |
 | `NON_TEXT_IDLE_RELEASE_SECONDS`     | 60 秒未收到业务请求时自动释放 Vision-CLIP / OCR / InsightFace；`<=0` 表示关闭 | `60`                                |
-| `INSIGHTFACE_OV_DEVICE`             | ORT OpenVINO EP `device_type`；`AUTO` 在 GPU 可见时会优先解析为 `GPU`     | `AUTO`                             |
+| `INSIGHTFACE_OV_DEVICE`             | 仅控制 InsightFace ORT OpenVINO EP 推理侧 `device_type`；`AUTO` 在 GPU 可见时会优先解析为 `GPU`，仓库内预处理固定走 `CPU` | `AUTO`                             |
 | `INSIGHTFACE_OV_ENABLE_OPENCL_THROTTLING` | 是否启用 OpenVINO EP 的 OpenCL 节流；吞吐优先场景建议关闭                  | `false`                            |
 | `INSIGHTFACE_OV_NUM_THREADS`        | InsightFace OpenVINO EP CPU 线程数；`-1` 表示使用运行时默认值               | `-1`                               |
 | `INSIGHTFACE_BATCH_WAIT_MS`         | `/represent` 单 lane 微批等待窗口（毫秒）；默认以 `4` 个请求作为 admission 与微批上限，若共享图片总名额更小则继续截断 | `5`                                |
-| `OPENCV_OPENCL_DEVICE`              | OpenCV OpenCL 设备选择，如 `Intel:GPU:0`；该变量由 OpenCV 运行时直接读取 | OpenCV 默认设备                        |
 | `PORT`                              | 服务端口；对 Docker 镜像入口、容器健康检查和 `python server.py` 生效 | `8060`                             |
 | `LOG_LEVEL`                         | 日志级别：作用于 `mt_photos_ai.*`、`uvicorn.*` 和 RapidOCR logger | `WARNING`                          |
 
@@ -93,15 +92,15 @@
 - 默认不会在启动后把 OCR 拉入内存；OCR 会在首次 `/ocr` 请求时懒加载。若显式开启 `OCR_PREWARM_ENABLED=true`，服务仅做一次性预热并立即释放 OCR，不会让 OCR 常驻。
 - 默认还会在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 服务不受该计时器影响。如需调整主容器释放窗口，可设置 `NON_TEXT_IDLE_RELEASE_SECONDS`。
 - `POST /restart` 会同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace；Text-CLIP 服务不参与该流程。返回 `{"result":"pass"}` 时本轮释放已经完成。
-- InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，并额外把 PPP 预处理编译到同一运行时设备；日志会输出 `configured_device`、`runtime_device`、`provider_runtime`、`face_preprocess_workers` 和 `ppp_execution_devices` 便于确认没有落回 CPU。
+- InsightFace 在 GPU 可见时会把 `INSIGHTFACE_OV_DEVICE=AUTO` 收敛为 `GPU`，但这只影响 ORT OpenVINO EP 推理侧；仓库内预处理固定走 CPU，多线程执行 resize/letterbox/align，并把 PPP 编译到 CPU。日志会输出 `configured_device`、`runtime_device`、`preprocess_device`、`provider_runtime`、`face_preprocess_workers` 和 `ppp_execution_devices` 便于核对推理侧与预处理侧设备。
 - 若 `models/insightface/models/antelopev2/glintr100.onnx` 的输出 batch 元数据仍写死为 `{1,512}`，或 `scrfd_10g_bnkps.onnx` 的输入/输出 batch 元数据仍固定为单 batch，服务会在受控 runtime copy 中统一修正为动态后再初始化 ORT session；仓库内原始模型文件不会被改写。
 - InsightFace 固定使用新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；若当前 `insightface` 包不支持这组参数，服务会直接失败，不再做兼容重试。
 - InsightFace 运行时模型固定物化到 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；服务只会在这里生成动态 batch detector/recognition 运行时模型，不再维护兼容目录或 source/runtime 回退。
-- `INSIGHTFACE_OV_DEVICE=GPU` 时，InsightFace 预处理走 OpenCV OpenCL + OpenVINO PPP；`INSIGHTFACE_OV_DEVICE=CPU` 时，预处理走 OpenCV CPU + OpenVINO PPP，二者都必须保持 `OpenVINOExecutionProvider` 为首位 provider。
+- 无论 `INSIGHTFACE_OV_DEVICE` 取 `GPU`、`CPU` 还是 `AUTO`，InsightFace 预处理都固定走 OpenCV CPU + OpenVINO PPP(CPU)；`INSIGHTFACE_OV_DEVICE` 仅决定 ORT OpenVINO EP 的推理设备，且 `OpenVINOExecutionProvider` 必须保持首位 provider。
 - `/represent` 当前固定为单个 detector/recognition lane，但会用有界预处理执行器并行完成检测前 resize/letterbox 和按请求分组的人脸对齐；默认 admission=4、微批上限=4、预处理 worker 上限=4，若共享图片总名额更小则继续截断。
 - `INSIGHTFACE_MAX_WORKERS`、`INSIGHTFACE_MAX_CONCURRENT_REQUESTS`、`INSIGHTFACE_BATCH_SIZE` 已移除，避免继续暴露与单 lane 事实不一致的调参项。
 - SCRFD detector 的 batched 输出会在仓库内先恢复为 `spatial x batch x anchors x channels` 再解码 bbox/kps，避免跨请求微批时出现框和关键点串位。
-- `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，GPU 模式使用 OpenCV OpenCL 缩放/对齐，CPU 模式使用 OpenCV CPU 缩放/对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
+- `/represent` 现在会通过有界单 lane 微批队列平滑跨请求调度；检测阶段保持单请求语义，仓库内预处理固定使用 OpenCV CPU 多线程/向量化路径完成缩放、letterbox 与对齐，识别阶段会把同批请求中的全部人脸一次送入批量识别，减少推理侧 GPU 脉冲化空转，同时避免共享 session 的多线程抖动。
 
 ## Windows 本机部署
 
@@ -172,7 +171,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
-- 当前 Docker 构建会在 `pip install -r requirements.txt` 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 OpenCL/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
+- 当前 Docker 构建会在 `pip install -r requirements.txt` 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 CPU `resize`/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
 - 因此当前运行时镜像不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不再打包 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`。
 - Intel GPU 固件属于宿主机职责；若宿主 Debian 13 需要补齐固件，请在宿主机安装 `firmware-misc-nonfree`（或兼容包名 `firmware-misc-non-free`），而不是放进应用容器。
 - Dockerfile 已固化为清华 APT + 清华 PyPI 镜像；APT 基础列表、sid pin 文件和安装包名单都直接写在仓库文件中，便于回溯与审计。
@@ -181,7 +180,7 @@ apt-get update && apt-get install -y --no-install-recommends \
 - 独立 Text-CLIP 镜像使用 `text-clip/DockerFile-TextCLIP`，固定走 OpenVINO CPU，不安装 Intel GPU runtime，也不需要 `/dev/dri`。
 - 容器内不安装 `xserver-xorg-video-intel`（该包用于 Xorg 显示栈，不是本服务的无头推理运行前提）。
 - 服务上传读图链已统一改为 OpenCV 原生解码，镜像不再包含 `ffmpeg/ffprobe`、VAAPI/oneVPL/QSV 媒体栈，也不预装 `clinfo` 这类诊断工具。
-- 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 GPU OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
+- 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 Intel GPU OpenVINO/OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。
 - 参考文档：
   - OpenVINO GPU 设备配置与依赖：<https://docs.openvino.ai/2025/openvino-workflow/running-inference/inference-devices-and-modes/gpu-device.html>
   - Intel Linux GPU Driver（OpenCL/Level Zero 运行时包）：<https://dgpu-docs.intel.com/driver/installation.html>
@@ -205,12 +204,12 @@ cp docker-compose.example.yml docker-compose.yml
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - `mt-photos-ai-text-clip` 为独立 CPU 容器，直接对外提供 `/clip/txt`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`；其中 `INSIGHTFACE_OV_DEVICE` 仅影响推理侧 OpenVINO EP，仓库内预处理仍固定走 CPU。RapidOCR 当前固定走 CPU，如 OCR 首次请求存在冷加载编译开销，可显式补 `OCR_EXEC_TIMEOUT=30`
 - `INFERENCE_QUEUE_MAX_SIZE` 建议保持 `10`；即使显式配得更大，服务也会按 `10` 截断，避免 MT-Photos 客户端在图片请求积压时超时取消
 - 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射；服务固定单进程，不再提供 worker 数配置项
 - 如需挂载自定义模型、RapidOCR 配置或自定义 OpenVINO cache 目录，可再调整两个容器各自的 `MODEL_PATH` / `OV_CACHE_DIR`，以及主服务的 `RAPIDOCR_MODEL_DIR`、`RAPIDOCR_OPENVINO_CONFIG_PATH`
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
-- `/represent` 当前固定为单 lane GPU + 4 请求微批预算；如需权衡吞吐与尾延迟，可只小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不再提供额外的 worker/batch 容量环境变量
+- `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求微批预算；如需权衡吞吐与尾延迟，可只小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不再提供额外的 worker/batch 容量环境变量
 
 4. 启动服务：
 
@@ -280,7 +279,6 @@ docker run -d \
 ```bash
 docker exec -it mt-photos-ai-openvino ls -l /dev/dri
 docker exec -it mt-photos-ai-openvino python -c "import openvino as ov; print(ov.Core().available_devices)"
-docker exec -it mt-photos-ai-openvino python -c 'import cv2; cv2.ocl.setUseOpenCL(True); d=cv2.ocl.Device_getDefault(); print(cv2.ocl.haveOpenCL(), cv2.ocl.useOpenCL(), d.vendorName(), d.name())'
 ```
 
 若请求了 GPU 推理但容器内 GPU 设备不可用，服务会直接报错并终止启动。
@@ -345,7 +343,6 @@ docker run --rm -it \
   -e CLIP_INFERENCE_DEVICE=CPU \
   -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=GPU \
-  -e OPENCV_OPENCL_DEVICE=Intel:GPU:0 \
   mt-photos-ai-openvino \
   python scripts/smoke_insightface.py --device GPU
 ```
@@ -353,7 +350,7 @@ docker run --rm -it \
 脚本会校验：
 
 - `OpenVINOExecutionProvider` 仍是 detection/recognition 的首位 provider，且 `device_type` 与请求一致
-- InsightFace 运行事实已收敛到单 lane detector/recognition + 最多 4 路预处理 worker + 默认 4 请求 admission/微批上限
+- InsightFace 运行事实已收敛到单 lane detector/recognition + 固定 CPU 预处理 + 最多 4 路预处理 worker + 默认 4 请求 admission/微批上限
 - 运行时模型目录已经收敛到 `_runtime_models/models/antelopev2`
 - 本地 `/represent` pipeline 与原生 `FaceAnalysis.get` 的检测框、分数和 embedding 语义保持一致
 - batched SCRFD detection / recognition 与 single-image 路径一致
