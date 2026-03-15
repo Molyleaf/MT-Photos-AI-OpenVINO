@@ -48,7 +48,7 @@ class ClipImageMixin(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+    def _load_family_serialized(self, family: NonTextFamily, loader: Any) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -226,7 +226,7 @@ class ClipImageMixin(ABC):
                 and self._clip_vision_ppp is not None
             ):
                 return
-            self._load_family_with_process_lock("vision", self._load_clip_vision_locked)
+            self._load_family_serialized("vision", self._load_clip_vision_locked)
 
     def _compile_clip_model(
         self,

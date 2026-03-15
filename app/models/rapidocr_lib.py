@@ -63,7 +63,7 @@ class RapidOCRMixin(ABC):
     _ocr_execution_timeout_seconds: int
 
     @abstractmethod
-    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+    def _load_family_serialized(self, family: NonTextFamily, loader: Any) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -513,7 +513,7 @@ class RapidOCRMixin(ABC):
                 and self._rapidocr_runtime_cfg is not None
             ):
                 return
-            self._load_family_with_process_lock("ocr", self._load_rapidocr_locked)
+            self._load_family_serialized("ocr", self._load_rapidocr_locked)
 
     @contextmanager
     def _borrow_rapidocr_engine(self) -> Iterator[RapidOCR]:

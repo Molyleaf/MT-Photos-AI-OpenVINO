@@ -490,13 +490,18 @@ def main() -> int:
         models.release_models_for_restart()
         gc.collect()
         rss_after_release_kb = _read_rss_kb()
-        if models._face_engine is not None or models._face_det_ppp is not None or models._face_rec_ppp is not None:
-            raise RuntimeError("Face runtime references were not fully released by release_models_for_restart().")
+        released_families = models.get_loaded_runtime_families()
+        if released_families:
+            raise RuntimeError(
+                "Runtime families were not fully released by release_models_for_restart(): "
+                f"{released_families}"
+            )
 
         reload_results = asyncio.run(_collect_local_results(models, [sample_images[0]]))[0]
         rss_after_reload_kb = _read_rss_kb()
         if not reload_results:
             raise RuntimeError("Face reload smoke test returned no faces after release/reload.")
+        loaded_families_after_reload = models.get_loaded_runtime_families()
 
         summary = {
             "device": ARGS.device,
@@ -512,6 +517,8 @@ def main() -> int:
                 "rss_before_release_kb": rss_before_release_kb,
                 "rss_after_release_kb": rss_after_release_kb,
                 "rss_after_reload_kb": rss_after_reload_kb,
+                "released_families_after_release": released_families,
+                "loaded_families_after_reload": loaded_families_after_reload,
                 "reload_face_count": len(reload_results),
             },
         }

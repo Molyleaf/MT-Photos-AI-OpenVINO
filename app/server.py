@@ -124,10 +124,10 @@ models_instance: Optional[AIModels] = None
 MAX_IMAGE_SIDE = 10000
 
 
-def _mark_non_text_request_activity() -> None:
+def _mark_request_activity() -> None:
     if models_instance is None:
         return
-    models_instance.mark_non_text_request_activity()
+    models_instance.mark_request_activity()
 
 
 def _device_requests_gpu(device_name: str) -> bool:
@@ -329,7 +329,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
-    _mark_non_text_request_activity()
+    _mark_request_activity()
     image, error_msg = await read_image_from_upload(file)
     if image is None:
         return {"result": [], "msg": error_msg}
@@ -346,7 +346,7 @@ async def clip_image_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
-    _mark_non_text_request_activity()
+    _mark_request_activity()
     LOGGER.debug("开始处理 CLIP 图像请求: %s", file.filename)
 
     image, error_msg = await read_image_from_upload(file)
@@ -366,7 +366,7 @@ async def represent_endpoint(file: UploadFile = File(...)):
     if not models_instance:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
 
-    _mark_non_text_request_activity()
+    _mark_request_activity()
     image, error_msg = await read_image_from_upload(file)
     if image is None:
         return {"result": [], "msg": error_msg}

@@ -48,8 +48,6 @@ class _NonTextFamilyStateModel:
 
     def __init__(self) -> None:
         self.state = "idle"
-        self.loading_family: Optional[NonTextFamily] = None
-        self.resident_family: Optional[NonTextFamily] = None
 
 
 class _NonTextFamilyStateMachine:
@@ -100,30 +98,6 @@ class _NonTextFamilyStateMachine:
             self._model.activate_ocr()
         else:
             self._model.activate_face()
-
-    def mark_loading(self, family: NonTextFamily) -> None:
-        with self._condition:
-            self._model.loading_family = family
-
-    def mark_loaded(self, family: NonTextFamily) -> None:
-        with self._condition:
-            self._model.loading_family = None
-            self._model.resident_family = family
-
-    def mark_load_failed(self, family: NonTextFamily) -> None:
-        with self._condition:
-            if self._model.loading_family == family:
-                self._model.loading_family = None
-
-    def mark_unloaded(self, unloaded_families: List[str]) -> None:
-        if not unloaded_families:
-            return
-        unloaded = set(unloaded_families)
-        with self._condition:
-            if self._model.loading_family in unloaded:
-                self._model.loading_family = None
-            if self._model.resident_family in unloaded:
-                self._model.resident_family = None
 
     def acquire(
         self,
@@ -176,7 +150,7 @@ class _NonTextFamilyStateMachine:
                 return False
             if unloaded_families:
                 LOG.info(
-                    "Switched non-text family from %s to %s; released=%s",
+                    "Switched runtime family from %s to %s; released=%s",
                     previous_family,
                     family,
                     ",".join(unloaded_families),
@@ -207,8 +181,6 @@ class _NonTextFamilyStateMachine:
 
     def finish_release(self) -> None:
         with self._condition:
-            self._model.loading_family = None
-            self._model.resident_family = None
             self._model.release_to_idle()
             self._condition.notify_all()
 
@@ -216,7 +188,7 @@ class _NonTextFamilyStateMachine:
 class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     """
     Image-CLIP uses a dedicated batch queue after standardized preprocessing.
-    Non-text families are lazy-loaded and switch synchronously so only one
+    Runtime model families are lazy-loaded and switch synchronously so only one
     vision/OCR/face family stays resident at a time, with idle release.
     """
     ov_cache_dir: Optional[Path]
@@ -292,10 +264,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._single_process_lock = _InterProcessFileLock(
             self._runtime_state_dir / "single-process.lock"
         )
-        self._family_load_locks = {
-            family: _InterProcessFileLock(self._runtime_state_dir / f"{family}.load.lock")
-            for family in ("vision", "ocr", "face")
-        }
 
     def _acquire_single_process_lock(self) -> None:
         acquired = self._single_process_lock.acquire(timeout=0.0, blocking=False)
@@ -365,7 +333,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 max(30, self._execution_timeout_seconds),
             ),
         )
-        self._load_lock_timeout_seconds = max(30.0, float(self._execution_timeout_seconds))
         self._idle_release_timeout_seconds = max(
             0.0,
             _as_float(os.environ.get("NON_TEXT_IDLE_RELEASE_SECONDS"), 60.0),
@@ -415,7 +382,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
 
         self._request_activity_lock = threading.Lock()
-        self._last_non_text_request_monotonic = time.monotonic()
+        self._last_request_activity_monotonic = time.monotonic()
         self._idle_release_stop = threading.Event()
         self._idle_release_wakeup = threading.Event()
         self._idle_release_thread: Optional[threading.Thread] = None
@@ -524,23 +491,20 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
         self._idle_release_thread.start()
 
-    def mark_non_text_request_activity(self) -> None:
+    def mark_request_activity(self) -> None:
         with self._request_activity_lock:
-            self._last_non_text_request_monotonic = time.monotonic()
+            self._last_request_activity_monotonic = time.monotonic()
         self._idle_release_wakeup.set()
 
-    def mark_request_activity(self) -> None:
-        self.mark_non_text_request_activity()
-
-    def _snapshot_last_non_text_request_monotonic(self) -> float:
+    def _snapshot_last_request_activity_monotonic(self) -> float:
         with self._request_activity_lock:
-            return self._last_non_text_request_monotonic
+            return self._last_request_activity_monotonic
 
     def _idle_release_loop(self) -> None:
         poll_seconds = min(5.0, max(0.5, self._idle_release_timeout_seconds / 6.0))
         while not self._idle_release_stop.is_set():
             deadline = (
-                self._snapshot_last_non_text_request_monotonic()
+                self._snapshot_last_request_activity_monotonic()
                 + self._idle_release_timeout_seconds
             )
             remaining = deadline - time.monotonic()
@@ -550,17 +514,19 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 continue
 
             try:
-                if self._has_loaded_non_text_models():
+                loaded_families = self.get_loaded_runtime_families()
+                if loaded_families:
                     LOG.info(
-                        "No business request for %.1fs; releasing non-text models.",
+                        "No business request for %.1fs; releasing runtime model families: %s.",
                         self._idle_release_timeout_seconds,
+                        ",".join(loaded_families),
                     )
                     self._release_non_text_models_sync(reason="idle-timeout")
             except Exception as exc:
-                LOG.warning("Idle non-text model release failed: %s", exc, exc_info=True)
+                LOG.warning("Idle runtime model release failed: %s", exc, exc_info=True)
             finally:
                 with self._request_activity_lock:
-                    self._last_non_text_request_monotonic = time.monotonic()
+                    self._last_request_activity_monotonic = time.monotonic()
 
     def _join_idle_release_thread(self, timeout_seconds: Optional[float]) -> None:
         thread = self._idle_release_thread
@@ -840,23 +806,32 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         finally:
             await lease.release_async()
 
-    def _has_loaded_non_text_models_locked(self) -> bool:
-        return bool(
+    def _get_loaded_runtime_families_locked(self) -> List[NonTextFamily]:
+        loaded: List[NonTextFamily] = []
+        if (
             self._clip_vision_model is not None
             or self._clip_vision_request is not None
             or self._clip_vision_ppp is not None
-            or self._rapidocr_engine is not None
+        ):
+            loaded.append("vision")
+        if (
+            self._rapidocr_engine is not None
             or self._rapidocr_engines is not None
             or self._rapidocr_engine_pool is not None
             or self._rapidocr_runtime_cfg is not None
-            or self._face_engine is not None
+        ):
+            loaded.append("ocr")
+        if (
+            self._face_engine is not None
             or self._face_det_ppp is not None
             or self._face_rec_ppp is not None
-        )
+        ):
+            loaded.append("face")
+        return loaded
 
-    def _has_loaded_non_text_models(self) -> bool:
+    def get_loaded_runtime_families(self) -> List[NonTextFamily]:
         with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
-            return self._has_loaded_non_text_models_locked()
+            return list(self._get_loaded_runtime_families_locked())
 
     def _join_background_prewarm_thread(self, timeout_seconds: Optional[float]) -> None:
         thread = self._background_prewarm_thread
@@ -919,7 +894,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     ) -> List[str]:
         with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
             unloaded = self._unload_non_text_models_locked(keep_family=keep_family)
-            self._non_text_state.mark_unloaded(unloaded)
         if unloaded:
             gc.collect()
         return unloaded
@@ -944,41 +918,26 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
             unloaded = self._unload_non_text_models()
             LOG.info(
-                "Non-text model release complete: reason=%s unloaded=%s",
+                "Runtime model release complete: reason=%s unloaded=%s",
                 reason,
                 ",".join(unloaded) if unloaded else "none",
             )
         finally:
             self._non_text_state.finish_release()
 
-    def _load_family_with_process_lock(
+    def _load_family_serialized(
         self, family: NonTextFamily, loader: Callable[[], None]
     ) -> None:
-        lock = self._family_load_locks[family]
         started_at = time.monotonic()
-        self._non_text_state.mark_loading(family)
-        acquired = lock.acquire(timeout=self._load_lock_timeout_seconds, blocking=True)
-        if not acquired:
-            self._non_text_state.mark_load_failed(family)
-            raise RuntimeError(
-                f"{family} 模型加载等待跨进程锁超时（>{self._load_lock_timeout_seconds:.0f}s）"
+        loader()
+        elapsed = time.monotonic() - started_at
+        if elapsed >= 0.25:
+            LOG.info(
+                "Loaded %s model family in %.2fs in pid=%s.",
+                family,
+                elapsed,
+                self._pid,
             )
-        try:
-            waited = time.monotonic() - started_at
-            if waited >= 0.25:
-                LOG.info(
-                    "Waited %.2fs for %s model load lock in pid=%s.",
-                    waited,
-                    family,
-                    self._pid,
-                )
-            loader()
-            self._non_text_state.mark_loaded(family)
-        except Exception:
-            self._non_text_state.mark_load_failed(family)
-            raise
-        finally:
-            lock.release()
 
     def _unload_everything_locked(self) -> None:
         self._unload_clip_vision_model_locked()

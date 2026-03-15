@@ -1,6 +1,5 @@
 import asyncio
 import os
-import socketserver
 import threading
 import time
 from concurrent.futures import Future
@@ -513,10 +512,6 @@ class _AdmissionController:
                 return
             self._active -= 1
             self._condition.notify_all()
-
-
-class _TextClipRpcServer(socketserver.TCPServer):
-    allow_reuse_address = True
 
 
 NonTextFamily = Literal["vision", "ocr", "face"]

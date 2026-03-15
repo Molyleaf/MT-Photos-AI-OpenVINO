@@ -194,7 +194,7 @@ class InsightFaceMixin(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _load_family_with_process_lock(self, family: NonTextFamily, loader: Any) -> None:
+    def _load_family_serialized(self, family: NonTextFamily, loader: Any) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -1395,7 +1395,7 @@ class InsightFaceMixin(ABC):
                 and self._face_rec_ppp is not None
             ):
                 return
-            self._load_family_with_process_lock("face", self._load_face_locked)
+            self._load_family_serialized("face", self._load_face_locked)
 
     def _load_face_locked(self) -> None:
         configured_provider_device = _normalize_non_text_openvino_device(
