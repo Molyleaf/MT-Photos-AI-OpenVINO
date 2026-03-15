@@ -1,6 +1,6 @@
 # MT-Photos AI (OpenVINO)
 
-主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace）；`Text-CLIP` 现已拆为独立 CPU 服务，单独对外提供 `/clip/txt`。本文档仅保留最终用户部署、运行和配置说明。
+主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace）；`Text-CLIP` 现已拆为独立 CPU 服务，单独对外提供 `/clip/txt`。仓库另外补充了一个仅面向本地 Windows 开发机的并行 `Image-CLIP` CUDA 子项目，目录为 `image-clip/`，不影响主服务 OpenVINO 实现。本文档仅保留最终用户部署、运行和配置说明。
 
 ## 部署前准备
 
@@ -11,6 +11,7 @@
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 主服务入口：`app/server.py`
 - Text-CLIP 服务入口：`text-clip/app/server.py`
+- Windows 本地 CUDA Image-CLIP 子项目入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时把 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx` 物化为动态 batch 运行时模型
@@ -144,6 +145,8 @@ python server.py
 cd app
 python server.py
 ```
+
+如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，启动方式见 [image-clip/README.md](image-clip/README.md)。
 
 如需手动执行 `uvicorn server:app`，请显式传入 `--port` / `--log-level`，例如 `uvicorn server:app --host 0.0.0.0 --port 8060 --log-level info`。
 

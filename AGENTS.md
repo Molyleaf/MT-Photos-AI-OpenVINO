@@ -17,6 +17,7 @@
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
 - Text-CLIP 独立服务入口：`text-clip/app/server.py`。
+- Windows 本地 CUDA Image-CLIP 并行子项目入口：`image-clip/app/server.py`，依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
 - 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
@@ -45,6 +46,7 @@
 
 - 模型固定为：`TencentARC/QA-CLIP-ViT-L-14`。
 - 向量维度固定：`768`。
+- `image-clip/app` 作为并行本地开发子项目时，可独立使用 `PyTorch + CUDA` 提供 `/clip/img`；但它不改变主服务 `/clip/img` 的 OpenVINO 基线、接口语义和部署方式。
 - 主服务 `/clip/img` 推理目标设备：`GPU`（Intel Xe 核显），优先减少 Host<->Device 数据搬运。
 - 主服务 `/clip/img` 的 OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例、RPC 子服务或文本 tokenizer 运行链。
@@ -268,6 +270,7 @@
   - `AGENTS.md`
   - `README.md`
   - `requirements.txt`
+  - `image-clip/requirement.txt`（若改动独立 Windows CUDA Image-CLIP 子项目）
   - `text-clip/requirement.txt`（若改动独立 Text-CLIP 容器）
 - 若引入/调整 RapidOCR OpenVINO 参数文件，需提供示例 `cfg_openvino_cpu.yaml` 并说明关键参数（含设备与批量策略）。
 

@@ -1,0 +1,9 @@
+fastapi
+numpy==2.3.5
+opencv-python-headless
+pydantic
+python-multipart
+safetensors
+torch
+transformers
+uvicorn
