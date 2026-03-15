@@ -57,10 +57,19 @@ python server.py
 ## 冒烟
 
 ```powershell
+python scripts\smoke_image_clip.py --device cuda
+python scripts\smoke_image_clip.py --device cuda --image C:\path\to\image.jpg
+
 curl.exe http://127.0.0.1:8062/
 curl.exe -X POST http://127.0.0.1:8062/check -H "api-key: mt_photos_ai_extra"
 curl.exe -X POST http://127.0.0.1:8062/clip/img -H "api-key: mt_photos_ai_extra" -F "file=@C:\path\to\image.jpg"
 ```
+
+脚本会直接调用 `image-clip/app` 运行时，不经过 HTTP，主要校验：
+
+- CUDA 初始化成功，且不是静默落回 CPU
+- 单张、同图微批、混合微批输出维度固定为 `768`
+- 同图顺序推理、批推理、释放后重载三条路径的 embedding 一致性
 
 成功调用 `/clip/img` 时，响应格式与主服务保持一致：
 

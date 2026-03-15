@@ -284,6 +284,7 @@
 - `python -m compileall app`
 - `python -m compileall text-clip/app`
 - `python -m compileall scripts`
+- `python scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
