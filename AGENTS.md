@@ -198,7 +198,7 @@
 
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
-1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例。
+1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例，且 Text-CLIP 模型在进程存活期间不得主动释放或空闲卸载。
 2. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
 3. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
 4. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
@@ -320,6 +320,7 @@
 ## 12. README / AGENTS 文档边界
 
 - `README.md` 只保留最终用户直接需要的信息：部署前准备、运行时环境变量、Windows/Docker 部署、模型文件准备、设备检查、基础调用示例、许可证。
+- `README.md` 的环境变量说明必须拆成“主容器”和“Text-CLIP 容器”两个表格，并按环境变量名字母顺序排列；兼容别名、compose 插值变量、内部固定值不要写入 README。
 - 下列内容默认只应存在于 `AGENTS.md`，不要重新塞回 `README.md`，除非它直接影响最终用户操作：
   - 实现约束、后端选择原因、无 silent fallback 规则
   - 容器构建内部实践、镜像裁剪策略、依赖清理策略
@@ -350,6 +351,7 @@
 - 主服务镜像不再打包 `openvino_text_fp16.*`；这些文件仅应进入独立 Text-CLIP 镜像。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
+- `docker-compose.example.yml` 只允许引用预构建镜像（`image:`）；禁止再保留运行时 `build:`。
 - 启动阶段必须增加 `/dev/dri` 自检：请求 GPU 推理时，`/dev/dri` 不可用则直接报错并终止启动。
 - Debian 宿主若要启用 Intel iGPU，必须正确映射 `/dev/dri`，并确保 `VIDEO_GID` / `RENDER_GID` 与宿主机设备组一致（默认示例 `44/109`）。
 
@@ -365,6 +367,7 @@
 ```yaml
 services:
   mt-photos-ai-openvino:
+    image: mt-photos-ai-openvino:latest
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -372,32 +375,27 @@ services:
       - "${RENDER_GID:-109}"
     environment:
       - API_AUTH_KEY=mt_photos_ai_extra
-      - INFERENCE_DEVICE=AUTO
-      - CLIP_INFERENCE_DEVICE=AUTO
-      - RAPIDOCR_DEVICE=CPU
-      - INSIGHTFACE_OV_DEVICE=AUTO
       - CLIP_IMAGE_BATCH=8
-      - INFERENCE_QUEUE_MAX_SIZE=10
-      - INFERENCE_TASK_TIMEOUT=10
-      - INFERENCE_EXEC_TIMEOUT=30
-      - OCR_EXEC_TIMEOUT=30
-      - NON_TEXT_IDLE_RELEASE_SECONDS=60
-      - PORT=8060
+      - CLIP_INFERENCE_DEVICE=AUTO
+      - INFERENCE_DEVICE=AUTO
+      - INSIGHTFACE_OV_DEVICE=AUTO
       - LOG_LEVEL=WARNING
+      - NON_TEXT_IDLE_RELEASE_SECONDS=60
+      - OCR_EXEC_TIMEOUT=30
+      - PORT=8060
+      - RAPIDOCR_DEVICE=CPU
   mt-photos-ai-text-clip:
+    image: mt-photos-ai-text-clip:latest
     environment:
       - API_AUTH_KEY=mt_photos_ai_extra
-      - MODEL_PATH=/models
-      - OV_CACHE_DIR=/cache/openvino
-      - PORT=8061
       - LOG_LEVEL=WARNING
+      - PORT=8061
 ```
 
 说明：
 - `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace 仅推理侧 EP 会收敛到 `GPU`，仓库内预处理固定走 `CPU`。
-- `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`。
+- `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`，且文本模型在进程生命周期内保持常驻。
 - `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求聚合预算 + 4 路 CPU 预处理 worker；如需权衡吞吐与尾延迟，只允许小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不要重新引入额外的 worker/batch 容量环境变量。
-- `INFERENCE_QUEUE_MAX_SIZE` 默认示例应保持为 `10`；即使显式配置得更大，运行时也必须按 `10` 截断，确保图片请求总量不超过 MT-Photos 客户端可接受范围。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
 - `PORT` 当前会同时影响 Docker 入口命令与容器健康检查；若修改它，`docker-compose` 里的 `ports:` 映射也必须同步修改。
@@ -433,7 +431,7 @@ services:
 #### D. 回归脚本建议（最小）
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 docker compose ps
 docker compose logs --tail=200 mt-photos-ai-openvino
 docker compose logs --tail=200 mt-photos-ai-text-clip

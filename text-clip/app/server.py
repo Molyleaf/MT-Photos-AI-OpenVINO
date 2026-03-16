@@ -118,9 +118,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    LOGGER.info("应用关闭：正在释放 Text-CLIP 模型。")
-    if runtime_instance is not None:
-        await asyncio.to_thread(runtime_instance.release)
+    LOGGER.info("应用关闭：Text-CLIP 常驻模型将随进程退出统一回收。")
 
 
 app = FastAPI(

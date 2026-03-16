@@ -1,74 +1,45 @@
 services:
   mt-photos-ai-openvino:
-    # 按需替换为你实际发布的镜像标签。
+    # 请先在本地构建或从镜像仓库拉取该镜像；compose 不负责运行时构建。
     image: mt-photos-ai-openvino:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: mt-photos-ai-openvino
     init: true
     security_opt:
       - no-new-privileges:true
     ports:
-      - "${PORT:-8060}:${PORT:-8060}"
+      - "8060:8060"
     group_add:
       # Debian 默认通常是 video=44、render=109。
       # 如果宿主机 GID 不同，直接修改下面两个值。
       - "44"
       - "109"
     environment:
-      # 未列出的变量要么是兼容/内部项，要么已由镜像固定，通常不需要覆盖。
       API_AUTH_KEY: "mt_photos_ai_extra"
-      INFERENCE_DEVICE: "AUTO"
-      CLIP_INFERENCE_DEVICE: "AUTO"
-      MODEL_PATH: "/models"
-      INFERENCE_QUEUE_MAX_SIZE: "10"
-      INFERENCE_TASK_TIMEOUT: "10"
-      INFERENCE_EXEC_TIMEOUT: "30"
-      OCR_EXEC_TIMEOUT: "30"
-      NON_TEXT_IDLE_RELEASE_SECONDS: "60"
       CLIP_IMAGE_BATCH: "8"
-      RAPIDOCR_OPENVINO_CONFIG_PATH: "/app/config/cfg_openvino_cpu.yaml"
-      RAPIDOCR_MODEL_DIR: "/models/rapidocr"
-      RAPIDOCR_FONT_PATH: ""
-      RAPIDOCR_DEVICE: "CPU"
-      RAPIDOCR_INFERENCE_NUM_THREADS: "-1"
-      RAPIDOCR_PERFORMANCE_HINT: "THROUGHPUT"
-      RAPIDOCR_PERFORMANCE_NUM_REQUESTS: "2"
-      RAPIDOCR_ENABLE_CPU_PINNING: "true"
-      RAPIDOCR_NUM_STREAMS: "2"
-      RAPIDOCR_ENABLE_HYPER_THREADING: "true"
-      RAPIDOCR_SCHEDULING_CORE_TYPE: "ANY_CORE"
-      RAPIDOCR_USE_CLS: "true"
-      RAPIDOCR_MAX_SIDE_LEN: "960"
-      RAPIDOCR_DET_LIMIT_SIDE_LEN: "960"
-      RAPIDOCR_DET_LIMIT_TYPE: "max"
-      RAPIDOCR_REC_BATCH_NUM: "8"
-      RAPIDOCR_CLS_BATCH_NUM: "8"
+      CLIP_INFERENCE_DEVICE: "AUTO"
+      INFERENCE_DEVICE: "AUTO"
       INSIGHTFACE_OV_DEVICE: "AUTO"
-      PORT: "8060"
       LOG_LEVEL: "WARNING"
+      NON_TEXT_IDLE_RELEASE_SECONDS: "60"
+      OCR_EXEC_TIMEOUT: "30"
+      PORT: "8060"
+      RAPIDOCR_DEVICE: "CPU"
     devices:
       # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。
       - /dev/dri:/dev/dri
     restart: unless-stopped
 
   mt-photos-ai-text-clip:
-    # Text-CLIP 独立容器固定走 CPU，不需要 /dev/dri。
+    # Text-CLIP 独立容器固定走 CPU，模型在进程生命周期内常驻内存。
     image: mt-photos-ai-text-clip:latest
-    build:
-      context: .
-      dockerfile: text-clip/DockerFile-TextCLIP
     container_name: mt-photos-ai-text-clip
     init: true
     security_opt:
       - no-new-privileges:true
     ports:
-      - "${TEXT_CLIP_PORT:-8061}:${TEXT_CLIP_PORT:-8061}"
+      - "8061:8061"
     environment:
       API_AUTH_KEY: "mt_photos_ai_extra"
-      MODEL_PATH: "/models"
-      OV_CACHE_DIR: "/cache/openvino"
-      PORT: "${TEXT_CLIP_PORT:-8061}"
       LOG_LEVEL: "WARNING"
+      PORT: "8061"
     restart: unless-stopped
