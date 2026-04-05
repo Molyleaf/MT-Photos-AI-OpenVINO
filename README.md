@@ -1,6 +1,6 @@
 # MT-Photos AI (OpenVINO)
 
-主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace）；`Text-CLIP` 现已拆为独立 CPU 服务，单独对外提供 `/clip/txt`。仓库另外补充了一个仅面向本地 Windows 开发机的并行 `Image-CLIP` CUDA 子项目，目录为 `image-clip/`，不影响主服务 OpenVINO 实现。本文档仅保留最终用户部署、运行和配置说明。
+主服务提供 OCR、图像向量（QA-CLIP）和人脸向量（InsightFace），并会把 `/clip/txt` 代理转发到独立部署的 `Text-CLIP` CPU 服务。仓库另外补充了一个仅面向本地 Windows 开发机的并行 `Image-CLIP` CUDA 子项目，目录为 `image-clip/`，不影响主服务 OpenVINO 实现。本文档仅保留最终用户部署、运行和配置说明。
 
 ## 部署前准备
 
@@ -50,7 +50,7 @@
 | `RAPIDOCR_CLS_BATCH_NUM` | RapidOCR 方向分类批大小 | `8` |
 | `RAPIDOCR_DET_LIMIT_SIDE_LEN` | RapidOCR 检测输入边长限制 | `960` |
 | `RAPIDOCR_DET_LIMIT_TYPE` | RapidOCR 检测缩放策略 | `max` |
-| `RAPIDOCR_DEVICE` | RapidOCR 请求设备；当前实现会固定收敛到 `CPU` | `CPU` |
+| `RAPIDOCR_DEVICE` | RapidOCR 请求设备；因上游 `rapidocr` OpenVINO 引擎写死 `CPU`，当前实现会强制收敛到 `CPU` | `CPU` |
 | `RAPIDOCR_ENABLE_CPU_PINNING` | 是否启用 CPU 绑核 | `true` |
 | `RAPIDOCR_ENABLE_HYPER_THREADING` | 是否启用超线程 | `true` |
 | `RAPIDOCR_FONT_PATH` | RapidOCR 字体文件路径；空表示不指定 | 空 |
@@ -64,6 +64,9 @@
 | `RAPIDOCR_REC_BATCH_NUM` | RapidOCR 识别批大小 | `8` |
 | `RAPIDOCR_SCHEDULING_CORE_TYPE` | RapidOCR OpenVINO 核调度类型 | `ANY_CORE` |
 | `RAPIDOCR_USE_CLS` | 是否启用方向分类器 | `true` |
+| `TEXT_CLIP_API_KEY` | 主服务转发 `/clip/txt` 时使用的上游 API Key；未设置时复用 `API_AUTH_KEY` | 跟随 `API_AUTH_KEY` |
+| `TEXT_CLIP_REQUEST_TIMEOUT` | 主服务转发 `/clip/txt` 的上游请求超时，单位秒 | `30` |
+| `TEXT_CLIP_SERVER_URL` | 独立 Text-CLIP 服务 URL；主服务会自动拼接 `/clip/txt` | `http://127.0.0.1:8061` |
 
 ### Text-CLIP 容器
 
@@ -77,8 +80,9 @@
 
 补充说明：
 
-- 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；Text-CLIP 容器固定使用 `CPU`，不需要额外设备变量。
-- 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`。
+- 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
+- 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务仅做 HTTP 转发。
+- RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。
 - 如果手动执行 `uvicorn server:app`，最早期的 uvicorn bootstrap 日志仍以 CLI `--log-level` 为准。
 
@@ -106,6 +110,7 @@ $env:CLIP_INFERENCE_DEVICE="CPU"
 $env:CLIP_IMAGE_BATCH="8"
 $env:RAPIDOCR_DEVICE="CPU"
 $env:INSIGHTFACE_OV_DEVICE="CPU"
+$env:TEXT_CLIP_SERVER_URL="http://127.0.0.1:8061"
 $env:LOG_LEVEL="INFO"
 ```
 
@@ -122,6 +127,8 @@ python server.py
 cd app
 python server.py
 ```
+
+启动后，客户端可统一访问主服务端口；主服务收到 `/clip/txt` 请求时会按 `TEXT_CLIP_SERVER_URL` 转发到独立 Text-CLIP 服务。
 
 如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，可在仓库根目录直接执行 `python image-clip\starter.py`，或进入 `image-clip\` 后执行 `python starter.py`。更完整的环境变量与冒烟说明见 [image-clip/README.md](image-clip/README.md)。
 
@@ -188,7 +195,7 @@ cp docker-compose.example.yml docker-compose.yml
 
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - 主容器需要映射 `/dev/dri` 并设置正确的 `video/render` 组；`mt-photos-ai-text-clip` 固定走 CPU，不需要 `/dev/dri`
-- `mt-photos-ai-text-clip` 启动后会常驻加载文本模型，直接对外提供 `/clip/txt`
+- `mt-photos-ai-text-clip` 启动后会常驻加载文本模型；主服务请通过 `TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061` 代理转发 `/clip/txt`
 - 有 Intel iGPU 且已映射 `/dev/dri` 时，主容器建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`
 - 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射
 - 如需挂载自定义模型或自定义 OpenVINO cache 目录，再显式覆盖 `MODEL_PATH` / `OV_CACHE_DIR`
@@ -211,9 +218,16 @@ docker compose logs -f mt-photos-ai-openvino mt-photos-ai-text-clip
 
 ### 方式二：docker run
 
+先创建一个供两个容器互访的用户网络：
+
+```bash
+docker network create mt-photos-ai-net
+```
+
 ```bash
 docker run -d \
   --name mt-photos-ai-text-clip \
+  --network mt-photos-ai-net \
   --init \
   -p 8061:8061 \
   -e API_AUTH_KEY=mt_photos_ai_extra \
@@ -223,6 +237,7 @@ docker run -d \
 
 docker run -d \
   --name mt-photos-ai-openvino \
+  --network mt-photos-ai-net \
   --init \
   -p 8060:8060 \
   --device /dev/dri:/dev/dri \
@@ -238,10 +253,11 @@ docker run -d \
   -e OCR_EXEC_TIMEOUT=30 \
   -e PORT=8060 \
   -e RAPIDOCR_DEVICE=CPU \
+  -e TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061 \
   mt-photos-ai-openvino
 ```
 
-如需自定义模型目录或 OpenVINO cache 目录，可继续追加 `-e MODEL_PATH=...`、`-e OV_CACHE_DIR=...`。如需修改任一服务的 `PORT`，请同步调整对应的 `-p <host_port>:<container_port>`。
+如需自定义模型目录或 OpenVINO cache 目录，可继续追加 `-e MODEL_PATH=...`、`-e OV_CACHE_DIR=...`。如需修改任一服务的 `PORT`，请同步调整对应的 `-p <host_port>:<container_port>`。如果 Text-CLIP 容器使用了不同的鉴权密钥，请额外给主容器设置 `-e TEXT_CLIP_API_KEY=...`。
 
 ### 容器内设备检查
 
@@ -333,6 +349,7 @@ docker run --rm -it \
 ```bash
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
+curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 curl -s -X POST http://127.0.0.1:8061/check -H "api-key: mt_photos_ai_extra"
 curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 ```

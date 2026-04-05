@@ -1,11 +1,16 @@
 # app/server.py
 import asyncio
+import json
 import logging
 import os
+import socket
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
@@ -95,6 +100,7 @@ from models.runtime import AIModels
 from models.schemas import (
     CheckResponse,
     RestartResponse,
+    TextClipRequest,
 )
 
 LOGGER = logging.getLogger(f"{_LOG_NAMESPACE}.server")
@@ -102,11 +108,137 @@ LOGGER = logging.getLogger(f"{_LOG_NAMESPACE}.server")
 
 API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"
 API_KEY_NAME = "api-key"
+TEXT_CLIP_SERVER_URL_DEFAULT = "http://127.0.0.1:8061"
+TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS = 30.0
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 
 def _get_api_auth_key() -> str:
     return os.environ.get("API_AUTH_KEY", API_AUTH_KEY_DEFAULT)
+
+
+def _get_text_clip_server_url() -> str:
+    configured = str(
+        os.environ.get("TEXT_CLIP_SERVER_URL", TEXT_CLIP_SERVER_URL_DEFAULT)
+    ).strip()
+    return configured or TEXT_CLIP_SERVER_URL_DEFAULT
+
+
+def _get_text_clip_api_key() -> str:
+    configured = os.environ.get("TEXT_CLIP_API_KEY")
+    if configured is None:
+        return _get_api_auth_key()
+    normalized = str(configured).strip()
+    return normalized or _get_api_auth_key()
+
+
+def _get_text_clip_request_timeout_seconds() -> float:
+    raw_timeout = os.environ.get(
+        "TEXT_CLIP_REQUEST_TIMEOUT",
+        str(TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS),
+    )
+    try:
+        timeout_seconds = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout_seconds = TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS
+    return max(1.0, timeout_seconds)
+
+
+def _resolve_text_clip_endpoint_url() -> str:
+    base_url = _get_text_clip_server_url()
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            "TEXT_CLIP_SERVER_URL 必须是绝对 http(s) URL，例如 "
+            "'http://127.0.0.1:8061' 或 'http://mt-photos-ai-text-clip:8061'。"
+        )
+
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path.endswith("/clip/txt"):
+        endpoint_path = normalized_path or "/clip/txt"
+    elif normalized_path:
+        endpoint_path = f"{normalized_path}/clip/txt"
+    else:
+        endpoint_path = "/clip/txt"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, endpoint_path, "", ""))
+
+
+def _decode_text_clip_response(raw_body: bytes, *, status_code: int) -> Dict[str, Any]:
+    response_text = raw_body.decode("utf-8", errors="replace").strip()
+    if not response_text:
+        if 200 <= status_code < 300:
+            raise RuntimeError("独立 Text-CLIP 服务返回了空响应。")
+        return {"result": [], "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"}
+
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        if 200 <= status_code < 300:
+            raise RuntimeError(
+                "独立 Text-CLIP 服务返回了无法解析的 JSON 响应。"
+            ) from exc
+        return {
+            "result": [],
+            "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。",
+        }
+
+    if not isinstance(payload, dict):
+        if 200 <= status_code < 300:
+            raise RuntimeError("独立 Text-CLIP 服务返回了非对象 JSON 响应。")
+        return {
+            "result": [],
+            "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。",
+        }
+
+    if "result" in payload:
+        if 200 <= status_code < 300:
+            return payload
+        message = str(
+            payload.get("msg")
+            or payload.get("detail")
+            or f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"
+        )
+        return {"result": payload.get("result", []), "msg": message}
+
+    if "detail" in payload:
+        return {
+            "result": [],
+            "msg": f"{payload['detail']} (HTTP {status_code})",
+        }
+
+    if 200 <= status_code < 300:
+        raise RuntimeError("独立 Text-CLIP 服务返回了缺少 result 字段的响应。")
+    return {"result": [], "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"}
+
+
+def _forward_text_clip_request(text: str) -> Dict[str, Any]:
+    endpoint_url = _resolve_text_clip_endpoint_url()
+    timeout_seconds = _get_text_clip_request_timeout_seconds()
+    payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    text_clip_api_key = _get_text_clip_api_key()
+    if text_clip_api_key and text_clip_api_key != "no-key":
+        headers[API_KEY_NAME] = text_clip_api_key
+
+    request = urllib.request.Request(
+        endpoint_url,
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status_code = int(getattr(response, "status", 200) or 200)
+            return _decode_text_clip_response(response.read(), status_code=status_code)
+    except urllib.error.HTTPError as exc:
+        return _decode_text_clip_response(exc.read(), status_code=int(exc.code))
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(
+                f"独立 Text-CLIP 服务请求超时（>{timeout_seconds}s）。"
+            ) from exc
+        raise RuntimeError(f"独立 Text-CLIP 服务不可达：{reason}") from exc
 
 
 async def get_api_key(api_key_header: str = Depends(api_key_header)):
@@ -216,7 +348,10 @@ async def lifespan(app: FastAPI):
     global models_instance
     _configure_application_logging()
     _startup_self_check_dri()
-    LOGGER.info("应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。")
+    LOGGER.info(
+        "应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。Text-CLIP 代理上游=%s",
+        _get_text_clip_server_url(),
+    )
     models_instance = AIModels()
 
     yield
@@ -322,6 +457,20 @@ async def restart_process():
         os.execl(python, python, *sys.argv)
     threading.Thread(target=delayed_restart).start()
     return {"result": "pass"}
+
+
+@app.post("/clip/txt", dependencies=[Depends(get_api_key)])
+async def clip_text_proxy_endpoint(request: TextClipRequest):
+    try:
+        return await asyncio.to_thread(_forward_text_clip_request, request.text)
+    except Exception as exc:
+        LOGGER.error(
+            "转发 Text-CLIP 请求失败: '%s...', 错误: %s",
+            request.text[:50],
+            exc,
+            exc_info=True,
+        )
+        return {"result": [], "msg": str(exc)}
 
 
 @app.post("/ocr", dependencies=[Depends(get_api_key)])

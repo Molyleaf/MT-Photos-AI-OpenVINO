@@ -39,3 +39,7 @@ class RepresentResult(BaseModel):
 
 class RestartResponse(BaseModel):
     result: str
+
+
+class TextClipRequest(BaseModel):
+    text: str

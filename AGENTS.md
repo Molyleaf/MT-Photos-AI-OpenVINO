@@ -49,9 +49,9 @@
 - `image-clip/app` 作为并行本地开发子项目时，可独立使用 `PyTorch + CUDA` 提供 `/clip/img`；但它不改变主服务 `/clip/img` 的 OpenVINO 基线、接口语义和部署方式。
 - 主服务 `/clip/img` 推理目标设备：`GPU`（Intel Xe 核显），优先减少 Host<->Device 数据搬运。
 - 主服务 `/clip/img` 的 OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
-- Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例、RPC 子服务或文本 tokenizer 运行链。
+- Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例或文本 tokenizer 运行链，主服务如需暴露 `/clip/txt` 只能做纯 HTTP 代理转发。
 - 独立 Text-CLIP 容器固定使用 OpenVINO `CPU`；**禁止**为它保留 GPU Remote Context、`/dev/dri` 依赖或 Intel GPU runtime 裁剪以外的冗余包。
-- 主服务不得再提供 `/clip/txt`；该端点仅允许由独立 Text-CLIP 服务暴露。
+- 主服务如提供 `/clip/txt`，必须把请求转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务；该代理链路不得进入主容器非文本模型池竞争，也不得触发本地文本模型加载。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
 - `/clip/img` 必须支持 **标准预处理后的受控批处理**：单张请求先完成缩放、中心裁剪与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 聚合成批；批处理不得改变单请求输入输出语义。
@@ -79,7 +79,7 @@
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
 - 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；必须把 `app/config/cfg_openvino_cpu.yaml` 作为 `RapidOCR(config_path=...)` 传入，禁止继续依赖库内默认 YAML。
-- RapidOCR 当前运行基线收敛为 **库内原生 OpenVINO CPU 路径**；`RAPIDOCR_DEVICE` 默认与实际运行时都必须为 `CPU`，显式传入 `AUTO/GPU` 仅允许记录告警后强制回到 `CPU`。
+- RapidOCR 当前运行基线收敛为 **库内原生 OpenVINO CPU 路径**；`rapidocr==3.7.0` 上游 OpenVINO 推理类已写死 `CPU`，因此 `RAPIDOCR_DEVICE` 默认与实际运行时都必须为 `CPU`，显式传入 `AUTO/GPU` 仅允许记录告警后强制回到 `CPU`。
 - `RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE` 仅保留兼容环境变量名，当前实现**不再参与**运行时 stage 选路；禁止再恢复本地 stage 级 session 包装。
 - 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
 - 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
@@ -141,7 +141,7 @@
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
 - 服务必须固定为**单进程**；禁止继续暴露 `WEB_CONCURRENCY` 一类 worker 配置项，也禁止让第二个服务进程在同一工作目录下成功启动。
-- 主容器不得常驻 Text-CLIP 模型；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。独立 Text-CLIP 容器常驻其自身模型即可。
+- 主容器不得常驻 Text-CLIP 模型；Vision-CLIP / OCR / InsightFace 按需懒加载，并采用“单活非文本模型族”切换：切换到新模型族前，必须等待当前模型族任务退场并同步释放旧族模型。独立 Text-CLIP 容器常驻其自身模型即可；主服务 `/clip/txt` 若存在，只能转发到独立容器。
 - 模型实例为空时：相关推理端点返回 HTTP 503（`"模型实例尚未初始化"`）。
 
 ### 4.2 图像读取辅助逻辑（`read_image_from_upload`）
@@ -172,19 +172,25 @@
 - 语义：延迟 1 秒后 `os.execl` 重启进程。
 - 立即返回：`{"result":"pass"}`。
 
-5. `POST /ocr`
+5. `POST /clip/txt`
+- 入参：`{"text": <字符串>}`。
+- 语义：主服务同步鉴权后，把请求转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务。
+- 成功：透传独立 Text-CLIP 服务的成功响应（当前为 `{"result":[<16位小数字符串>...]}`）。
+- 异常：`{"result":[],"msg":<异常文本>}`
+
+6. `POST /ocr`
 - 入参：`file`。
 - 读图失败：`{"result":[],"msg":<错误信息>}`
 - 成功：`{"result":<OCRResult>}`（成功时不返回 `msg`）
 - 运行异常：`{"result":[],"msg":<异常文本>}`
 
-6. `POST /clip/img`
+7. `POST /clip/img`
 - 入参：`file`。
 - 读图失败：`{"result":[],"msg":<错误信息>}`
 - 成功：`{"result":[<16位小数字符串>...]}`（成功时不返回 `msg`）
 - 异常：`{"result":[],"msg":<异常文本>}`
 
-7. `POST /represent`
+8. `POST /represent`
 - 入参：`file`。
 - 读图失败：`{"result":[],"msg":<错误信息>}`
 - 成功：
@@ -198,7 +204,7 @@
 
 ## 5. 模型加载/卸载与调度策略（硬约束）
 
-1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例，且 Text-CLIP 模型在进程存活期间不得主动释放或空闲卸载。
+1. Text-CLIP 必须作为独立容器服务常驻内存，固定走 CPU；主容器不得再持有本地 Text-CLIP 模型实例，且 Text-CLIP 模型在进程存活期间不得主动释放或空闲卸载；主服务如暴露 `/clip/txt`，只能走远程代理。
 2. `/clip/img` 使用独立批队列；单张请求先完成标准预处理与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 受控聚合。
 3. `/clip/img` 批队列实现必须基于 `asyncio.Queue`，禁止继续回到 `Condition + deque + 轮询` 的手写实现。
 4. 非文本模型族必须采用“单活租约”切换：同一时刻只允许一个活跃的 Vision-CLIP / OCR / InsightFace 模型族常驻；切换前必须等待旧族已受理任务完全退场并同步卸载旧族模型。
@@ -207,7 +213,7 @@
 7. InsightFace 使用独立执行路径；但其准入必须遵守第 4 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
 8. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
 9. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 4 条让多个非文本模型族并行常驻。
-10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2` 不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
+10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 代理调用都不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
 11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
 12. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
 13. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
@@ -297,7 +303,7 @@
 - `uvicorn server:app --host 0.0.0.0 --port 8061`（在 `text-clip/app/` 目录）
 - 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
 - 如需验证独立 Text-CLIP 服务的 `PORT` / `LOG_LEVEL`，可在 `text-clip/app/` 目录执行 `python server.py`
-- 关键端点冒烟：主服务 `/check`、`/clip/img`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
+- 关键端点冒烟：主服务 `/check`、`/clip/txt`、`/clip/img`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
 
 ---
 
@@ -384,6 +390,7 @@ services:
       - OCR_EXEC_TIMEOUT=30
       - PORT=8060
       - RAPIDOCR_DEVICE=CPU
+      - TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061
   mt-photos-ai-text-clip:
     image: mt-photos-ai-text-clip:latest
     environment:
@@ -394,7 +401,7 @@ services:
 
 说明：
 - `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace 仅推理侧 EP 会收敛到 `GPU`，仓库内预处理固定走 `CPU`。
-- `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`，且文本模型在进程生命周期内保持常驻。
+- `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`，且文本模型在进程生命周期内保持常驻。主服务如需对外统一端口，必须配置 `TEXT_CLIP_SERVER_URL` 做纯代理。
 - `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求聚合预算 + 4 路 CPU 预处理 worker；如需权衡吞吐与尾延迟，只允许小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不要重新引入额外的 worker/batch 容量环境变量。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
 - 如需调整空闲模型回收窗口，可额外设置 `NON_TEXT_IDLE_RELEASE_SECONDS`；设为 `0` 或负数可关闭该兜底释放。
@@ -439,6 +446,7 @@ docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPI
 
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"
+curl -s -X POST http://127.0.0.1:8060/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 curl -s -X POST http://127.0.0.1:8061/check -H "api-key: mt_photos_ai_extra"
 curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" -H "Content-Type: application/json" -d '{"text":"smoke"}'
 ```

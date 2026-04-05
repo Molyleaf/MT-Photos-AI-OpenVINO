@@ -267,8 +267,10 @@ class RapidOCRMixin(ABC):
     def _finalize_rapidocr_runtime_config(
         self,
         config: Dict[str, Any],
-        requested_device: str,
     ) -> Dict[str, Any]:
+        requested_device = _normalize_non_text_openvino_device(
+            str(config.get("requested_device_name", "CPU"))
+        )
         config["requested_device_name"] = requested_device
         config["device_name"] = "CPU"
         config["det_device_name"] = "CPU"
@@ -298,7 +300,7 @@ class RapidOCRMixin(ABC):
         self._apply_rapidocr_yaml_overrides(config, loaded)
         self._apply_rapidocr_env_overrides(config)
         self._warn_rapidocr_stage_device_overrides()
-        return self._finalize_rapidocr_runtime_config(config, requested_device)
+        return self._finalize_rapidocr_runtime_config(config)
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
         required_files = {
