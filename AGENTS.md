@@ -16,6 +16,7 @@
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 使用 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
+- 主服务辅助模块：`app/bootstrap.py`（日志与启动配置）、`app/image_io.py`（上传图像解码/归一化）、`app/text_clip_proxy.py`（`/clip/txt` 代理转发）；运行时配置聚合位于 `app/models/runtime_settings.py`。
 - Text-CLIP 独立服务入口：`text-clip/app/server.py`。
 - Windows 本地 CUDA Image-CLIP 并行子项目命令行入口：`image-clip/starter.py`；服务实现入口：`image-clip/app/server.py`；依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。

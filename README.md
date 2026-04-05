@@ -10,6 +10,7 @@
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 主服务入口：`app/server.py`
+- 主服务仍由 `app/server.py` 暴露路由；同目录 `app/bootstrap.py`、`app/image_io.py`、`app/text_clip_proxy.py` 仅用于维护性拆分，不改变启动方式和接口语义
 - Text-CLIP 服务入口：`text-clip/app/server.py`
 - Windows 本地 CUDA Image-CLIP 子项目命令行入口：`image-clip/starter.py`
 - Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`

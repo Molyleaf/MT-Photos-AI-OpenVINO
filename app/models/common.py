@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import logging
 import os
 import threading
 import time
@@ -22,6 +24,11 @@ else:
     import fcntl  # type: ignore[attr-defined]
 
     msvcrt = None  # type: ignore[assignment]
+
+
+_WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
+_WINDOWS_DLL_DIRECTORY_PATHS: set[str] = set()
+_WINDOWS_RUNTIME_LOG = logging.getLogger("mt_photos_ai.models")
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -49,6 +56,57 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _prepare_windows_openvino_runtime() -> None:
+    if os.name != "nt":
+        return
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if not callable(add_dll_directory):
+        return
+
+    candidate_dirs: list[Path] = []
+    for module_name, relative_dirs in (
+        ("openvino", ("libs", "lib")),
+        ("onnxruntime", ("capi",)),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+
+        module_root = Path(getattr(module, "__file__", "")).resolve().parent
+        candidate_dirs.append(module_root)
+        for relative_dir in relative_dirs:
+            candidate_dirs.append(module_root / relative_dir)
+
+    for candidate in candidate_dirs:
+        resolved = candidate.expanduser().resolve()
+        normalized = str(resolved)
+        if not resolved.is_dir() or normalized in _WINDOWS_DLL_DIRECTORY_PATHS:
+            continue
+        handle = add_dll_directory(normalized)
+        _WINDOWS_DLL_DIRECTORY_HANDLES.append(handle)
+        _WINDOWS_DLL_DIRECTORY_PATHS.add(normalized)
+
+    if _WINDOWS_DLL_DIRECTORY_PATHS:
+        existing_path_entries = {
+            entry.strip().lower()
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry.strip()
+        }
+        missing_entries = [
+            dll_dir
+            for dll_dir in _WINDOWS_DLL_DIRECTORY_PATHS
+            if dll_dir.lower() not in existing_path_entries
+        ]
+        if missing_entries:
+            os.environ["PATH"] = os.pathsep.join([*missing_entries, os.environ.get("PATH", "")])
+        _WINDOWS_RUNTIME_LOG.info(
+            "Registered Windows DLL search paths for OpenVINO/ORT runtime: %s",
+            ",".join(sorted(_WINDOWS_DLL_DIRECTORY_PATHS)),
+        )
 
 
 def _normalize_openvino_devices(devices: Any) -> List[str]:

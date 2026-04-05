@@ -1,426 +1,38 @@
-# app/server.py
 import asyncio
-import json
 import logging
 import os
-import socket
 import sys
 import threading
-import urllib.error
-import urllib.parse
-import urllib.request
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional
 
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_APP_DIR)
-_LOG_FILE = os.path.join(_PROJECT_ROOT, "server.log")
-_LOG_NAMESPACE = "mt_photos_ai"
-_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-_APP_LOG_HANDLER_FLAG = "_mt_photos_ai_handler"
-_KNOWN_LOGGER_NAMES = (
-    _LOG_NAMESPACE,
-    f"{_LOG_NAMESPACE}.server",
-    f"{_LOG_NAMESPACE}.models",
-    "uvicorn",
-    "uvicorn.error",
-    "uvicorn.access",
-    "rapidocr",
-    "rapidocr.utils.log",
-)
-
-
-def _resolve_log_level() -> tuple[str, int]:
-    configured_name = str(os.environ.get("LOG_LEVEL", "WARNING")).strip().upper() or "WARNING"
-    resolved_level = getattr(logging, configured_name, logging.WARNING)
-    resolved_name = logging.getLevelName(resolved_level)
-    if not isinstance(resolved_name, str):
-        resolved_name = "WARNING"
-        resolved_level = logging.WARNING
-    return resolved_name, int(resolved_level)
-
-
-def _synchronize_known_logger_levels(log_level: int) -> None:
-    for logger_name in _KNOWN_LOGGER_NAMES:
-        logging.getLogger(logger_name).setLevel(log_level)
-
-
-def _configure_application_logging() -> None:
-    _, log_level = _resolve_log_level()
-    namespace_logger = logging.getLogger(_LOG_NAMESPACE)
-    namespace_logger.setLevel(log_level)
-    namespace_logger.propagate = False
-    _synchronize_known_logger_levels(log_level)
-
-    configured_handlers = [
-        handler
-        for handler in namespace_logger.handlers
-        if getattr(handler, _APP_LOG_HANDLER_FLAG, False)
-    ]
-    if configured_handlers:
-        for handler in configured_handlers:
-            handler.setLevel(log_level)
-            handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-        return
-
-    formatter = logging.Formatter(_LOG_FORMAT)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
-    console_handler.setFormatter(formatter)
-    setattr(console_handler, _APP_LOG_HANDLER_FLAG, True)
-    namespace_logger.addHandler(console_handler)
-
-    if sys.platform == "win32":
-        try:
-            file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a")
-        except Exception as exc:
-            print(f"无法设置文件日志: {exc}")
-        else:
-            file_handler.setLevel(log_level)
-            file_handler.setFormatter(formatter)
-            setattr(file_handler, _APP_LOG_HANDLER_FLAG, True)
-            namespace_logger.addHandler(file_handler)
-
-
-def _configure_standalone_logging() -> None:
-    _configure_application_logging()
-
-
-_configure_application_logging()
-
-import cv2
-import numpy as np
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
+from bootstrap import (
+    LOG_NAMESPACE,
+    configure_application_logging,
+    configure_standalone_logging,
+    load_server_settings,
+    startup_self_check_dri,
+)
+from image_io import read_image_from_upload
 from models.constants import MODEL_NAME
 from models.runtime import AIModels
 from models.schemas import (
     CheckResponse,
     RestartResponse,
 )
+from text_clip_proxy import TextClipProxyClient
 
-LOGGER = logging.getLogger(f"{_LOG_NAMESPACE}.server")
+configure_application_logging()
 
-
-API_AUTH_KEY_DEFAULT = "mt_photos_ai_extra"
+LOGGER = logging.getLogger(f"{LOG_NAMESPACE}.server")
 API_KEY_NAME = "api-key"
-TEXT_CLIP_SERVER_URL_DEFAULT = "http://127.0.0.1:8061"
-TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS = 30.0
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-
-def _get_api_auth_key() -> str:
-    return os.environ.get("API_AUTH_KEY", API_AUTH_KEY_DEFAULT)
-
-
-def _get_text_clip_server_url() -> str:
-    configured = str(
-        os.environ.get("TEXT_CLIP_SERVER_URL", TEXT_CLIP_SERVER_URL_DEFAULT)
-    ).strip()
-    return configured or TEXT_CLIP_SERVER_URL_DEFAULT
-
-
-def _get_text_clip_api_key() -> str:
-    configured = os.environ.get("TEXT_CLIP_API_KEY")
-    if configured is None:
-        return _get_api_auth_key()
-    normalized = str(configured).strip()
-    return normalized or _get_api_auth_key()
-
-
-def _get_text_clip_request_timeout_seconds() -> float:
-    raw_timeout = os.environ.get(
-        "TEXT_CLIP_REQUEST_TIMEOUT",
-        str(TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS),
-    )
-    try:
-        timeout_seconds = float(raw_timeout)
-    except (TypeError, ValueError):
-        timeout_seconds = TEXT_CLIP_REQUEST_TIMEOUT_DEFAULT_SECONDS
-    return max(1.0, timeout_seconds)
-
-
-def _resolve_text_clip_endpoint_url() -> str:
-    base_url = _get_text_clip_server_url()
-    parsed = urllib.parse.urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError(
-            "TEXT_CLIP_SERVER_URL 必须是绝对 http(s) URL，例如 "
-            "'http://127.0.0.1:8061' 或 'http://mt-photos-ai-text-clip:8061'。"
-        )
-
-    normalized_path = parsed.path.rstrip("/")
-    if normalized_path.endswith("/clip/txt"):
-        endpoint_path = normalized_path or "/clip/txt"
-    elif normalized_path:
-        endpoint_path = f"{normalized_path}/clip/txt"
-    else:
-        endpoint_path = "/clip/txt"
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, endpoint_path, "", ""))
-
-
-def _decode_text_clip_response(raw_body: bytes, *, status_code: int) -> Dict[str, Any]:
-    response_text = raw_body.decode("utf-8", errors="replace").strip()
-    if not response_text:
-        if 200 <= status_code < 300:
-            raise RuntimeError("独立 Text-CLIP 服务返回了空响应。")
-        return {"result": [], "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"}
-
-    try:
-        payload = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        if 200 <= status_code < 300:
-            raise RuntimeError(
-                "独立 Text-CLIP 服务返回了无法解析的 JSON 响应。"
-            ) from exc
-        return {
-            "result": [],
-            "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。",
-        }
-
-    if not isinstance(payload, dict):
-        if 200 <= status_code < 300:
-            raise RuntimeError("独立 Text-CLIP 服务返回了非对象 JSON 响应。")
-        return {
-            "result": [],
-            "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。",
-        }
-
-    if "result" in payload:
-        if 200 <= status_code < 300:
-            return payload
-        message = str(
-            payload.get("msg")
-            or payload.get("detail")
-            or f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"
-        )
-        return {"result": payload.get("result", []), "msg": message}
-
-    if "detail" in payload:
-        return {
-            "result": [],
-            "msg": f"{payload['detail']} (HTTP {status_code})",
-        }
-
-    if 200 <= status_code < 300:
-        raise RuntimeError("独立 Text-CLIP 服务返回了缺少 result 字段的响应。")
-    return {"result": [], "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"}
-
-
-def _forward_text_clip_request(
-    raw_body: bytes,
-    *,
-    content_type: Optional[str],
-) -> Dict[str, Any]:
-    endpoint_url = _resolve_text_clip_endpoint_url()
-    timeout_seconds = _get_text_clip_request_timeout_seconds()
-    headers = {
-        "Content-Type": content_type or "application/json; charset=utf-8",
-    }
-    text_clip_api_key = _get_text_clip_api_key()
-    if text_clip_api_key and text_clip_api_key != "no-key":
-        headers[API_KEY_NAME] = text_clip_api_key
-
-    request = urllib.request.Request(
-        endpoint_url,
-        data=raw_body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status_code = int(getattr(response, "status", 200) or 200)
-            return _decode_text_clip_response(response.read(), status_code=status_code)
-    except urllib.error.HTTPError as exc:
-        return _decode_text_clip_response(exc.read(), status_code=int(exc.code))
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            raise RuntimeError(
-                f"独立 Text-CLIP 服务请求超时（>{timeout_seconds}s）。"
-            ) from exc
-        raise RuntimeError(f"独立 Text-CLIP 服务不可达：{reason}") from exc
-
-
-async def get_api_key(api_key_header: str = Depends(api_key_header)):
-    api_auth_key = _get_api_auth_key()
-    if not api_auth_key or api_auth_key == "no-key":
-        return
-    if api_key_header != api_auth_key:
-        LOGGER.warning("拒绝了无效的 API 密钥。")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-models_instance: Optional[AIModels] = None
-MAX_IMAGE_SIDE = 10000
-
-
-def _mark_request_activity() -> None:
-    if models_instance is None:
-        return
-    models_instance.mark_request_activity()
-
-
-def _device_requests_gpu(device_name: str) -> bool:
-    normalized = str(device_name or "").strip().upper()
-    return normalized == "AUTO" or "GPU" in normalized
-
-
-def _startup_self_check_dri() -> None:
-    if os.name == "nt":
-        return
-
-    inference_device = os.environ.get("INFERENCE_DEVICE", "AUTO")
-    clip_device = os.environ.get("CLIP_INFERENCE_DEVICE", inference_device)
-    if not (_device_requests_gpu(inference_device) or _device_requests_gpu(clip_device)):
-        LOGGER.info("启动自检：未请求 GPU 设备，跳过 /dev/dri 检查。")
-        return
-
-    dri_dir = "/dev/dri"
-    if not os.path.isdir(dri_dir):
-        raise RuntimeError(
-            "启动自检失败：已请求 GPU 推理，但容器内不存在 /dev/dri。"
-            "请映射 --device /dev/dri:/dev/dri 并设置正确的 video/render 组。"
-        )
-
-    try:
-        dri_nodes = [
-            os.path.join(dri_dir, name)
-            for name in sorted(os.listdir(dri_dir))
-            if name.startswith("card") or name.startswith("renderD")
-        ]
-    except Exception as exc:
-        raise RuntimeError(f"启动自检失败：无法读取 {dri_dir}: {exc}") from exc
-
-    if not dri_nodes:
-        raise RuntimeError(
-            "启动自检失败：/dev/dri 未发现 card*/renderD* 节点，无法执行 GPU 推理。"
-        )
-
-    denied_nodes = [node for node in dri_nodes if not os.access(node, os.R_OK | os.W_OK)]
-    if denied_nodes:
-        raise RuntimeError(
-            "启动自检失败：/dev/dri 设备权限不足，请检查容器用户组映射。"
-            f" 无权限节点: {', '.join(denied_nodes)}"
-        )
-
-    LOGGER.info(
-        "启动自检通过：GPU 设备节点可访问。INFERENCE_DEVICE=%s CLIP_INFERENCE_DEVICE=%s",
-        inference_device,
-        clip_device,
-    )
-
-
-def _decode_first_gif_frame(contents: bytes) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    buffer = np.frombuffer(contents, np.uint8)
-    errors: list[str] = []
-
-    if hasattr(cv2, "imdecodeanimation"):
-        try:
-            ok, animation = cv2.imdecodeanimation(buffer)
-        except Exception as exc:
-            errors.append(f"cv2.imdecodeanimation failed: {exc}")
-        else:
-            frames = getattr(animation, "frames", None) if ok else None
-            if frames:
-                return np.asarray(frames[0]), None
-
-    if hasattr(cv2, "imdecodemulti"):
-        try:
-            ok, frames = cv2.imdecodemulti(buffer, cv2.IMREAD_UNCHANGED)
-        except Exception as exc:
-            errors.append(f"cv2.imdecodemulti failed: {exc}")
-        else:
-            if ok and frames:
-                return np.asarray(frames[0]), None
-
-    decoded = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
-    if decoded is None:
-        if errors:
-            return None, "; ".join(errors)
-        return None, "GIF first-frame decode failed"
-    return decoded, None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global models_instance
-    _configure_application_logging()
-    _startup_self_check_dri()
-    LOGGER.info(
-        "应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。Text-CLIP 代理上游=%s",
-        _get_text_clip_server_url(),
-    )
-    models_instance = AIModels()
-
-    yield
-    LOGGER.info("应用关闭：正在释放所有模型。")
-    if models_instance:
-        await asyncio.to_thread(models_instance.release_all_models)
-
-
-app = FastAPI(
-    title="MT-Photos AI 统一服务",
-    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
-    version="2.2.0",
-    lifespan=lifespan
-)
-
-async def read_image_from_upload(file: UploadFile) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    读取上传的图像文件，处理 GIF、16-bit 和其他格式。
-    在失败时返回 (None, "错误消息")，而不是抛出 HTTPException。
-    """
-    contents = await file.read()
-    img = None
-
-    try:
-        is_gif = file.content_type == "image/gif" or str(file.filename).lower().endswith(".gif")
-        if is_gif:
-            img, gif_err = await asyncio.to_thread(_decode_first_gif_frame, contents)
-            if img is None and gif_err:
-                LOGGER.info("GIF 首帧解码失败，将按普通静态图继续尝试: %s", gif_err)
-
-        if img is None:
-            nparr = np.frombuffer(contents, np.uint8)
-            img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_UNCHANGED)
-
-        if img is None:
-            LOGGER.info("文件 '%s' 无法被解码为图像。", file.filename)
-            return None, f"文件 '{file.filename}' 无法被解码为图像。"
-
-        if img.dtype == np.uint16:
-            LOGGER.info("文件 '%s' 是 16-bit 图像，正在转换为 8-bit。", file.filename)
-            img = (img / 256).astype(np.uint8)
-
-        height, width, channels = img.shape if len(img.shape) == 3 else (img.shape[0], img.shape[1], 1)
-        if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
-            LOGGER.info("文件 '%s' 尺寸超限: %sx%s", file.filename, width, height)
-            return None, "height or width out of range"
-
-        if channels == 1:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif channels == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-        if len(img.shape) < 3 or img.shape[2] != 3:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-        return img, None
-
-    except Exception as e:
-        LOGGER.error("读取图像 '%s' 时发生意外错误: %s", file.filename, e, exc_info=True)
-        return None, f"处理图像时发生意外错误: {str(e)}"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def top_info():
-    html_content = """<!DOCTYPE html>
+STATUS_PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -434,7 +46,72 @@ async def top_info():
 <p>作者：https://github.com/Molyleaf/MT-Photos-AI-OpenVINO</p>
 </body>
 </html>"""
-    return HTMLResponse(content=html_content)
+
+
+def _build_text_clip_proxy_client() -> TextClipProxyClient:
+    return TextClipProxyClient(
+        load_server_settings().text_clip,
+        api_key_header_name=API_KEY_NAME,
+    )
+
+
+async def get_api_key(api_key_header: str = Depends(api_key_header)):
+    api_auth_key = load_server_settings().api_auth_key
+    if not api_auth_key or api_auth_key == "no-key":
+        return
+    if api_key_header != api_auth_key:
+        LOGGER.warning("拒绝了无效的 API 密钥。")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+
+models_instance: Optional[AIModels] = None
+
+
+def _require_models_instance() -> AIModels:
+    if models_instance is None:
+        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+    return models_instance
+
+
+def _mark_request_activity(models: AIModels) -> None:
+    models.mark_request_activity()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global models_instance
+    configure_application_logging()
+    startup_self_check_dri(LOGGER)
+    settings = load_server_settings()
+    LOGGER.info(
+        "应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。Text-CLIP 代理上游=%s",
+        settings.text_clip.server_url,
+    )
+    models_instance = AIModels()
+    try:
+        yield
+    finally:
+        LOGGER.info("应用关闭：正在释放所有模型。")
+        if models_instance:
+            await asyncio.to_thread(models_instance.release_all_models)
+            models_instance = None
+
+
+app = FastAPI(
+    title="MT-Photos AI 统一服务",
+    description="一个基于 OpenVINO 加速的、用于照片分析的高性能统一AI服务。\n https://github.com/Molyleaf/MT-Photos-AI-OpenVINO",
+    version="2.2.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def top_info():
+    return HTMLResponse(content=STATUS_PAGE_HTML)
+
 
 @app.post("/check", response_model=CheckResponse, dependencies=[Depends(get_api_key)])
 async def check_service():
@@ -444,6 +121,7 @@ async def check_service():
         "help": "https://mtmt.tech/docs/advanced/ocr_api",
     }
 
+
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_service():
     LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。")
@@ -451,15 +129,19 @@ async def restart_service():
         await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}
 
+
 @app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
 async def restart_process():
     LOGGER.info("收到 /restart_v2 请求，将重启整个服务进程。")
+
     def delayed_restart():
         import time
+
         time.sleep(1)
         python = sys.executable
         os.execl(python, python, *sys.argv)
-    threading.Thread(target=delayed_restart).start()
+
+    threading.Thread(target=delayed_restart, name="restart-v2", daemon=True).start()
     return {"result": "pass"}
 
 
@@ -468,8 +150,9 @@ async def clip_text_proxy_endpoint(request: Request):
     request_body = await request.body()
     content_type = request.headers.get("content-type")
     try:
+        proxy_client = _build_text_clip_proxy_client()
         return await asyncio.to_thread(
-            _forward_text_clip_request,
+            proxy_client.forward_request,
             request_body,
             content_type=content_type,
         )
@@ -486,78 +169,78 @@ async def clip_text_proxy_endpoint(request: Request):
 
 @app.post("/ocr", dependencies=[Depends(get_api_key)])
 async def ocr_endpoint(file: UploadFile = File(...)):
-    if not models_instance:
-        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+    models = _require_models_instance()
 
-    _mark_request_activity()
-    image, error_msg = await read_image_from_upload(file)
+    _mark_request_activity(models)
+    image, error_msg = await read_image_from_upload(file, logger=LOGGER)
     if image is None:
         return {"result": [], "msg": error_msg}
 
     try:
-        ocr_results_obj = await models_instance.get_ocr_results_async(image)
+        ocr_results_obj = await models.get_ocr_results_async(image)
         return {"result": ocr_results_obj.model_dump()}
     except Exception as e:
         LOGGER.error("处理 OCR 请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
+
 @app.post("/clip/img", dependencies=[Depends(get_api_key)])
 async def clip_image_endpoint(file: UploadFile = File(...)):
-    if not models_instance:
-        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+    models = _require_models_instance()
 
-    _mark_request_activity()
+    _mark_request_activity(models)
     LOGGER.debug("开始处理 CLIP 图像请求: %s", file.filename)
 
-    image, error_msg = await read_image_from_upload(file)
+    image, error_msg = await read_image_from_upload(file, logger=LOGGER)
     if image is None:
         return {"result": [], "msg": error_msg}
 
     try:
-        embedding = await models_instance.get_image_embedding_async(image)
+        embedding = await models.get_image_embedding_async(image)
         result_strings = [f"{f:.16f}" for f in embedding]
         return {"result": result_strings}
     except Exception as e:
         LOGGER.error("处理 CLIP 请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
         return {"result": [], "msg": str(e)}
 
+
 @app.post("/represent", dependencies=[Depends(get_api_key)])
 async def represent_endpoint(file: UploadFile = File(...)):
-    if not models_instance:
-        raise HTTPException(status_code=503, detail="模型实例尚未初始化")
+    models = _require_models_instance()
 
-    _mark_request_activity()
-    image, error_msg = await read_image_from_upload(file)
+    _mark_request_activity(models)
+    image, error_msg = await read_image_from_upload(file, logger=LOGGER)
     if image is None:
         return {"result": [], "msg": error_msg}
 
     try:
-        face_results_list = await models_instance.get_face_representation_async(image)
+        face_results_list = await models.get_face_representation_async(image)
         results_dict = [r.model_dump() for r in face_results_list]
         return {
             "detector_backend": "insightface",
             "recognition_model": MODEL_NAME,
-            "result": results_dict
+            "result": results_dict,
         }
     except Exception as e:
         LOGGER.error("处理人脸识别请求失败: %s, 错误: %s", file.filename, e, exc_info=True)
-        if 'set enforce_detection' in str(e) or 'Face could not be detected' in str(e):
+        if "set enforce_detection" in str(e) or "Face could not be detected" in str(e):
             return {"result": []}
 
         return {"result": [], "msg": str(e)}
 
+
 if __name__ == "__main__":
     import uvicorn
-    _configure_standalone_logging()
-    port = int(os.environ.get("PORT", 8060))
-    log_level, _ = _resolve_log_level()
+
+    configure_standalone_logging()
+    settings = load_server_settings()
 
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=port,
+        port=settings.port,
         reload=False,
         workers=1,
-        log_level=log_level.lower(),
-        access_log=False
+        log_level=settings.log_level_name.lower(),
+        access_log=False,
     )

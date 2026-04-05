@@ -21,29 +21,24 @@ from .common import (
     _InferenceCancelled,
     _InterProcessFileLock,
     _OpenVinoPreprocessRunner,
-    _as_bool,
-    _as_float,
-    _as_int,
+    _prepare_windows_openvino_runtime,
     _extract_explicit_gpu_devices,
     _get_openvino_gpu_devices,
     _normalize_openvino_devices,
     _summarize_exception,
 )
 from .constants import (
-    APP_DIR,
-    CLIP_INFERENCE_DEVICE,
-    EXEC_TIMEOUT_SECONDS,
-    INSIGHTFACE_PREPROCESS_WORKERS,
     INSIGHTFACE_REQUEST_CAPACITY,
     INSIGHTFACE_SINGLE_LANE,
     LOG,
-    MAX_PENDING_IMAGE_REQUESTS,
-    PROJECT_ROOT,
-    QUEUE_MAX_SIZE,
-    QUEUE_TIMEOUT_SECONDS,
 )
 from .insightface import InsightFaceMixin
 from .rapidocr_lib import RapidOCRMixin
+from .runtime_settings import (
+    load_clip_image_runtime_settings,
+    load_execution_control_settings,
+    load_runtime_path_settings,
+)
 
 
 class _NonTextFamilyStateModel:
@@ -206,6 +201,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     def __init__(self) -> None:
         self._pid = os.getpid()
         self._stopping = False
+        _prepare_windows_openvino_runtime()
         self._initialize_paths()
         self._initialize_openvino_runtime()
         self._initialize_model_load_locks()
@@ -224,34 +220,19 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             raise
 
     def _initialize_paths(self) -> None:
-        self.model_base_path = Path(
-            os.environ.get("MODEL_PATH", str(PROJECT_ROOT / "models"))
-        )
-        self.insightface_root = self.model_base_path / "insightface"
-        self.insightface_model_root = self.insightface_root / "models"
-        self.qa_clip_path = self.model_base_path / "qa-clip" / "openvino"
-        self._clip_inference_device = CLIP_INFERENCE_DEVICE
-
-        cache_dir_raw = str(os.environ.get("OV_CACHE_DIR", "")).strip()
-        if cache_dir_raw:
-            self.ov_cache_dir = Path(cache_dir_raw).expanduser().resolve()
-        else:
-            self.ov_cache_dir = (PROJECT_ROOT / "cache" / "openvino").resolve()
-        self.ov_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        self.rapidocr_config_path = Path(
-            os.environ.get(
-                "RAPIDOCR_OPENVINO_CONFIG_PATH",
-                str(APP_DIR / "config" / "cfg_openvino_cpu.yaml"),
-            )
-        )
-        self.rapidocr_model_dir = os.environ.get(
-            "RAPIDOCR_MODEL_DIR", str(self.model_base_path / "rapidocr")
-        )
-        self.rapidocr_model_dir_path = Path(self.rapidocr_model_dir).expanduser().resolve()
-        self.rapidocr_font_path = os.environ.get("RAPIDOCR_FONT_PATH", "")
-        self._runtime_state_dir = (PROJECT_ROOT / "cache" / "runtime").resolve()
-        self._runtime_state_dir.mkdir(parents=True, exist_ok=True)
+        self._path_settings = load_runtime_path_settings()
+        self._clip_image_settings = load_clip_image_runtime_settings()
+        self.model_base_path = self._path_settings.model_base_path
+        self.insightface_root = self._path_settings.insightface_root
+        self.insightface_model_root = self._path_settings.insightface_model_root
+        self.qa_clip_path = self._path_settings.qa_clip_path
+        self._clip_inference_device = self._clip_image_settings.inference_device
+        self.ov_cache_dir = self._path_settings.ov_cache_dir
+        self.rapidocr_config_path = self._path_settings.rapidocr_config_path
+        self.rapidocr_model_dir = self._path_settings.rapidocr_model_dir
+        self.rapidocr_model_dir_path = self._path_settings.rapidocr_model_dir_path
+        self.rapidocr_font_path = self._path_settings.rapidocr_font_path
+        self._runtime_state_dir = self._path_settings.runtime_state_dir
 
     def _initialize_openvino_runtime(self) -> None:
         self.core = ov.Core()
@@ -285,17 +266,8 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._clip_vision_model: Optional[ov.CompiledModel] = None
         self._clip_vision_ppp: Optional[_OpenVinoPreprocessRunner] = None
         self._clip_vision_request: Optional[ov.InferRequest] = None
-        self._clip_image_batch_size = max(
-            1,
-            _as_int(
-                os.environ.get("CLIP_IMAGE_BATCH", os.environ.get("CLIP_IMAGE_BATCH_SIZE")),
-                8,
-            ),
-        )
-        self._clip_image_batch_wait_seconds = max(
-            0.0,
-            _as_float(os.environ.get("CLIP_IMAGE_BATCH_WAIT_MS"), 5.0) / 1000.0,
-        )
+        self._clip_image_batch_size = self._clip_image_settings.batch_size
+        self._clip_image_batch_wait_seconds = self._clip_image_settings.batch_wait_seconds
         self._clip_image_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
         self._clip_image_queue: Optional[asyncio.Queue[Optional[_ClipImageTask]]] = None
         self._clip_image_loop_ready = threading.Event()
@@ -314,58 +286,43 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._face_preprocess_device: Optional[str] = None
 
     def _initialize_execution_controls(self) -> None:
-        configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
-        self._queue_capacity = min(MAX_PENDING_IMAGE_REQUESTS, configured_queue_capacity)
-        if configured_queue_capacity > self._queue_capacity:
+        self._execution_settings = load_execution_control_settings()
+        self._queue_capacity = self._execution_settings.queue_capacity
+        if self._execution_settings.configured_queue_capacity > self._queue_capacity:
             LOG.warning(
                 "INFERENCE_QUEUE_MAX_SIZE=%s exceeds MT-Photos safe limit %s; capping to %s.",
-                configured_queue_capacity,
-                MAX_PENDING_IMAGE_REQUESTS,
+                self._execution_settings.configured_queue_capacity,
+                self._queue_capacity,
                 self._queue_capacity,
             )
 
-        self._queue_timeout_seconds = max(1, QUEUE_TIMEOUT_SECONDS)
-        self._execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
-        self._ocr_execution_timeout_seconds = max(
-            1,
-            _as_int(
-                os.environ.get("OCR_EXEC_TIMEOUT"),
-                max(30, self._execution_timeout_seconds),
-            ),
+        self._queue_timeout_seconds = self._execution_settings.queue_timeout_seconds
+        self._execution_timeout_seconds = self._execution_settings.execution_timeout_seconds
+        self._ocr_execution_timeout_seconds = (
+            self._execution_settings.ocr_execution_timeout_seconds
         )
-        self._idle_release_timeout_seconds = max(
-            0.0,
-            _as_float(os.environ.get("NON_TEXT_IDLE_RELEASE_SECONDS"), 60.0),
+        self._idle_release_timeout_seconds = (
+            self._execution_settings.idle_release_timeout_seconds
         )
+        self._ocr_prewarm_enabled = self._execution_settings.ocr_prewarm_enabled
+        self._ocr_prewarm_delay_seconds = self._execution_settings.ocr_prewarm_delay_seconds
 
         self._image_admission = _AdmissionController("image", self._queue_capacity)
-        self._ocr_worker_count = max(
-            1,
-            _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2),
-        )
-        self._face_preprocess_worker_count = max(
-            1,
-            min(
-                self._queue_capacity,
-                INSIGHTFACE_REQUEST_CAPACITY,
-                INSIGHTFACE_PREPROCESS_WORKERS,
-                os.cpu_count() or INSIGHTFACE_PREPROCESS_WORKERS,
-            ),
+        self._ocr_worker_count = self._execution_settings.ocr_worker_count
+        self._face_preprocess_worker_count = (
+            self._execution_settings.face_preprocess_worker_count
         )
         self._ocr_admission = _AdmissionController(
             "ocr",
-            self._resolve_ocr_request_capacity(self._ocr_worker_count),
+            self._execution_settings.ocr_admission_capacity,
         )
         self._face_admission = _AdmissionController(
             "face",
-            max(1, min(self._queue_capacity, INSIGHTFACE_REQUEST_CAPACITY)),
+            self._execution_settings.face_batch_size,
         )
         self._face_batch_size = self._face_admission.capacity
-        self._face_batch_wait_seconds = max(
-            0.0,
-            _as_float(os.environ.get("INSIGHTFACE_BATCH_WAIT_MS"), 5.0) / 1000.0,
-        )
-        self._face_queue_capacity = self._face_admission.capacity
+        self._face_batch_wait_seconds = self._execution_settings.face_batch_wait_seconds
+        self._face_queue_capacity = self._execution_settings.face_queue_capacity
 
         self._shared_cpu_executor = ThreadPoolExecutor(
             max_workers=max(2, min(8, os.cpu_count() or 4)),
@@ -428,7 +385,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._ocr_execution_timeout_seconds,
             self._clip_image_batch_size,
             int(self._clip_image_batch_wait_seconds * 1000.0),
-            _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False),
+            self._ocr_prewarm_enabled,
             int(self._idle_release_timeout_seconds),
             self._ocr_admission.capacity,
             INSIGHTFACE_SINGLE_LANE,
@@ -444,11 +401,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         except Exception as exc:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
-    def _resolve_ocr_request_capacity(self, worker_count: int) -> int:
-        default_capacity = max(2, int(worker_count) * 2)
-        configured = _as_int(os.environ.get("OCR_MAX_CONCURRENT_REQUESTS"), default_capacity)
-        return max(1, min(self._queue_capacity, configured))
-
     def _acquire_image_request_slot(self, label: str) -> None:
         if self._image_admission.acquire(timeout=0.0):
             return
@@ -460,7 +412,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._image_admission.release()
 
     def _start_background_prewarm(self) -> None:
-        if not _as_bool(os.environ.get("OCR_PREWARM_ENABLED"), False):
+        if not self._ocr_prewarm_enabled:
             return
         self._background_prewarm_cancel.clear()
         self._background_prewarm_thread = threading.Thread(
@@ -533,7 +485,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._idle_release_thread = None
 
     def _background_prewarm_loop(self) -> None:
-        delay_seconds = max(0.0, _as_float(os.environ.get("OCR_PREWARM_DELAY_SECONDS"), 1.0))
+        delay_seconds = self._ocr_prewarm_delay_seconds
         if bool(self._background_prewarm_cancel.wait(timeout=delay_seconds)):
             return
         if self._stopping or self._background_prewarm_cancel.is_set():
