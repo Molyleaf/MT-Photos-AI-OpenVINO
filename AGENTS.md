@@ -51,7 +51,7 @@
 - 主服务 `/clip/img` 的 OpenVINO 侧优先启用 Remote Tensor API 相关互操作能力（零拷贝/少拷贝优先）。
 - Text-CLIP 必须拆到独立容器，代码位于 `text-clip/app`；主容器**不得**再保留本地 Text-CLIP 模型实例或文本 tokenizer 运行链，主服务如需暴露 `/clip/txt` 只能做纯 HTTP 代理转发。
 - 独立 Text-CLIP 容器固定使用 OpenVINO `CPU`；**禁止**为它保留 GPU Remote Context、`/dev/dri` 依赖或 Intel GPU runtime 裁剪以外的冗余包。
-- 主服务如提供 `/clip/txt`，必须把请求转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务；该代理链路不得进入主容器非文本模型池竞争，也不得触发本地文本模型加载。
+- 主服务如提供 `/clip/txt`，必须把请求体按原样转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务；主服务不得重新解析/重组 Text-CLIP 业务字段。该代理链路不得进入主容器非文本模型池竞争，也不得触发本地文本模型加载。
 - 当 `CLIP_INFERENCE_DEVICE=AUTO` 时，必须强制初始化 GPU Remote Context；初始化失败必须直接报错，禁止 silent fallback。
 - 当 `CLIP_INFERENCE_DEVICE` 显式包含 `GPU`（如 `GPU`、`AUTO:GPU,CPU`）时，也必须显式完成 GPU Remote Context 初始化；失败直接报错，禁止静默继续。
 - `/clip/img` 必须支持 **标准预处理后的受控批处理**：单张请求先完成缩放、中心裁剪与 PPP 归一化，再按 `CLIP_IMAGE_BATCH` 聚合成批；批处理不得改变单请求输入输出语义。
@@ -173,8 +173,8 @@
 - 立即返回：`{"result":"pass"}`。
 
 5. `POST /clip/txt`
-- 入参：`{"text": <字符串>}`。
-- 语义：主服务同步鉴权后，把请求转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务。
+- 入参：透传独立 Text-CLIP 服务原始请求体（当前示例为 `{"text": <字符串>}`）。
+- 语义：主服务同步鉴权后，把请求体和 `Content-Type` 原样转发到 `TEXT_CLIP_SERVER_URL` 指向的独立 Text-CLIP 服务。
 - 成功：透传独立 Text-CLIP 服务的成功响应（当前为 `{"result":[<16位小数字符串>...]}`）。
 - 异常：`{"result":[],"msg":<异常文本>}`
 

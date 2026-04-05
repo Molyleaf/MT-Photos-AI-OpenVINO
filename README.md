@@ -66,7 +66,7 @@
 | `RAPIDOCR_USE_CLS` | 是否启用方向分类器 | `true` |
 | `TEXT_CLIP_API_KEY` | 主服务转发 `/clip/txt` 时使用的上游 API Key；未设置时复用 `API_AUTH_KEY` | 跟随 `API_AUTH_KEY` |
 | `TEXT_CLIP_REQUEST_TIMEOUT` | 主服务转发 `/clip/txt` 的上游请求超时，单位秒 | `30` |
-| `TEXT_CLIP_SERVER_URL` | 独立 Text-CLIP 服务 URL；主服务会自动拼接 `/clip/txt` | `http://127.0.0.1:8061` |
+| `TEXT_CLIP_SERVER_URL` | 独立 Text-CLIP 服务 URL；主服务会自动拼接 `/clip/txt`，并把请求体原样转发给上游 | `http://127.0.0.1:8061` |
 
 ### Text-CLIP 容器
 
@@ -81,7 +81,7 @@
 补充说明：
 
 - 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
-- 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务仅做 HTTP 转发。
+- 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
 - RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
 - 主服务当前尽量直接复用 RapidOCR 原生 `config_path + params` 配置合并逻辑；仓库侧只补充本地模型路径、显式环境变量覆盖以及应用层实例池/超时控制。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。
@@ -129,7 +129,7 @@ cd app
 python server.py
 ```
 
-启动后，客户端可统一访问主服务端口；主服务收到 `/clip/txt` 请求时会按 `TEXT_CLIP_SERVER_URL` 转发到独立 Text-CLIP 服务。
+启动后，客户端可统一访问主服务端口；主服务收到 `/clip/txt` 请求时会按 `TEXT_CLIP_SERVER_URL` 把原始请求体转发到独立 Text-CLIP 服务。
 
 如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，可在仓库根目录直接执行 `python image-clip\starter.py`，或进入 `image-clip\` 后执行 `python starter.py`。更完整的环境变量与冒烟说明见 [image-clip/README.md](image-clip/README.md)。
 

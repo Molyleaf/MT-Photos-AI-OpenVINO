@@ -91,7 +91,7 @@ _configure_application_logging()
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 
@@ -100,7 +100,6 @@ from models.runtime import AIModels
 from models.schemas import (
     CheckResponse,
     RestartResponse,
-    TextClipRequest,
 )
 
 LOGGER = logging.getLogger(f"{_LOG_NAMESPACE}.server")
@@ -211,18 +210,23 @@ def _decode_text_clip_response(raw_body: bytes, *, status_code: int) -> Dict[str
     return {"result": [], "msg": f"独立 Text-CLIP 服务请求失败（HTTP {status_code}）。"}
 
 
-def _forward_text_clip_request(text: str) -> Dict[str, Any]:
+def _forward_text_clip_request(
+    raw_body: bytes,
+    *,
+    content_type: Optional[str],
+) -> Dict[str, Any]:
     endpoint_url = _resolve_text_clip_endpoint_url()
     timeout_seconds = _get_text_clip_request_timeout_seconds()
-    payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json; charset=utf-8"}
+    headers = {
+        "Content-Type": content_type or "application/json; charset=utf-8",
+    }
     text_clip_api_key = _get_text_clip_api_key()
     if text_clip_api_key and text_clip_api_key != "no-key":
         headers[API_KEY_NAME] = text_clip_api_key
 
     request = urllib.request.Request(
         endpoint_url,
-        data=payload,
+        data=raw_body,
         headers=headers,
         method="POST",
     )
@@ -460,13 +464,20 @@ async def restart_process():
 
 
 @app.post("/clip/txt", dependencies=[Depends(get_api_key)])
-async def clip_text_proxy_endpoint(request: TextClipRequest):
+async def clip_text_proxy_endpoint(request: Request):
+    request_body = await request.body()
+    content_type = request.headers.get("content-type")
     try:
-        return await asyncio.to_thread(_forward_text_clip_request, request.text)
+        return await asyncio.to_thread(
+            _forward_text_clip_request,
+            request_body,
+            content_type=content_type,
+        )
     except Exception as exc:
         LOGGER.error(
-            "转发 Text-CLIP 请求失败: '%s...', 错误: %s",
-            request.text[:50],
+            "转发 Text-CLIP 请求失败: bytes=%s content_type=%s 错误: %s",
+            len(request_body),
+            content_type or "application/json; charset=utf-8",
             exc,
             exc_info=True,
         )
