@@ -14,7 +14,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 import cv2
 import numpy as np
 import openvino as ov
-import yaml
 from rapidocr import RapidOCR
 from rapidocr.utils.log import logger as RAPIDOCR_LOGGER
 from rapidocr.utils.typings import EngineType
@@ -128,127 +127,27 @@ class RapidOCRMixin(ABC):
         setattr(RAPIDOCR_LOGGER, "_mt_expected_no_text_filter", message_filter)
 
     @staticmethod
-    def _build_rapidocr_default_config(requested_device: str) -> Dict[str, Any]:
-        return {
-            "requested_device_name": requested_device,
-            "device_name": "CPU",
-            "det_device_name": "CPU",
-            "cls_device_name": "CPU",
-            "rec_device_name": "CPU",
-            "inference_num_threads": -1,
-            "performance_hint": "THROUGHPUT",
-            "performance_num_requests": 2,
-            "enable_cpu_pinning": True,
-            "num_streams": 2,
-            "enable_hyper_threading": True,
-            "scheduling_core_type": "ANY_CORE",
-            "use_cls": True,
-            "max_side_len": 960,
-            "det_limit_side_len": 960,
-            "det_limit_type": "max",
-            "rec_batch_num": 8,
-            "cls_batch_num": 8,
-        }
+    def _cfg_value(section: Any, key: str, default: Any = None) -> Any:
+        if section is None:
+            return default
+        getter = getattr(section, "get", None)
+        if callable(getter):
+            value = getter(key, default)
+        else:
+            value = getattr(section, key, default)
+        return default if value is None else value
 
     @staticmethod
-    def _apply_rapidocr_yaml_overrides(config: Dict[str, Any], loaded: Dict[str, Any]) -> None:
-        ov_cfg = loaded.get("EngineConfig", {}).get("openvino", {})
-        for key in list(config.keys()):
-            if key in ov_cfg:
-                config[key] = ov_cfg[key]
-
-        global_cfg = loaded.get("Global", {})
-        if "use_cls" in global_cfg:
-            config["use_cls"] = _as_bool(global_cfg.get("use_cls"), config["use_cls"])
-        if "max_side_len" in global_cfg:
-            config["max_side_len"] = _as_int(
-                global_cfg.get("max_side_len"), config["max_side_len"]
+    def _normalize_requested_rapidocr_device() -> str:
+        requested_device = _normalize_non_text_openvino_device(
+            os.environ.get("RAPIDOCR_DEVICE", "CPU")
+        )
+        if requested_device != "CPU":
+            LOG.warning(
+                "RapidOCR upstream OpenVINO backend is CPU-only; coercing RAPIDOCR_DEVICE=%s to CPU.",
+                requested_device,
             )
-
-        det_cfg = loaded.get("Det", {})
-        if "limit_side_len" in det_cfg:
-            config["det_limit_side_len"] = _as_int(
-                det_cfg.get("limit_side_len"), config["det_limit_side_len"]
-            )
-        if "limit_type" in det_cfg:
-            config["det_limit_type"] = _normalize_rapidocr_limit_type(
-                det_cfg.get("limit_type"),
-                config["det_limit_type"],
-            )
-
-        rec_cfg = loaded.get("Rec", {})
-        if "rec_batch_num" in rec_cfg:
-            config["rec_batch_num"] = max(
-                1, _as_int(rec_cfg.get("rec_batch_num"), config["rec_batch_num"])
-            )
-
-        cls_cfg = loaded.get("Cls", {})
-        if "cls_batch_num" in cls_cfg:
-            config["cls_batch_num"] = max(
-                1, _as_int(cls_cfg.get("cls_batch_num"), config["cls_batch_num"])
-            )
-
-    @staticmethod
-    def _apply_rapidocr_env_overrides(config: Dict[str, Any]) -> None:
-        env_override_map: Dict[str, Tuple[str, Any]] = {
-            "RAPIDOCR_INFERENCE_NUM_THREADS": (
-                "inference_num_threads",
-                lambda value, default: _as_int(value, default),
-            ),
-            "RAPIDOCR_PERFORMANCE_HINT": (
-                "performance_hint",
-                lambda value, default: str(value).strip() or default,
-            ),
-            "RAPIDOCR_PERFORMANCE_NUM_REQUESTS": (
-                "performance_num_requests",
-                lambda value, default: _as_int(value, default),
-            ),
-            "RAPIDOCR_ENABLE_CPU_PINNING": (
-                "enable_cpu_pinning",
-                lambda value, default: _as_bool(value, default),
-            ),
-            "RAPIDOCR_NUM_STREAMS": (
-                "num_streams",
-                lambda value, default: _as_int(value, default),
-            ),
-            "RAPIDOCR_ENABLE_HYPER_THREADING": (
-                "enable_hyper_threading",
-                lambda value, default: _as_bool(value, default),
-            ),
-            "RAPIDOCR_SCHEDULING_CORE_TYPE": (
-                "scheduling_core_type",
-                lambda value, default: str(value).strip() or default,
-            ),
-            "RAPIDOCR_USE_CLS": (
-                "use_cls",
-                lambda value, default: _as_bool(value, default),
-            ),
-            "RAPIDOCR_MAX_SIDE_LEN": (
-                "max_side_len",
-                lambda value, default: _as_int(value, default),
-            ),
-            "RAPIDOCR_DET_LIMIT_SIDE_LEN": (
-                "det_limit_side_len",
-                lambda value, default: _as_int(value, default),
-            ),
-            "RAPIDOCR_DET_LIMIT_TYPE": (
-                "det_limit_type",
-                lambda value, default: _normalize_rapidocr_limit_type(value, default),
-            ),
-            "RAPIDOCR_REC_BATCH_NUM": (
-                "rec_batch_num",
-                lambda value, default: max(1, _as_int(value, default)),
-            ),
-            "RAPIDOCR_CLS_BATCH_NUM": (
-                "cls_batch_num",
-                lambda value, default: max(1, _as_int(value, default)),
-            ),
-        }
-        for env_name, (cfg_name, parser) in env_override_map.items():
-            raw_env = os.environ.get(env_name)
-            if raw_env is None or str(raw_env).strip() == "":
-                continue
-            config[cfg_name] = parser(raw_env, config[cfg_name])
+        return requested_device
 
     @staticmethod
     def _warn_rapidocr_stage_device_overrides() -> None:
@@ -263,44 +162,6 @@ class RapidOCRMixin(ABC):
                     env_name,
                     normalized,
                 )
-
-    def _finalize_rapidocr_runtime_config(
-        self,
-        config: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        requested_device = _normalize_non_text_openvino_device(
-            str(config.get("requested_device_name", "CPU"))
-        )
-        config["requested_device_name"] = requested_device
-        config["device_name"] = "CPU"
-        config["det_device_name"] = "CPU"
-        config["cls_device_name"] = "CPU"
-        config["rec_device_name"] = "CPU"
-        if self.ov_cache_dir is not None:
-            config["cache_dir"] = str(self.ov_cache_dir)
-        config["runtime_device_name"] = "CPU"
-        config["det_runtime_device_name"] = "CPU"
-        config["cls_runtime_device_name"] = "CPU"
-        config["rec_runtime_device_name"] = "CPU"
-        return config
-
-    def _load_rapidocr_openvino_config(self) -> Dict[str, Any]:
-        requested_device = _normalize_non_text_openvino_device(
-            os.environ.get("RAPIDOCR_DEVICE", "CPU")
-        )
-        if requested_device != "CPU":
-            LOG.warning(
-                "RapidOCR upstream OpenVINO backend is CPU-only; coercing RAPIDOCR_DEVICE=%s to CPU.",
-                requested_device,
-            )
-        config = self._build_rapidocr_default_config(requested_device)
-
-        config_path = self._require_rapidocr_config_path()
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        self._apply_rapidocr_yaml_overrides(config, loaded)
-        self._apply_rapidocr_env_overrides(config)
-        self._warn_rapidocr_stage_device_overrides()
-        return self._finalize_rapidocr_runtime_config(config)
 
     def _require_rapidocr_local_assets(self) -> Dict[str, Path]:
         required_files = {
@@ -326,53 +187,77 @@ class RapidOCRMixin(ABC):
             )
         return resolved
 
-    def _build_rapidocr_runtime_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_rapidocr_init_params(self) -> Tuple[str, Dict[str, Any]]:
+        requested_device = self._normalize_requested_rapidocr_device()
+        self._warn_rapidocr_stage_device_overrides()
         params: Dict[str, Any] = {
             "Det.engine_type": EngineType.OPENVINO,
             "Cls.engine_type": EngineType.OPENVINO,
             "Rec.engine_type": EngineType.OPENVINO,
-            "EngineConfig.openvino.device_name": str(
-                cfg.get("runtime_device_name", cfg.get("device_name", "AUTO"))
-            ),
-            "Det.device_name": str(
-                cfg.get("det_runtime_device_name", cfg.get("det_device_name", "AUTO"))
-            ),
-            "Cls.device_name": str(
-                cfg.get("cls_runtime_device_name", cfg.get("cls_device_name", "AUTO"))
-            ),
-            "Rec.device_name": str(
-                cfg.get("rec_runtime_device_name", cfg.get("rec_device_name", "AUTO"))
-            ),
-            "EngineConfig.openvino.inference_num_threads": _as_int(
-                cfg.get("inference_num_threads"), -1
-            ),
-            "EngineConfig.openvino.performance_num_requests": _as_int(
-                cfg.get("performance_num_requests"), -1
-            ),
-            "EngineConfig.openvino.enable_cpu_pinning": _as_bool(
-                cfg.get("enable_cpu_pinning"), True
-            ),
-            "EngineConfig.openvino.num_streams": _as_int(cfg.get("num_streams"), -1),
-            "EngineConfig.openvino.enable_hyper_threading": _as_bool(
-                cfg.get("enable_hyper_threading"), True
-            ),
-            "EngineConfig.openvino.scheduling_core_type": str(
-                cfg.get("scheduling_core_type", "ANY_CORE")
-            ),
-            "Global.use_cls": _as_bool(cfg.get("use_cls"), True),
-            "Global.max_side_len": _as_int(cfg.get("max_side_len"), 960),
-            "Det.limit_side_len": _as_int(cfg.get("det_limit_side_len"), 960),
-            "Det.limit_type": _normalize_rapidocr_limit_type(cfg.get("det_limit_type"), "max"),
-            "Rec.rec_batch_num": max(1, _as_int(cfg.get("rec_batch_num"), 6)),
-            "Cls.cls_batch_num": max(1, _as_int(cfg.get("cls_batch_num"), 6)),
         }
-        cache_dir = cfg.get("cache_dir")
-        if cache_dir not in (None, ""):
-            params["EngineConfig.openvino.cache_dir"] = str(cache_dir)
-        if cfg.get("performance_hint") not in (None, ""):
-            params["EngineConfig.openvino.performance_hint"] = str(
-                cfg.get("performance_hint", "LATENCY")
-            )
+
+        env_override_map: Dict[str, Tuple[str, Any]] = {
+            "RAPIDOCR_INFERENCE_NUM_THREADS": (
+                "EngineConfig.openvino.inference_num_threads",
+                lambda value: _as_int(value, -1),
+            ),
+            "RAPIDOCR_PERFORMANCE_HINT": (
+                "EngineConfig.openvino.performance_hint",
+                lambda value: str(value).strip() or None,
+            ),
+            "RAPIDOCR_PERFORMANCE_NUM_REQUESTS": (
+                "EngineConfig.openvino.performance_num_requests",
+                lambda value: _as_int(value, -1),
+            ),
+            "RAPIDOCR_ENABLE_CPU_PINNING": (
+                "EngineConfig.openvino.enable_cpu_pinning",
+                lambda value: _as_bool(value, True),
+            ),
+            "RAPIDOCR_NUM_STREAMS": (
+                "EngineConfig.openvino.num_streams",
+                lambda value: _as_int(value, -1),
+            ),
+            "RAPIDOCR_ENABLE_HYPER_THREADING": (
+                "EngineConfig.openvino.enable_hyper_threading",
+                lambda value: _as_bool(value, True),
+            ),
+            "RAPIDOCR_SCHEDULING_CORE_TYPE": (
+                "EngineConfig.openvino.scheduling_core_type",
+                lambda value: str(value).strip() or None,
+            ),
+            "RAPIDOCR_USE_CLS": (
+                "Global.use_cls",
+                lambda value: _as_bool(value, True),
+            ),
+            "RAPIDOCR_MAX_SIDE_LEN": (
+                "Global.max_side_len",
+                lambda value: _as_int(value, 960),
+            ),
+            "RAPIDOCR_DET_LIMIT_SIDE_LEN": (
+                "Det.limit_side_len",
+                lambda value: _as_int(value, 960),
+            ),
+            "RAPIDOCR_DET_LIMIT_TYPE": (
+                "Det.limit_type",
+                lambda value: _normalize_rapidocr_limit_type(value, "max"),
+            ),
+            "RAPIDOCR_REC_BATCH_NUM": (
+                "Rec.rec_batch_num",
+                lambda value: max(1, _as_int(value, 8)),
+            ),
+            "RAPIDOCR_CLS_BATCH_NUM": (
+                "Cls.cls_batch_num",
+                lambda value: max(1, _as_int(value, 8)),
+            ),
+        }
+        for env_name, (param_name, parser) in env_override_map.items():
+            raw_env = os.environ.get(env_name)
+            if raw_env is None or str(raw_env).strip() == "":
+                continue
+            parsed = parser(raw_env)
+            if parsed is None:
+                continue
+            params[param_name] = parsed
 
         if self.rapidocr_font_path:
             params["Global.font_path"] = self.rapidocr_font_path
@@ -382,7 +267,57 @@ class RapidOCRMixin(ABC):
         params["Rec.model_path"] = str(assets["rec"])
         params["Rec.rec_keys_path"] = str(assets["dict"])
         params["Cls.model_path"] = str(assets["cls"])
-        return params
+        return requested_device, params
+
+    def _snapshot_rapidocr_runtime_config(
+        self,
+        engine: RapidOCR,
+        *,
+        requested_device: str,
+    ) -> Dict[str, Any]:
+        cfg = getattr(engine, "cfg", None)
+        if cfg is None:
+            raise RuntimeError("RapidOCR initialized without runtime cfg metadata.")
+
+        global_cfg = getattr(cfg, "Global", None)
+        engine_cfg = getattr(cfg, "EngineConfig", None)
+        openvino_cfg = getattr(engine_cfg, "openvino", None)
+        det_cfg = getattr(cfg, "Det", None)
+        cls_cfg = getattr(cfg, "Cls", None)
+        rec_cfg = getattr(cfg, "Rec", None)
+
+        return {
+            "requested_device_name": requested_device,
+            "runtime_device_name": "CPU",
+            "use_cls": _as_bool(self._cfg_value(global_cfg, "use_cls", True), True),
+            "max_side_len": _as_int(self._cfg_value(global_cfg, "max_side_len", 960), 960),
+            "inference_num_threads": _as_int(
+                self._cfg_value(openvino_cfg, "inference_num_threads", -1), -1
+            ),
+            "performance_hint": self._cfg_value(openvino_cfg, "performance_hint"),
+            "performance_num_requests": _as_int(
+                self._cfg_value(openvino_cfg, "performance_num_requests", -1), -1
+            ),
+            "enable_cpu_pinning": _as_bool(
+                self._cfg_value(openvino_cfg, "enable_cpu_pinning", True), True
+            ),
+            "num_streams": _as_int(self._cfg_value(openvino_cfg, "num_streams", -1), -1),
+            "enable_hyper_threading": _as_bool(
+                self._cfg_value(openvino_cfg, "enable_hyper_threading", True), True
+            ),
+            "scheduling_core_type": self._cfg_value(
+                openvino_cfg, "scheduling_core_type", "ANY_CORE"
+            ),
+            "det_limit_side_len": _as_int(
+                self._cfg_value(det_cfg, "limit_side_len", 960), 960
+            ),
+            "det_limit_type": _normalize_rapidocr_limit_type(
+                self._cfg_value(det_cfg, "limit_type", "max"),
+                "max",
+            ),
+            "rec_batch_num": max(1, _as_int(self._cfg_value(rec_cfg, "rec_batch_num", 8), 8)),
+            "cls_batch_num": max(1, _as_int(self._cfg_value(cls_cfg, "cls_batch_num", 8), 8)),
+        }
 
     @staticmethod
     def _validate_rapidocr_backend(engine: RapidOCR) -> None:
@@ -405,7 +340,7 @@ class RapidOCRMixin(ABC):
             )
 
     def _instantiate_rapidocr(self, params: Dict[str, Any]) -> RapidOCR:
-        rapidocr_device = str(params.get("EngineConfig.openvino.device_name", "CPU")).upper()
+        rapidocr_device = "CPU"
         config_path = self._require_rapidocr_config_path()
         self._configure_rapidocr_logger()
         try:
@@ -460,22 +395,30 @@ class RapidOCRMixin(ABC):
             self._run_rapidocr_builtin(engine, warmup_image)
 
     def _load_rapidocr_locked(self) -> None:
-        config = self._load_rapidocr_openvino_config()
-        rapidocr_params = self._build_rapidocr_runtime_params(config)
+        self._require_rapidocr_config_path()
+        requested_device, rapidocr_params = self._build_rapidocr_init_params()
         engine_pool_size = max(1, self._ocr_worker_count)
-        engines = tuple(
-            self._instantiate_rapidocr(dict(rapidocr_params)) for _ in range(engine_pool_size)
+        first_engine = self._instantiate_rapidocr(dict(rapidocr_params))
+        engines = (
+            first_engine,
+            *tuple(
+                self._instantiate_rapidocr(dict(rapidocr_params))
+                for _ in range(max(0, engine_pool_size - 1))
+            ),
         )
         engine_pool: LifoQueue = LifoQueue(maxsize=len(engines))
         for engine in engines:
             engine_pool.put_nowait(engine)
-        runtime_cfg = dict(config)
+        runtime_cfg = self._snapshot_rapidocr_runtime_config(
+            first_engine,
+            requested_device=requested_device,
+        )
         runtime_cfg["engine_pool_size"] = len(engines)
         self._rapidocr_engine = engines[0]
         self._rapidocr_engines = engines
         self._rapidocr_engine_pool = engine_pool
         self._rapidocr_runtime_cfg = runtime_cfg
-        if config.get("det_limit_type") == "min":
+        if runtime_cfg.get("det_limit_type") == "min":
             LOG.warning(
                 "RapidOCR Det.limit_type=min will upscale small images and may increase latency."
             )
@@ -483,15 +426,15 @@ class RapidOCRMixin(ABC):
             "RapidOCR ready: config=%s requested_device=%s runtime_device=%s hint=%s use_cls=%s max_side_len=%s "
             "det_limit=%s/%s rec_batch_num=%s cls_batch_num=%s ocr_admission=%s engine_pool=%s",
             self.rapidocr_config_path,
-            config.get("requested_device_name"),
-            config.get("device_name"),
-            config.get("performance_hint"),
-            config.get("use_cls"),
-            config.get("max_side_len"),
-            config.get("det_limit_type"),
-            config.get("det_limit_side_len"),
-            config.get("rec_batch_num"),
-            config.get("cls_batch_num"),
+            runtime_cfg.get("requested_device_name"),
+            runtime_cfg.get("runtime_device_name"),
+            runtime_cfg.get("performance_hint"),
+            runtime_cfg.get("use_cls"),
+            runtime_cfg.get("max_side_len"),
+            runtime_cfg.get("det_limit_type"),
+            runtime_cfg.get("det_limit_side_len"),
+            runtime_cfg.get("rec_batch_num"),
+            runtime_cfg.get("cls_batch_num"),
             self._ocr_admission.capacity,
             len(engines),
         )

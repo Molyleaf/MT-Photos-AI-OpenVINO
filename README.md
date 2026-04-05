@@ -45,7 +45,7 @@
 | `OCR_MAX_CONCURRENT_REQUESTS` | OCR 应用层最大并发请求数；不会超过共享图片名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
 | `OCR_PREWARM_DELAY_SECONDS` | RapidOCR 一次性后台预热延迟，单位秒 | `1.0` |
 | `OCR_PREWARM_ENABLED` | 是否启用一次性后台 RapidOCR 预热 | `false` |
-| `OV_CACHE_DIR` | OpenVINO 编译缓存目录 | `<repo>/cache/openvino` |
+| `OV_CACHE_DIR` | OpenVINO 编译缓存目录；当前主要作用于主服务自管的 OpenVINO 路径，不控制 RapidOCR upstream CPU backend | `<repo>/cache/openvino` |
 | `PORT` | 服务端口；同时影响镜像入口与健康检查 | `8060` |
 | `RAPIDOCR_CLS_BATCH_NUM` | RapidOCR 方向分类批大小 | `8` |
 | `RAPIDOCR_DET_LIMIT_SIDE_LEN` | RapidOCR 检测输入边长限制 | `960` |
@@ -83,6 +83,7 @@
 - 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务仅做 HTTP 转发。
 - RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
+- 主服务当前尽量直接复用 RapidOCR 原生 `config_path + params` 配置合并逻辑；仓库侧只补充本地模型路径、显式环境变量覆盖以及应用层实例池/超时控制。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。
 - 如果手动执行 `uvicorn server:app`，最早期的 uvicorn bootstrap 日志仍以 CLI `--log-level` 为准。
 

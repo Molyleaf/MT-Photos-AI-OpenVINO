@@ -87,9 +87,9 @@
 - OpenVINO 参数基线：`device_name=CPU`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
 - `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 当前除透传给 RapidOCR/OpenVINO 外，还作为 OCR 多实例池与应用层执行器默认 worker 数基线。
 - 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；但设备相关项最终仍必须收敛到 `CPU`。
+- RapidOCR 配置合并必须尽量直接复用上游 `RapidOCR(config_path=..., params=...)` 逻辑；仓库侧只允许补充本地模型路径、显式环境变量覆盖、实例池/准入/超时封装，禁止再维护一份 shadow YAML 解析后回填给上游。
 - 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
-- 必须启用模型编译缓存，降低冷启动与多 Worker 反复编译开销。
-- 默认缓存目录应收敛到仓库内可写路径（当前基线 `<PROJECT_ROOT>/cache/openvino`）；仅在显式设置 `OV_CACHE_DIR` 时覆盖默认值。
+- `rapidocr==3.7.0` 当前原生 OpenVINO CPU backend 未暴露 `cache_dir` 注入路径；仓库不得继续伪造未生效的 `cache_dir/device_name` 参数来制造“已启用缓存/可切设备”的假象。
 - RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
 - RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
 - RapidOCR 与 OpenVINO 的衔接必须直接走库原生实现；严禁 monkey patch 第三方类/模块，也禁止继续替换 `text_det/text_cls/text_rec.session` 或自定义 stage session 包装。
