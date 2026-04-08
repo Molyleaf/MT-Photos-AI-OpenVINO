@@ -16,7 +16,7 @@
 - Debian 容器镜像源基线：APT 使用 `https://mirrors.tuna.tsinghua.edu.cn/debian/`，PyPI 使用 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
 - 硬件基线：Intel i7-11800H（AVX512 VNNI + Xe 核显，共享内存架构）。
 - 主服务入口：`app/server.py`（当前仓库中等效于历史 `server_openvino.py` 的实现入口）。
-- 主服务辅助模块：`app/bootstrap.py`（日志与启动配置）、`app/image_io.py`（上传图像解码/归一化）、`app/text_clip_proxy.py`（`/clip/txt` 代理转发）；运行时配置聚合位于 `app/models/runtime_settings.py`。
+- 主服务辅助模块：`app/bootstrap.py`（日志与启动配置）、`app/image_io.py`（上传图像解码/归一化）、`app/text_clip_proxy.py`（`/clip/txt` 代理转发）、`app/non_text_process.py`（`/app` 非文本模型统一子进程管理）；运行时配置聚合位于 `app/models/runtime_settings.py`。
 - Text-CLIP 独立服务入口：`text-clip/app/server.py`。
 - Windows 本地 CUDA Image-CLIP 并行子项目命令行入口：`image-clip/starter.py`；服务实现入口：`image-clip/app/server.py`；依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
@@ -102,8 +102,9 @@
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 - 默认应在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 容器不参与这一路径。允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
+- `/app` 内的 Vision-CLIP / OCR / InsightFace 必须统一放进单个非文本子进程中管理；任何显式释放路径（`/restart`、`/restart_v2`、`/restartV2`、`/restartv2`、idle release、执行超时、模型族切换、shutdown）都必须以结束该子进程收口，依靠子进程退出清空匿名内存，而不是再在父进程保留“残余匿名内存阈值硬重启”兜底。
 - 主容器在完成非文本模型释放后，必须同步回收非文本批队列线程以及 OCR/InsightFace 相关应用层执行器；如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，还必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS。Linux 部署下还必须对非文本模型文件与 OpenVINO cache 做 best-effort 文件页缓存回收，降低 cgroup/file cache 残留导致的“模型已释放但容器内存不降”现象；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
-- 主容器在完成非文本 full release 后，必须输出一条进程/cgroup 内存拆分日志，至少覆盖 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`；若 Linux 下文件页缓存回收已执行，也应保留对应日志，便于区分匿名内存、文件页缓存和 shared memory 残留。
+- 主容器在非文本子进程退出后，必须输出一条进程/cgroup 内存拆分日志，至少覆盖 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`；若 Linux 下文件页缓存回收已执行，也应保留对应日志，便于区分匿名内存、文件页缓存和 shared memory 残留。
 
 ### 3.4 InsightFace
 
@@ -112,6 +113,7 @@
 - InsightFace OpenVINO EP 的 `device_type` 基线为 `AUTO`；禁止继续把 `GPU_FP16` / `CPU_FP32` 直接透传给运行时；当 `AUTO` 且 GPU 可见时，运行时必须显式收敛到 `GPU`，并在日志里输出 `configured_device/runtime_device/preprocess_device/provider_runtime`。
 - 不允许 silent fallback 到 CPUExecutionProvider；OpenVINO EP 不可用时必须直接报错。
 - InsightFace OpenVINO EP 默认应显式传入 `cache_dir=<PROJECT_ROOT>/cache/openvino`，并把 `enable_opencl_throttling=false` 作为吞吐优先基线；需要保守模式时再通过环境变量覆盖。
+- InsightFace ORT session 必须采用低残留内存基线：默认关闭 `enable_cpu_mem_arena`、关闭 `enable_mem_pattern`，并固定单 lane session `inter_op/intra_op` 线程数为 `1`；目标优先级是 `/represent` unload 后匿名内存可回收，而不是极限吞吐。
 - 必须固定到新版 `FaceAnalysis(name=..., root=..., allowed_modules=..., providers=..., provider_options=...)` 初始化路径；禁止 compat dataclass、构造参数重试、source fallback、`set_providers` 后置修正。
 - InsightFace 运行时模型目录固定为 `<MODEL_PATH>/insightface/_runtime_models/models/antelopev2`；禁止再维护额外的兼容目录、双 root 或 source/runtime 回退。
 - InsightFace 必须支持 `INSIGHTFACE_OV_DEVICE=GPU|CPU|AUTO` 三种显式推理模式；无论推理设备取值为何，除 ORT OpenVINO EP 推理外，其余路径都应尽量委托 `insightface` 原生 CPU 实现：检测走 `det_model.detect`，识别特征提取走 `rec_model.get_feat`，且 OpenVINOExecutionProvider 必须保持首位 provider。
@@ -139,8 +141,8 @@
   - 鉴权失败：HTTP 401，`detail="Invalid API key"`
   - 鉴权范围：除 `GET /` 外的所有业务端点
 - 生命周期：
-- 启动时初始化主服务 `AIModels`
-  - 关闭时释放全部模型
+- 启动时初始化主服务 `NonTextProcessManager`
+  - 关闭时释放全部非文本模型与子进程
 - 服务日志必须在 `uvicorn server:app` 与 `python server.py` 两种启动路径下都稳定输出到控制台；Windows 直跑时可额外写入 `<PROJECT_ROOT>/server.log`，但不能替代控制台输出。
 - `LOG_LEVEL` 必须同时作用于 `mt_photos_ai.*`、`uvicorn.*` 与当前接入的第三方运行日志；若手动执行 `uvicorn server:app`，其最早期 bootstrap 日志仍需通过 CLI `--log-level` 对齐。
 - 服务必须固定为**单进程**；禁止继续暴露 `WEB_CONCURRENCY` 一类 worker 配置项，也禁止让第二个服务进程在同一工作目录下成功启动。
@@ -172,9 +174,9 @@
 - 成功返回：`{"result":"pass"}`。
 
 4. `POST /restart_v2`
-- 语义：延迟 1 秒后 `os.execl` 重启进程。
-- 立即返回：`{"result":"pass"}`。
-- 兼容别名：`POST /restartV2`，语义与 `/restart_v2` 完全一致，仅用于兼容现有 MT-Photos 客户端。
+- 语义：与 `/restart` 完全一致，同步等待当前非文本任务退场并释放 Vision-CLIP / OCR / InsightFace（不重启进程）。
+- 成功返回：`{"result":"pass"}`。
+- 兼容别名：`POST /restartV2`、`POST /restartv2`，语义与 `/restart_v2` 完全一致，仅用于兼容现有客户端。
 
 5. `POST /clip/txt`
 - 入参：透传独立 Text-CLIP 服务原始请求体（当前示例为 `{"text": <字符串>}`）。
@@ -217,8 +219,8 @@
 7. InsightFace 使用独立执行路径；但其准入必须遵守第 4 条，不得在 Vision-CLIP 或 OCR 仍持有活跃租约时并行常驻。
 8. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
 9. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 4 条让多个非文本模型族并行常驻。
-10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 代理调用都不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
-11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放，并同步回收非文本批队列线程与 OCR/InsightFace 应用层执行器；这些支持资源只允许在后续非文本请求到来时按需重建。独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
+10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/restartV2`、`/restartv2`、`/clip/txt` 代理调用都不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
+11. `POST /restart`、`POST /restart_v2`、`POST /restartV2`、`POST /restartv2` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放，并同步回收非文本批队列线程与 OCR/InsightFace 应用层执行器；这些支持资源只允许在后续非文本请求到来时按需重建。独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
 12. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
 13. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 
@@ -226,10 +228,11 @@
 
 ## 6. 并发架构约束（硬约束）
 
-- 推荐结构：**单进程 FastAPI 异步服务 + 有界批队列/阶段执行器**。
+- 推荐结构：**单进程 FastAPI 异步服务 + 单个非文本子进程 + 有界批队列/阶段执行器**。
 - 禁止在单进程无限堆线程“硬顶并行度”。
 - 必须在运行时对单进程做硬约束；同一工作目录下的第二个服务进程必须因运行锁直接失败，而不是并行持有另一份非文本模型。
 - 非文本模型族准入必须显式串行化，确保“单活模型族 + 独立 Text-CLIP 容器”的内存上界可控。
+- 非文本子进程与父进程之间的任务派发/结果回传必须优先复用标准库 `multiprocessing.JoinableQueue` / `multiprocessing.Queue`，不要再维护自定义 pipe/轮询协议。
 - 必须控制总并行度：
   - `总并行度 = 各阶段执行器线程数之和`
 - 原因：
@@ -296,10 +299,11 @@
 - `python -m compileall app`
 - `python -m compileall text-clip/app`
 - `python -m compileall scripts`
-- `python -m compileall image-clip tests`
+- `python -m compileall image-clip`
 - `cd image-clip && python starter.py`
 - `python scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
-- `python -m unittest discover -s tests -p "test_image_clip_starter.py"`
+- `python -m unittest discover -s scripts -p "test_*.py"`
+- `python scripts/smoke_non_text_process.py`
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`

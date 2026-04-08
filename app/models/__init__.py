@@ -1,5 +1,9 @@
+from typing import TYPE_CHECKING
+
 from .constants import CLIP_EMBEDDING_DIMS, CLIP_IMAGE_RESOLUTION, CONTEXT_LENGTH, MODEL_NAME
-from .runtime import AIModels
+
+if TYPE_CHECKING:
+    from .runtime import AIModels
 
 __all__ = [
     "AIModels",
@@ -8,3 +12,11 @@ __all__ = [
     "CONTEXT_LENGTH",
     "CLIP_IMAGE_RESOLUTION",
 ]
+
+
+def __getattr__(name: str):
+    if name == "AIModels":
+        from .runtime import AIModels
+
+        return AIModels
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

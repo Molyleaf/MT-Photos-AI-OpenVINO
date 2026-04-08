@@ -66,7 +66,7 @@ python image-clip\starter.py
 ## 冒烟
 
 ```powershell
-python -m unittest discover -s tests -p "test_image_clip_starter.py"
+python -m unittest scripts.test_image_clip_starter
 python scripts\smoke_image_clip.py --device cuda
 python scripts\smoke_image_clip.py --device cuda --image C:\path\to\image.jpg
 

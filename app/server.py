@@ -1,8 +1,5 @@
 import asyncio
 import logging
-import os
-import sys
-import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -19,11 +16,11 @@ from bootstrap import (
 )
 from image_io import read_image_from_upload
 from models.constants import MODEL_NAME
-from models.runtime import AIModels
 from models.schemas import (
     CheckResponse,
     RestartResponse,
 )
+from non_text_process import NonTextProcessManager
 from text_clip_proxy import TextClipProxyClient
 
 configure_application_logging()
@@ -67,16 +64,16 @@ async def get_api_key(api_key_header: str = Depends(api_key_header)):
         )
 
 
-models_instance: Optional[AIModels] = None
+models_instance: Optional[NonTextProcessManager] = None
 
 
-def _require_models_instance() -> AIModels:
+def _require_models_instance() -> NonTextProcessManager:
     if models_instance is None:
         raise HTTPException(status_code=503, detail="模型实例尚未初始化")
     return models_instance
 
 
-def _mark_request_activity(models: AIModels) -> None:
+def _mark_request_activity(models: NonTextProcessManager) -> None:
     models.mark_request_activity()
 
 
@@ -87,10 +84,10 @@ async def lifespan(app: FastAPI):
     startup_self_check_dri(LOGGER)
     settings = load_server_settings()
     LOGGER.info(
-        "应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。Text-CLIP 代理上游=%s",
+        "应用启动：初始化非文本子进程管理器；非文本模型在独立子进程中按首次请求懒加载。Text-CLIP 代理上游=%s",
         settings.text_clip.server_url,
     )
-    instance = AIModels()
+    instance = NonTextProcessManager()
     models_instance = instance
     try:
         yield
@@ -125,32 +122,14 @@ async def check_service():
 
 
 @app.post("/restart", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
-async def restart_service():
-    LOGGER.info("收到 /restart 请求，正在同步释放当前非文本模型。")
-    if models_instance:
+@app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
+@app.post("/restartV2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
+@app.post("/restartv2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
+async def restart_non_text_models(request: Request):
+    LOGGER.info("收到 %s 请求，正在同步释放当前非文本子进程。", request.url.path)
+    if models_instance is not None:
         await asyncio.to_thread(models_instance.release_models_for_restart)
     return {"result": "pass"}
-
-
-@app.post("/restart_v2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
-async def restart_process():
-    LOGGER.info("收到 /restart_v2 请求，将重启整个服务进程。")
-
-    def delayed_restart():
-        import time
-
-        time.sleep(1)
-        python = sys.executable
-        os.execl(python, python, *sys.argv)
-
-    threading.Thread(target=delayed_restart, name="restart-v2", daemon=True).start()
-    return {"result": "pass"}
-
-
-@app.post("/restartV2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
-async def restart_process_compat():
-    LOGGER.info("收到兼容路径 /restartV2 请求，转到 /restart_v2 语义。")
-    return await restart_process()
 
 
 @app.post("/clip/txt", dependencies=[Depends(get_api_key)])

@@ -82,10 +82,11 @@
 补充说明：
 
 - 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
-- 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
-- 主容器在 `/restart` 或空闲释放完成后，除断开模型引用外，还会同步回收非文本批队列线程与 OCR/人脸预处理执行器；若当前不再持有 Vision-CLIP / InsightFace OpenVINO consumer，还会继续释放共享 OpenVINO runtime，并尽量把 native heap 空闲页归还给 OS。Linux 下还会对非文本模型文件与 OpenVINO cache 做 best-effort 文件页缓存回收，减少 cgroup/file cache 长时间顶住容器内存的情况。下一次 `/clip/img`、`/ocr`、`/represent` 请求会按需重建这些运行时支持资源；因此 Linux 容器 RSS / Windows 工作集通常会明显下降，但受驱动与分配器行为影响，不保证瞬时回到冷启动水平。
-- 主服务会在非文本 full release 后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
-- 进程级重启端点标准路径是 `/restart_v2`；同时兼容 MT-Photos 当前实际发出的 `/restartV2`，两者语义一致，都会在约 1 秒后 `os.execl` 重启进程。
+- 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
+- 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
+- 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
+- InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。
+- `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 现已统一语义：同步释放当前非文本子进程，不重启主服务进程。
 - RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
 - 主服务当前尽量直接复用 RapidOCR 原生 `config_path + params` 配置合并逻辑；仓库侧只补充本地模型路径、显式环境变量覆盖以及应用层实例池/超时控制。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。

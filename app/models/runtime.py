@@ -25,7 +25,6 @@ from .common import (
     _extract_explicit_gpu_devices,
     _get_openvino_gpu_devices,
     _drop_filesystem_page_cache,
-    _get_process_memory_snapshot,
     _normalize_openvino_devices,
     _summarize_exception,
     _trim_process_memory,
@@ -188,9 +187,9 @@ class _NonTextFamilyStateMachine:
 
 class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     """
-    Image-CLIP uses a dedicated batch queue after standardized preprocessing.
-    Runtime model families are lazy-loaded and switch synchronously so only one
-    vision/OCR/face family stays resident at a time, with idle release.
+    This runtime is loaded inside the non-text worker process. Image-CLIP uses
+    a dedicated batch queue after standardized preprocessing, while runtime
+    model families still lazy-load and switch synchronously inside that worker.
     """
     ov_cache_dir: Optional[Path]
 
@@ -552,7 +551,8 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _log_ready(self) -> None:
         LOG.info(
-            "AIModels ready: clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s",
+            "AIModels ready: pid=%s clip_device=%s clip_context=%s cache=%s image_budget=%s clip_queue=%s queue_timeout=%ss exec_timeout=%ss ocr_exec_timeout=%ss clip_batch=%s/%sms ocr_prewarm=%s ocr_idle_release=%ss ocr_admission=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s",
+            self._pid,
             self._clip_inference_device,
             self._clip_remote_context_device_name or "disabled",
             self.ov_cache_dir or "default",
@@ -1049,7 +1049,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             recycled_support = self._recycle_non_text_runtime_support_resources()
             if unloaded or recycled_support:
                 self._drop_non_text_filesystem_page_cache()
-                self._log_process_memory_snapshot(f"{reason}-release")
             LOG.info(
                 "Runtime model release complete: reason=%s unloaded=%s support_recycled=%s",
                 reason,
@@ -1151,33 +1150,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         trimmed = _trim_process_memory()
         if trimmed:
             LOG.info("Returned native heap pages to OS after %s.", reason)
-
-    def _log_process_memory_snapshot(self, reason: str) -> None:
-        snapshot = _get_process_memory_snapshot()
-        if not snapshot:
-            return
-        ordered_keys = [
-            "VmRSS",
-            "RssAnon",
-            "RssFile",
-            "RssShmem",
-            "VmSize",
-            "cgroup_memory_current",
-            "cgroup_anon",
-            "cgroup_file",
-            "cgroup_shmem",
-            "cgroup_inactive_file",
-            "cgroup_active_file",
-            "WorkingSetSize",
-            "PrivateUsage",
-        ]
-        formatted = ", ".join(
-            f"{key}={snapshot[key]}"
-            for key in ordered_keys
-            if key in snapshot
-        )
-        if formatted:
-            LOG.info("Process memory snapshot after %s: %s", reason, formatted)
 
     def _build_openvino_preprocess_runner(
         self,

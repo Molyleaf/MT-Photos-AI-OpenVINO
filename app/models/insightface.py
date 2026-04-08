@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 import cv2
 import numpy as np
 import onnx
+import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
 from .common import (
@@ -583,6 +584,7 @@ class InsightFaceMixin(ABC):
             "allowed_modules": ["detection", "recognition"],
             "providers": list(provider_names),
             "provider_options": [dict(provider_options)],
+            "sess_options": self._build_insightface_session_options(),
         }
         try:
             face_app = FaceAnalysis(**init_kwargs)
@@ -602,6 +604,17 @@ class InsightFaceMixin(ABC):
             getattr(face_app, "models", {}).get("recognition")
         )
         return face_app, runtime_root
+
+    @staticmethod
+    def _build_insightface_session_options() -> ort.SessionOptions:
+        # Keep ORT from retaining large CPU-side arenas after /represent unload.
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session_options.inter_op_num_threads = 1
+        session_options.intra_op_num_threads = 1
+        return session_options
 
     def _initialize_loaded_insightface_runtime(
         self,
@@ -868,12 +881,19 @@ class InsightFaceMixin(ABC):
             )
             self._face_engine = runtime.face_app
             LOG.info(
-                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s preprocess_device=%s provider_options=%s provider_runtime=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s pipeline=%s (runtime_root=%s)",
+                "InsightFace loaded with providers=%s configured_device=%s runtime_device=%s preprocess_device=%s provider_options=%s session_options=%s provider_runtime=%s det_session_shapes=%s rec_session_shapes=%s face_lane=%s face_preprocess_workers=%s face_batch=%s/%sms face_admission=%s pipeline=%s (runtime_root=%s)",
                 provider_names,
                 configured_provider_device,
                 provider_device,
                 self._face_preprocess_device or "CPU",
                 provider_options,
+                {
+                    "enable_cpu_mem_arena": False,
+                    "enable_mem_pattern": False,
+                    "execution_mode": "ORT_SEQUENTIAL",
+                    "inter_op_num_threads": 1,
+                    "intra_op_num_threads": 1,
+                },
                 runtime.provider_runtime,
                 runtime.det_session_shapes,
                 runtime.rec_session_shapes,

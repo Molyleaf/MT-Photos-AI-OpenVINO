@@ -165,6 +165,16 @@ class _FakeFaceApp:
         self.det_size = (640, 640)
 
 
+class _CapturedFaceAnalysis:
+    last_kwargs = None
+
+    def __init__(self, **kwargs) -> None:
+        _CapturedFaceAnalysis.last_kwargs = dict(kwargs)
+        self.models = {
+            "recognition": object(),
+        }
+
+
 class RuntimeCleanupTests(unittest.TestCase):
     def test_ai_models_init_failure_triggers_release_all_models(self) -> None:
         with (
@@ -348,6 +358,24 @@ class RuntimeCleanupTests(unittest.TestCase):
         models._drop_non_text_filesystem_page_cache.assert_called_once_with()
         models._unload_non_text_models.assert_called_once_with()
 
+    def test_release_non_text_models_sync_keeps_release_local_to_worker_runtime(self) -> None:
+        models = AIModels.__new__(AIModels)
+        models._pid = 123
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+        models._execution_timeout_seconds = 3
+        models._non_text_state = Mock()
+        models._unload_non_text_models = Mock(return_value=["face"])
+        models._recycle_non_text_runtime_support_resources = Mock(return_value=False)
+        models._drop_non_text_filesystem_page_cache = Mock()
+
+        models._release_non_text_models_sync(reason="idle-timeout")
+
+        models._non_text_state.begin_release.assert_called_once_with()
+        models._non_text_state.wait_for_drain.assert_called_once_with()
+        models._non_text_state.finish_release.assert_called_once_with()
+        models._drop_non_text_filesystem_page_cache.assert_called_once_with()
+
     def test_dispose_insightface_face_analysis_clears_ort_runtime_refs(self) -> None:
         face_app = _FakeFaceApp()
         det_session = face_app.det_model.session
@@ -373,6 +401,34 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertIsNone(detached_model.input_shape)
         self.assertIsNone(detached_model.output_shape)
         self.assertIsNone(detached_model.output_shapes)
+
+    def test_instantiate_insightface_uses_low_residue_session_options(self) -> None:
+        _CapturedFaceAnalysis.last_kwargs = None
+        models = AIModels.__new__(AIModels)
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+        runtime_root = PROJECT_ROOT / "tests" / "runtime"
+        source_root = PROJECT_ROOT / "tests" / "source"
+
+        with (
+            patch("models.insightface.FaceAnalysis", _CapturedFaceAnalysis),
+            patch.object(AIModels, "_resolve_insightface_source_model_dir", return_value=source_root),
+            patch.object(AIModels, "_prepare_insightface_runtime_root", return_value=runtime_root),
+            patch.object(AIModels, "_validate_insightface_loaded_modules"),
+            patch.object(AIModels, "_normalize_insightface_recognition_state"),
+        ):
+            _, actual_runtime_root = models._instantiate_insightface_face_analysis(
+                ["OpenVINOExecutionProvider"],
+                {"device_type": "GPU"},
+            )
+
+        self.assertEqual(runtime_root, actual_runtime_root)
+        self.assertIsNotNone(_CapturedFaceAnalysis.last_kwargs)
+        sess_options = _CapturedFaceAnalysis.last_kwargs["sess_options"]
+        self.assertFalse(sess_options.enable_cpu_mem_arena)
+        self.assertFalse(sess_options.enable_mem_pattern)
+        self.assertEqual(1, sess_options.inter_op_num_threads)
+        self.assertEqual(1, sess_options.intra_op_num_threads)
 
 
 if __name__ == "__main__":
