@@ -15,7 +15,7 @@ def _ensure_app_dir_on_sys_path() -> None:
 def main() -> int:
     _ensure_app_dir_on_sys_path()
 
-    from app.server import run_server
+    from server import run_server
 
     run_server()
     return 0

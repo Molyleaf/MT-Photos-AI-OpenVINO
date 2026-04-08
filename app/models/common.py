@@ -425,32 +425,54 @@ class _InterProcessFileLock:
 
 @dataclass(slots=True)
 class _OpenVinoPreprocessRunner:
-    compiled_model: ov.CompiledModel
+    compiled_model: Optional[ov.CompiledModel]
     input_port: Any
     output_port: Any
     runner_name: str
     input_height: int
     input_width: int
-    _request_local: threading.local = field(
+    _request_lock: threading.Lock = field(
         init=False,
         repr=False,
-        default_factory=threading.local,
+        default_factory=threading.Lock,
+    )
+    _requests_by_thread: dict[int, ov.InferRequest] = field(
+        init=False,
+        repr=False,
+        default_factory=dict,
     )
 
     def _get_request(self) -> ov.InferRequest:
-        request = getattr(self._request_local, "request", None)
-        if request is None:
-            request = self.compiled_model.create_infer_request()
-            self._request_local.request = request
-        return request
+        thread_id = threading.get_ident()
+        with self._request_lock:
+            request = self._requests_by_thread.get(thread_id)
+            if request is not None:
+                return request
+
+            compiled_model = self.compiled_model
+            if compiled_model is None:
+                raise RuntimeError(f"{self.runner_name} PPP runner has been released.")
+
+            request = compiled_model.create_infer_request()
+            self._requests_by_thread[thread_id] = request
+            return request
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
+        if self.input_port is None or self.output_port is None:
+            raise RuntimeError(f"{self.runner_name} PPP runner has been released.")
         prepared = np.ascontiguousarray(tensor, dtype=np.uint8)
         request = self._get_request()
         request.set_tensor(self.input_port, ov.Tensor(prepared, shared_memory=True))
         request.start_async()
         request.wait()
         return np.asarray(request.get_tensor(self.output_port).data)
+
+    def release(self) -> None:
+        with self._request_lock:
+            self._requests_by_thread.clear()
+        self.input_port = None
+        self.output_port = None
+        self.compiled_model = None
 
     def validate(self) -> None:
         sample = np.zeros((1, self.input_height, self.input_width, 3), dtype=np.uint8)

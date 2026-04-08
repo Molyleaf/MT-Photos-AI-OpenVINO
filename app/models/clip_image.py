@@ -203,13 +203,23 @@ class ClipImageMixin(ABC):
             payloads = [task.payload for task in tasks]
             results = self._infer_clip_image_tensor_batch(payloads)
             for task, result in zip(tasks, results):
-                self._safe_set_result(task.future, result)
+                self._set_clip_task_result(task, result)
         except Exception as exc:
             LOG.error("Task clip_img failed: %s", exc, exc_info=True)
             for task in tasks:
-                self._safe_set_exception(task.future, exc)
+                self._set_clip_task_exception(task, exc)
+
+    def _set_clip_task_result(self, task: _ClipImageTask, value: Any) -> None:
+        task.payload = None
+        self._safe_set_result(task.future, value)
+
+    def _set_clip_task_exception(self, task: _ClipImageTask, exc: Exception) -> None:
+        task.payload = None
+        self._safe_set_exception(task.future, exc)
 
     def _unload_clip_vision_model_locked(self) -> None:
+        if self._clip_vision_ppp is not None:
+            self._clip_vision_ppp.release()
         self._clip_vision_request = None
         self._clip_vision_model = None
         self._clip_vision_ppp = None

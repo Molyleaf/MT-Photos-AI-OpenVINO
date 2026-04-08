@@ -201,12 +201,13 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
     def __init__(self) -> None:
         self._pid = os.getpid()
         self._stopping = False
+        self._initialize_release_defaults()
         _prepare_windows_openvino_runtime()
-        self._initialize_paths()
-        self._initialize_openvino_runtime()
-        self._initialize_model_load_locks()
-        self._acquire_single_process_lock()
         try:
+            self._initialize_paths()
+            self._initialize_openvino_runtime()
+            self._initialize_model_load_locks()
+            self._acquire_single_process_lock()
             self._initialize_clip_image_state()
             self._initialize_non_text_model_state()
             self._initialize_execution_controls()
@@ -216,8 +217,83 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._start_background_services()
             self._log_ready()
         except Exception:
-            self._release_single_process_lock()
+            try:
+                self.release_all_models()
+            except Exception as cleanup_exc:
+                LOG.warning(
+                    "AIModels initialization cleanup failed after startup error: %s",
+                    cleanup_exc,
+                    exc_info=True,
+                )
             raise
+
+    def _initialize_release_defaults(self) -> None:
+        self.ov_cache_dir = None
+        self._clip_remote_context_device_name = None
+        self._clip_remote_context = None
+        self._single_process_lock = None
+
+        self._model_lock = threading.Lock()
+        self._clip_vision_load_lock = threading.Lock()
+        self._rapidocr_load_lock = threading.Lock()
+        self._face_load_lock = threading.Lock()
+
+        self._clip_vision_model = None
+        self._clip_vision_ppp = None
+        self._clip_vision_request = None
+        self._clip_image_batch_size = 1
+        self._clip_image_batch_wait_seconds = 0.0
+        self._clip_image_dispatch_loop = None
+        self._clip_image_queue = None
+        self._clip_image_loop_ready = threading.Event()
+        self._clip_image_worker = None
+
+        self._rapidocr_engine = None
+        self._rapidocr_engines = None
+        self._rapidocr_engine_pool = None
+        self._rapidocr_runtime_cfg = None
+
+        self._face_engine = None
+        self._face_dispatch_loop = None
+        self._face_task_queue = None
+        self._face_loop_ready = threading.Event()
+        self._face_worker = None
+        self._face_preprocess_device = None
+
+        self._queue_capacity = 1
+        self._queue_timeout_seconds = 30
+        self._execution_timeout_seconds = 30
+        self._ocr_execution_timeout_seconds = 30
+        self._idle_release_timeout_seconds = 0
+        self._ocr_prewarm_enabled = False
+        self._ocr_prewarm_delay_seconds = 0.0
+
+        self._image_admission = _AdmissionController("image", 1)
+        self._ocr_worker_count = 1
+        self._face_preprocess_worker_count = 1
+        self._ocr_admission = _AdmissionController("ocr", 1)
+        self._face_admission = _AdmissionController("face", 1)
+        self._face_batch_size = 1
+        self._face_batch_wait_seconds = 0.0
+        self._face_queue_capacity = 1
+
+        self._shared_cpu_executor = None
+        self._control_executor = None
+        self._ocr_executor = None
+        self._face_preprocess_executor = None
+
+        self._request_activity_lock = threading.Lock()
+        self._last_request_activity_monotonic = time.monotonic()
+        self._idle_release_stop = threading.Event()
+        self._idle_release_wakeup = threading.Event()
+        self._idle_release_thread = None
+        self._background_prewarm_cancel = threading.Event()
+        self._background_prewarm_thread = None
+
+        self._non_text_state = _NonTextFamilyStateMachine(
+            unload_callback=self._unload_non_text_models,
+            is_stopping=lambda: self._stopping,
+        )
 
     def _initialize_paths(self) -> None:
         self._path_settings = load_runtime_path_settings()
@@ -627,10 +703,13 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         task = _ClipImageTask(payload=payload, future=future, created_at=time.time())
         loop = self._clip_image_dispatch_loop
         if self._stopping:
-            future.set_exception(RuntimeError("模型服务已关闭"))
+            self._set_clip_task_exception(task, RuntimeError("模型服务已关闭"))
             return task
         if loop is None:
-            future.set_exception(RuntimeError("CLIP image queue loop is not initialized."))
+            self._set_clip_task_exception(
+                task,
+                RuntimeError("CLIP image queue loop is not initialized."),
+            )
             return task
         submit_future = asyncio.run_coroutine_threadsafe(
             self._enqueue_clip_image_task_async(task),
@@ -640,17 +719,14 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             submit_future.result(timeout=max(1.0, float(self._queue_timeout_seconds)))
         except Exception as exc:
             submit_exc = exc if isinstance(exc, RuntimeError) else RuntimeError(str(exc))
-            self._safe_set_exception(
-                future,
-                submit_exc,
-            )
+            self._set_clip_task_exception(task, submit_exc)
         return task
 
     def _cancel_clip_image_task_if_queued(self, task: _ClipImageTask, exc: Exception) -> bool:
         if task.started_event.is_set():
             return False
         task.cancel_requested.set()
-        self._safe_set_exception(task.future, exc)
+        self._set_clip_task_exception(task, exc)
         return True
 
     def _wait_clip_image_task(self, task: _ClipImageTask) -> Any:
@@ -1015,22 +1091,22 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._release_non_text_models_sync(reason="restart")
 
     def release_all_models(self) -> None:
+        join_timeout_seconds = max(2.0, float(self._execution_timeout_seconds))
         try:
             self._idle_release_stop.set()
             self._idle_release_wakeup.set()
-            self._join_idle_release_thread(
-                timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
-            )
+            self._join_idle_release_thread(timeout_seconds=join_timeout_seconds)
             self._background_prewarm_cancel.set()
-            self._release_non_text_models_sync(
-                reason="shutdown",
-                cancel_background_prewarm=False,
-                join_background_prewarm=True,
-            )
-
-            if self._stopping:
-                return
+            try:
+                self._release_non_text_models_sync(
+                    reason="shutdown",
+                    cancel_background_prewarm=False,
+                    join_background_prewarm=True,
+                )
+            except Exception as exc:
+                LOG.warning("Failed to release non-text models during shutdown: %s", exc, exc_info=True)
             self._stopping = True
+
             pending_tasks: List[_ClipImageTask] = []
             pending_face_tasks: List[_FaceInferenceTask] = []
             clip_queue_loop = self._clip_image_dispatch_loop
@@ -1040,25 +1116,35 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                     clip_queue_loop,
                 )
                 try:
-                    pending_tasks = shutdown_future.result(
-                        timeout=max(2.0, float(self._execution_timeout_seconds))
-                    )
+                    pending_tasks = shutdown_future.result(timeout=join_timeout_seconds)
                 except Exception as exc:
                     LOG.warning("Failed to drain CLIP image queue during shutdown: %s", exc)
-                clip_queue_loop.call_soon_threadsafe(clip_queue_loop.stop)
+                try:
+                    clip_queue_loop.call_soon_threadsafe(clip_queue_loop.stop)
+                except RuntimeError:
+                    pass
 
             for task in pending_tasks:
-                self._safe_set_exception(task.future, RuntimeError("模型服务正在关闭"))
-            pending_face_tasks = self._stop_face_batch_service()
+                self._set_clip_task_exception(task, RuntimeError("模型服务正在关闭"))
+            try:
+                pending_face_tasks = self._stop_face_batch_service()
+            except Exception as exc:
+                LOG.warning("Failed to stop InsightFace batch service during shutdown: %s", exc, exc_info=True)
             for task in pending_face_tasks:
-                if not task.future.done():
-                    task.future.set_exception(RuntimeError("模型服务正在关闭"))
+                self._set_face_task_exception(task, RuntimeError("模型服务正在关闭"))
 
-            if self._clip_image_worker is not None:
-                self._clip_image_worker.join()
-            self._join_background_prewarm_thread(
-                timeout_seconds=max(2.0, float(self._execution_timeout_seconds))
-            )
+            clip_worker = self._clip_image_worker
+            if clip_worker is not None and clip_worker is not threading.current_thread():
+                clip_worker.join(timeout=join_timeout_seconds)
+                if clip_worker.is_alive():
+                    LOG.warning(
+                        "CLIP queue worker did not exit within %.1fs.",
+                        join_timeout_seconds,
+                    )
+                else:
+                    self._clip_image_worker = None
+            self._clip_image_loop_ready.clear()
+            self._join_background_prewarm_thread(timeout_seconds=join_timeout_seconds)
 
             for executor in (
                 self._control_executor,
@@ -1066,10 +1152,21 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 self._shared_cpu_executor,
                 self._ocr_executor,
             ):
-                executor.shutdown(wait=True, cancel_futures=True)
+                if executor is not None:
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    except Exception as exc:
+                        LOG.warning("Executor shutdown failed: %s", exc, exc_info=True)
+            self._control_executor = None
+            self._face_preprocess_executor = None
+            self._shared_cpu_executor = None
+            self._ocr_executor = None
 
-            with self._model_lock:
-                self._unload_everything_locked()
+            try:
+                with self._model_lock:
+                    self._unload_everything_locked()
+            except Exception as exc:
+                LOG.warning("Final runtime unload failed during shutdown: %s", exc, exc_info=True)
             LOG.info("All models released.")
         finally:
             self._release_single_process_lock()

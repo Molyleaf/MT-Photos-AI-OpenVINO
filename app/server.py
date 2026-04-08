@@ -90,14 +90,16 @@ async def lifespan(app: FastAPI):
         "应用启动：初始化主 AIModels 实例；非文本模型按首次请求懒加载。Text-CLIP 代理上游=%s",
         settings.text_clip.server_url,
     )
-    models_instance = AIModels()
+    instance = AIModels()
+    models_instance = instance
     try:
         yield
     finally:
         LOGGER.info("应用关闭：正在释放所有模型。")
-        if models_instance:
-            await asyncio.to_thread(models_instance.release_all_models)
-            models_instance = None
+        instance_to_release = models_instance
+        models_instance = None
+        if instance_to_release is not None:
+            await asyncio.to_thread(instance_to_release.release_all_models)
 
 
 app = FastAPI(
