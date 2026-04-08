@@ -122,6 +122,49 @@ class _FakeConcurrentResult:
         return self._value
 
 
+class _FakeOrtSession:
+    def __init__(self) -> None:
+        self._sess = object()
+        self._sess_options = object()
+        self._sess_options_initial = object()
+        self._inputs_meta = object()
+        self._outputs_meta = object()
+        self._overridable_initializers = object()
+        self._input_meminfos = object()
+        self._output_meminfos = object()
+        self._input_epdevices = object()
+        self._model_meta = object()
+        self._providers = ["OpenVINOExecutionProvider"]
+        self._provider_options = {"OpenVINOExecutionProvider": {"device_type": "GPU"}}
+        self._fallback_providers = ["CPUExecutionProvider"]
+        self._profiling_start_time_ns = 1
+        self._profiling_start_time = 1
+        self._model_path = "model.onnx"
+        self._model_bytes = b"model"
+
+
+class _FakeInsightFaceModel:
+    def __init__(self) -> None:
+        self.center_cache = {"a": 1}
+        self.session = _FakeOrtSession()
+        self.input_name = "input"
+        self.output_names = ["output"]
+        self.input_shape = [1, 3, 112, 112]
+        self.output_shape = [1, 512]
+        self.output_shapes = [[1, 10]]
+
+
+class _FakeFaceApp:
+    def __init__(self) -> None:
+        self.det_model = _FakeInsightFaceModel()
+        self.models = {
+            "detection": self.det_model,
+            "recognition": _FakeInsightFaceModel(),
+        }
+        self.det_thresh = 0.5
+        self.det_size = (640, 640)
+
+
 class RuntimeCleanupTests(unittest.TestCase):
     def test_ai_models_init_failure_triggers_release_all_models(self) -> None:
         with (
@@ -242,6 +285,90 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertIsNone(runner.output_port)
         with self.assertRaisesRegex(RuntimeError, "released"):
             runner._get_request()
+
+    def test_release_models_for_restart_recycles_support_workers_and_executors(self) -> None:
+        models = AIModels.__new__(AIModels)
+        models._pid = 123
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+        models._execution_timeout_seconds = 3
+
+        clip_task = _ClipImageTask(payload=object(), future=Future(), created_at=0.0)
+        face_task = _FaceInferenceTask(payload=object(), future=Future(), created_at=0.0)
+        clip_loop = _FakeLoop()
+        clip_worker = _FakeThread()
+        face_loop = _FakeLoop()
+        face_worker = _FakeThread()
+        shared_executor = _FakeExecutor()
+        ocr_executor = _FakeExecutor()
+        face_executor = _FakeExecutor()
+
+        models._clip_image_dispatch_loop = clip_loop
+        models._clip_image_worker = clip_worker
+        models._face_dispatch_loop = face_loop
+        models._face_worker = face_worker
+        models._shared_cpu_executor = shared_executor
+        models._ocr_executor = ocr_executor
+        models._face_preprocess_executor = face_executor
+        models._non_text_state = Mock()
+        models._unload_non_text_models = Mock(return_value=["face"])
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            if loop is clip_loop:
+                return _FakeConcurrentResult([clip_task])
+            if loop is face_loop:
+                return _FakeConcurrentResult([face_task])
+            raise AssertionError(f"unexpected loop: {loop}")
+
+        with patch(
+            "models.runtime.asyncio.run_coroutine_threadsafe",
+            side_effect=fake_run_coroutine_threadsafe,
+        ), patch("models.insightface.asyncio.run_coroutine_threadsafe", side_effect=fake_run_coroutine_threadsafe):
+            models.release_models_for_restart()
+
+        self.assertTrue(clip_task.future.done())
+        self.assertTrue(face_task.future.done())
+        self.assertIsNone(clip_task.payload)
+        self.assertIsNone(face_task.payload)
+        self.assertTrue(clip_loop.stop_called)
+        self.assertTrue(face_loop.stop_called)
+        self.assertEqual([(True, True)], shared_executor.shutdown_calls)
+        self.assertEqual([(True, True)], ocr_executor.shutdown_calls)
+        self.assertEqual([(True, True)], face_executor.shutdown_calls)
+        self.assertIsNone(models._shared_cpu_executor)
+        self.assertIsNone(models._ocr_executor)
+        self.assertIsNone(models._face_preprocess_executor)
+        models._non_text_state.begin_release.assert_called_once_with()
+        models._non_text_state.wait_for_drain.assert_called_once_with()
+        models._non_text_state.finish_release.assert_called_once_with()
+        models._unload_non_text_models.assert_called_once_with()
+
+    def test_dispose_insightface_face_analysis_clears_ort_runtime_refs(self) -> None:
+        face_app = _FakeFaceApp()
+        det_session = face_app.det_model.session
+        rec_session = face_app.models["recognition"].session
+
+        AIModels._dispose_insightface_face_analysis(face_app)
+
+        self.assertIsNone(face_app.det_model)
+        self.assertEqual({}, face_app.models)
+        self.assertIsNone(face_app.det_thresh)
+        self.assertIsNone(face_app.det_size)
+        self.assertIsNone(det_session._sess)
+        self.assertIsNone(det_session._provider_options)
+        self.assertIsNone(rec_session._sess)
+        self.assertIsNone(rec_session._providers)
+
+        detached_model = _FakeInsightFaceModel()
+        AIModels._dispose_insightface_model(detached_model)
+        self.assertEqual({}, detached_model.center_cache)
+        self.assertIsNone(detached_model.session)
+        self.assertIsNone(detached_model.input_name)
+        self.assertIsNone(detached_model.output_names)
+        self.assertIsNone(detached_model.input_shape)
+        self.assertIsNone(detached_model.output_shape)
+        self.assertIsNone(detached_model.output_shapes)
 
 
 if __name__ == "__main__":

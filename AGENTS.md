@@ -102,7 +102,7 @@
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 - 默认应在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 容器不参与这一路径。允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
-- 主容器在完成非文本模型释放后，如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
+- 主容器在完成非文本模型释放后，必须同步回收非文本批队列线程以及 OCR/InsightFace 相关应用层执行器；如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，还必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
 
 ### 3.4 InsightFace
 
@@ -216,7 +216,7 @@
 8. 非文本超时必须拆分为“排队超时”和“执行超时”；禁止继续用单个 `INFERENCE_TASK_TIMEOUT` 同时覆盖全部阶段。
 9. `/represent` 必须通过专用有界批队列平滑跨请求调度，并在 InsightFace 模型族内部聚合识别批；不得绕开第 4 条让多个非文本模型族并行常驻。
 10. 非文本空闲释放计时只允许由 `/clip/img`、`/ocr`、`/represent` 刷新；`/check`、`/restart`、`/restart_v2`、`/clip/txt` 代理调用都不得阻止 Vision-CLIP / OCR / InsightFace 自动释放。
-11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放；独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
+11. `POST /restart` 返回前必须完成 Vision-CLIP / OCR / InsightFace 的同步释放，并同步回收非文本批队列线程与 OCR/InsightFace 应用层执行器；这些支持资源只允许在后续非文本请求到来时按需重建。独立 Text-CLIP 服务保持可用，除非它自己的容器被关闭或重启。
 12. 关闭路径必须等待已受理的 Vision-CLIP / OCR / InsightFace 任务退场后，再回收执行器与 native runtime 引用。
 13. `/clip/img`、`/ocr`、`/represent` 必须共享同一个应用层图片准入名额池；已受理图片总量（排队 + 执行）硬上限为 `10`，超出时必须立即失败，禁止继续挂起等待导致 MT-Photos 客户端超时取消。
 

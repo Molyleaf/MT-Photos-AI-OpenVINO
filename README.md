@@ -83,7 +83,7 @@
 
 - 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 仍按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
-- 主容器在 `/restart` 或空闲释放完成后，除断开模型引用外，还会在当前不再持有 Vision-CLIP / InsightFace OpenVINO consumer 时同步释放共享 OpenVINO runtime，并尽量把 native heap 空闲页归还给 OS；因此 Linux 容器 RSS / Windows 工作集通常会明显下降，但受驱动与分配器行为影响，不保证瞬时回到冷启动水平。
+- 主容器在 `/restart` 或空闲释放完成后，除断开模型引用外，还会同步回收非文本批队列线程与 OCR/人脸预处理执行器；若当前不再持有 Vision-CLIP / InsightFace OpenVINO consumer，还会继续释放共享 OpenVINO runtime，并尽量把 native heap 空闲页归还给 OS。下一次 `/clip/img`、`/ocr`、`/represent` 请求会按需重建这些运行时支持资源；因此 Linux 容器 RSS / Windows 工作集通常会明显下降，但受驱动与分配器行为影响，不保证瞬时回到冷启动水平。
 - RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
 - 主服务当前尽量直接复用 RapidOCR 原生 `config_path + params` 配置合并逻辑；仓库侧只补充本地模型路径、显式环境变量覆盖以及应用层实例池/超时控制。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。

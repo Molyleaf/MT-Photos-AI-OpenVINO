@@ -218,6 +218,10 @@ class InsightFaceMixin(ABC):
     def _ensure_openvino_runtime(self) -> Any:
         raise NotImplementedError
 
+    @abstractmethod
+    def _ensure_non_text_task_executors_ready(self) -> None:
+        raise NotImplementedError
+
     def _configure_insightface_preprocess_backend(self, device_name: str) -> None:
         normalized_device = str(device_name or "").strip().upper()
         self._face_preprocess_device = "CPU"
@@ -740,30 +744,94 @@ class InsightFaceMixin(ABC):
         return runtime_state
 
     @staticmethod
+    def _dispose_onnxruntime_session(session: Any) -> None:
+        if session is None:
+            return
+
+        for attr_name in (
+            "_sess",
+            "_sess_options",
+            "_sess_options_initial",
+            "_inputs_meta",
+            "_outputs_meta",
+            "_overridable_initializers",
+            "_input_meminfos",
+            "_output_meminfos",
+            "_input_epdevices",
+            "_model_meta",
+            "_providers",
+            "_provider_options",
+            "_fallback_providers",
+            "_profiling_start_time_ns",
+            "_profiling_start_time",
+            "_model_path",
+            "_model_bytes",
+        ):
+            if not hasattr(session, attr_name):
+                continue
+            try:
+                setattr(session, attr_name, None)
+            except Exception:
+                pass
+
+    @classmethod
+    def _dispose_insightface_model(cls, model: Any) -> None:
+        if model is None:
+            return
+
+        if isinstance(getattr(model, "center_cache", None), dict):
+            model.center_cache.clear()
+
+        cls._dispose_onnxruntime_session(getattr(model, "session", None))
+        if hasattr(model, "session"):
+            try:
+                model.session = None
+            except Exception:
+                pass
+
+        for attr_name in (
+            "input_name",
+            "output_names",
+            "input_shape",
+            "output_shape",
+            "output_shapes",
+        ):
+            if not hasattr(model, attr_name):
+                continue
+            try:
+                setattr(model, attr_name, None)
+            except Exception:
+                pass
+
+    @staticmethod
     def _dispose_insightface_face_analysis(face_app: Optional[FaceAnalysis]) -> None:
         if face_app is None:
             return
 
         det_model = getattr(face_app, "det_model", None)
-        if det_model is not None and isinstance(getattr(det_model, "center_cache", None), dict):
-            det_model.center_cache.clear()
+        InsightFaceMixin._dispose_insightface_model(det_model)
 
         models_map = getattr(face_app, "models", None)
         if isinstance(models_map, dict):
             for model in list(models_map.values()):
-                if isinstance(getattr(model, "center_cache", None), dict):
-                    model.center_cache.clear()
-                if hasattr(model, "session"):
-                    try:
-                        model.session = None
-                    except Exception:
-                        pass
+                InsightFaceMixin._dispose_insightface_model(model)
             models_map.clear()
+            try:
+                face_app.models = {}
+            except Exception:
+                pass
 
         try:
             face_app.det_model = None
         except Exception:
             pass
+        for attr_name in ("det_thresh", "det_size"):
+            if not hasattr(face_app, attr_name):
+                continue
+            try:
+                setattr(face_app, attr_name, None)
+            except Exception:
+                pass
 
     def _unload_face_model_locked(self) -> None:
         self._dispose_insightface_face_analysis(self._face_engine)
@@ -851,6 +919,7 @@ class InsightFaceMixin(ABC):
         if self._face_preprocess_worker_count <= 1 or len(jobs) <= 1:
             return [job() for job in jobs]
 
+        self._ensure_non_text_task_executors_ready()
         futures = {
             self._face_preprocess_executor.submit(job): index
             for index, job in enumerate(jobs)
@@ -924,10 +993,11 @@ class InsightFaceMixin(ABC):
     def _submit_face_task(self, image: np.ndarray) -> _FaceInferenceTask:
         future: Future[List[RepresentResult]] = Future()
         task = _FaceInferenceTask(payload=image, future=future, created_at=time.time())
-        loop = self._face_dispatch_loop
         if self._stopping:
             future.set_exception(RuntimeError("模型服务已关闭"))
             return task
+        self._ensure_face_batch_service_ready()
+        loop = self._face_dispatch_loop
         if loop is None:
             future.set_exception(RuntimeError("InsightFace queue loop is not initialized."))
             return task
@@ -1099,43 +1169,63 @@ class InsightFaceMixin(ABC):
         task_queue.put_nowait(task)
 
     def _start_face_batch_service(self) -> None:
-        if self._face_worker is not None:
-            return
+        with self._face_worker_lock:
+            if self._face_worker is not None and self._face_dispatch_loop is not None:
+                return
 
-        self._face_worker = threading.Thread(
-            target=self._face_worker_thread_main,
-            name="ai-face-queue",
-            daemon=True,
-        )
-        self._face_worker.start()
-        ready = self._face_loop_ready.wait(
-            timeout=max(2.0, float(self._execution_timeout_seconds))
-        )
-        if not ready:
-            raise RuntimeError("InsightFace queue worker failed to initialize in time.")
+            self._face_loop_ready.clear()
+            self._face_worker = threading.Thread(
+                target=self._face_worker_thread_main,
+                name="ai-face-queue",
+                daemon=True,
+            )
+            self._face_worker.start()
+            ready = self._face_loop_ready.wait(
+                timeout=max(2.0, float(self._execution_timeout_seconds))
+            )
+            if not ready:
+                self._face_worker = None
+                raise RuntimeError("InsightFace queue worker failed to initialize in time.")
+
+    def _ensure_face_batch_service_ready(self) -> None:
+        if self._stopping:
+            raise RuntimeError("模型服务已关闭")
+        if self._face_worker is not None and self._face_dispatch_loop is not None:
+            return
+        self._start_face_batch_service()
 
     def _stop_face_batch_service(self) -> List[_FaceInferenceTask]:
         pending: List[_FaceInferenceTask] = []
-        loop = self._face_dispatch_loop
-        if loop is not None:
-            shutdown_future = asyncio.run_coroutine_threadsafe(
-                self._shutdown_face_queue_async(),
-                loop,
-            )
-            try:
-                pending = shutdown_future.result(
-                    timeout=max(2.0, float(self._execution_timeout_seconds))
+        with self._face_worker_lock:
+            loop = self._face_dispatch_loop
+            if loop is not None:
+                shutdown_future = asyncio.run_coroutine_threadsafe(
+                    self._shutdown_face_queue_async(),
+                    loop,
                 )
-            except Exception as exc:
-                LOG.warning("Failed to drain InsightFace queue during shutdown: %s", exc)
-            loop.call_soon_threadsafe(loop.stop)
+                try:
+                    pending = shutdown_future.result(
+                        timeout=max(2.0, float(self._execution_timeout_seconds))
+                    )
+                except Exception as exc:
+                    LOG.warning("Failed to drain InsightFace queue during runtime recycle: %s", exc)
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
 
-        worker = self._face_worker
-        if worker is not None:
-            worker.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
-            self._face_worker = None
+            worker = self._face_worker
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+                if worker.is_alive():
+                    LOG.warning(
+                        "InsightFace queue worker did not exit within %.1fs.",
+                        max(2.0, float(self._execution_timeout_seconds)),
+                    )
+                else:
+                    self._face_worker = None
 
-        self._face_loop_ready.clear()
+            self._face_loop_ready.clear()
         return pending
 
     async def _shutdown_face_queue_async(self) -> List[_FaceInferenceTask]:

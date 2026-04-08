@@ -68,6 +68,10 @@ class ClipImageMixin(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def _ensure_non_text_task_executors_ready(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def _safe_set_result(self, future: Future, value: Any) -> None:
         raise NotImplementedError
 
@@ -399,6 +403,7 @@ class ClipImageMixin(ABC):
         lease = await self._acquire_clip_image_lease_async()
         try:
             await self._run_control(self._ensure_clip_vision_loaded)
+            self._ensure_non_text_task_executors_ready()
             payload = await self._run_in_executor(
                 self._shared_cpu_executor,
                 self._preprocess_clip_image_tensor,

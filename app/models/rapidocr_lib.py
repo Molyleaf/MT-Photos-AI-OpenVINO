@@ -97,6 +97,10 @@ class RapidOCRMixin(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def _ensure_non_text_task_executors_ready(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     async def _await_with_timeout_and_cooperative_cancel(
         self,
         awaitable: asyncio.Future[Any] | asyncio.Task[Any],
@@ -577,6 +581,7 @@ class RapidOCRMixin(ABC):
     ) -> OCRResult:
         if self._rapidocr_engine_pool is None:
             raise RuntimeError("RapidOCR model is not loaded.")
+        self._ensure_non_text_task_executors_ready()
         return await self._run_in_executor(
             self._ocr_executor,
             self._run_rapidocr_with_pooled_engine,
