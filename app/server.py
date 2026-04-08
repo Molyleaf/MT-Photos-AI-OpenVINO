@@ -147,6 +147,12 @@ async def restart_process():
     return {"result": "pass"}
 
 
+@app.post("/restartV2", response_model=RestartResponse, dependencies=[Depends(get_api_key)])
+async def restart_process_compat():
+    LOGGER.info("收到兼容路径 /restartV2 请求，转到 /restart_v2 语义。")
+    return await restart_process()
+
+
 @app.post("/clip/txt", dependencies=[Depends(get_api_key)])
 async def clip_text_proxy_endpoint(request: Request):
     request_body = await request.body()

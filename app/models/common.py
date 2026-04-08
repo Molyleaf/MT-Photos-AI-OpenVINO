@@ -30,6 +30,7 @@ else:
 _WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
 _WINDOWS_DLL_DIRECTORY_PATHS: set[str] = set()
 _WINDOWS_RUNTIME_LOG = logging.getLogger("mt_photos_ai.models")
+_POSIX_FADV_DONTNEED = 4
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -139,6 +140,168 @@ def _trim_process_memory() -> bool:
         except Exception:
             return False
     return False
+
+
+def _drop_filesystem_page_cache(paths: List[Optional[Path]]) -> Tuple[int, int]:
+    if os.name == "nt":
+        return 0, 0
+
+    libc = None
+    for libc_name in ("libc.so.6", "libc.so"):
+        try:
+            libc = ctypes.CDLL(libc_name, use_errno=True)
+            break
+        except OSError:
+            continue
+    if libc is None:
+        return 0, 0
+
+    posix_fadvise = getattr(libc, "posix_fadvise64", None)
+    if posix_fadvise is None:
+        posix_fadvise = getattr(libc, "posix_fadvise", None)
+    if posix_fadvise is None:
+        return 0, 0
+
+    try:
+        posix_fadvise.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int,
+        ]
+        posix_fadvise.restype = ctypes.c_int
+    except Exception:
+        return 0, 0
+
+    evicted_files = 0
+    evicted_bytes = 0
+    seen: set[str] = set()
+    candidates: List[Path] = []
+    for raw_path in paths:
+        if raw_path is None:
+            continue
+        candidate = Path(raw_path).expanduser()
+        if not candidate.exists():
+            continue
+        if candidate.is_file():
+            candidates.append(candidate)
+            continue
+        if candidate.is_dir():
+            for child in candidate.rglob("*"):
+                if child.is_file():
+                    candidates.append(child)
+
+    for candidate in candidates:
+        normalized = str(candidate.resolve())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            stat_result = candidate.stat()
+        except OSError:
+            continue
+        try:
+            fd = os.open(str(candidate), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            result = int(posix_fadvise(fd, 0, 0, _POSIX_FADV_DONTNEED))
+            if result == 0:
+                evicted_files += 1
+                evicted_bytes += int(stat_result.st_size)
+        except Exception:
+            continue
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return evicted_files, evicted_bytes
+
+
+def _get_process_memory_snapshot() -> dict[str, int]:
+    snapshot: dict[str, int] = {}
+    if os.name != "nt":
+        status_path = Path("/proc/self/status")
+        if status_path.is_file():
+            try:
+                for raw_line in status_path.read_text(encoding="utf-8").splitlines():
+                    if ":" not in raw_line:
+                        continue
+                    key, value = raw_line.split(":", 1)
+                    key = key.strip()
+                    if key not in {"VmRSS", "VmSize", "RssAnon", "RssFile", "RssShmem"}:
+                        continue
+                    parts = value.strip().split()
+                    if not parts:
+                        continue
+                    snapshot[key] = int(parts[0]) * 1024
+            except Exception:
+                pass
+
+        cgroup_root = Path("/sys/fs/cgroup")
+        memory_current_path = cgroup_root / "memory.current"
+        if memory_current_path.is_file():
+            try:
+                snapshot["cgroup_memory_current"] = int(memory_current_path.read_text().strip())
+            except Exception:
+                pass
+
+        memory_stat_path = cgroup_root / "memory.stat"
+        if memory_stat_path.is_file():
+            try:
+                for raw_line in memory_stat_path.read_text(encoding="utf-8").splitlines():
+                    parts = raw_line.split()
+                    if len(parts) != 2:
+                        continue
+                    key, raw_value = parts
+                    if key not in {"anon", "file", "shmem", "inactive_file", "active_file"}:
+                        continue
+                    snapshot[f"cgroup_{key}"] = int(raw_value)
+            except Exception:
+                pass
+        return snapshot
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = ctypes.c_void_p
+
+        class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        counters = _PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS_EX)
+        get_process_memory_info = psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX),
+            ctypes.c_ulong,
+        ]
+        get_process_memory_info.restype = ctypes.c_int
+        if bool(get_process_memory_info(get_current_process(), ctypes.byref(counters), counters.cb)):
+            snapshot["WorkingSetSize"] = int(counters.WorkingSetSize)
+            snapshot["PrivateUsage"] = int(counters.PrivateUsage)
+    except Exception:
+        pass
+    return snapshot
 
 
 def _normalize_openvino_devices(devices: Any) -> List[str]:

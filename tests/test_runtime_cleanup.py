@@ -218,6 +218,7 @@ class RuntimeCleanupTests(unittest.TestCase):
         models._single_process_lock = process_lock
         models._stop_face_batch_service = Mock(return_value=[face_task])
         models._unload_everything_locked = Mock()
+        models._drop_non_text_filesystem_page_cache = Mock()
 
         def fake_run_coroutine_threadsafe(coro, loop):
             self.assertIs(loop, clip_loop)
@@ -243,6 +244,7 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertEqual([(True, True)], ocr_executor.shutdown_calls)
         self.assertEqual(1, process_lock.release_calls)
         models._stop_face_batch_service.assert_called_once_with()
+        models._drop_non_text_filesystem_page_cache.assert_called_once_with()
         models._unload_everything_locked.assert_called_once_with()
 
     def test_release_openvino_runtime_if_unused_drops_core_and_remote_context(self) -> None:
@@ -312,6 +314,7 @@ class RuntimeCleanupTests(unittest.TestCase):
         models._face_preprocess_executor = face_executor
         models._non_text_state = Mock()
         models._unload_non_text_models = Mock(return_value=["face"])
+        models._drop_non_text_filesystem_page_cache = Mock()
 
         def fake_run_coroutine_threadsafe(coro, loop):
             coro.close()
@@ -342,6 +345,7 @@ class RuntimeCleanupTests(unittest.TestCase):
         models._non_text_state.begin_release.assert_called_once_with()
         models._non_text_state.wait_for_drain.assert_called_once_with()
         models._non_text_state.finish_release.assert_called_once_with()
+        models._drop_non_text_filesystem_page_cache.assert_called_once_with()
         models._unload_non_text_models.assert_called_once_with()
 
     def test_dispose_insightface_face_analysis_clears_ort_runtime_refs(self) -> None:

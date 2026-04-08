@@ -24,6 +24,8 @@ from .common import (
     _prepare_windows_openvino_runtime,
     _extract_explicit_gpu_devices,
     _get_openvino_gpu_devices,
+    _drop_filesystem_page_cache,
+    _get_process_memory_snapshot,
     _normalize_openvino_devices,
     _summarize_exception,
     _trim_process_memory,
@@ -1045,6 +1047,9 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
             unloaded = self._unload_non_text_models()
             recycled_support = self._recycle_non_text_runtime_support_resources()
+            if unloaded or recycled_support:
+                self._drop_non_text_filesystem_page_cache()
+                self._log_process_memory_snapshot(f"{reason}-release")
             LOG.info(
                 "Runtime model release complete: reason=%s unloaded=%s support_recycled=%s",
                 reason,
@@ -1123,10 +1128,56 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._trim_native_memory(reason="non-text-support-recycle")
         return recycled
 
+    def _drop_non_text_filesystem_page_cache(self) -> None:
+        insightface_root = getattr(self, "insightface_root", None)
+        evicted_files, evicted_bytes = _drop_filesystem_page_cache(
+            [
+                getattr(self, "qa_clip_path", None),
+                getattr(self, "rapidocr_model_dir_path", None),
+                getattr(self, "insightface_model_root", None),
+                (insightface_root / "_runtime_models") if insightface_root is not None else None,
+                getattr(self, "ov_cache_dir", None),
+            ]
+        )
+        if evicted_files <= 0:
+            return
+        LOG.info(
+            "Dropped Linux filesystem page cache for non-text model assets: files=%s bytes=%s.",
+            evicted_files,
+            evicted_bytes,
+        )
+
     def _trim_native_memory(self, reason: str) -> None:
         trimmed = _trim_process_memory()
         if trimmed:
             LOG.info("Returned native heap pages to OS after %s.", reason)
+
+    def _log_process_memory_snapshot(self, reason: str) -> None:
+        snapshot = _get_process_memory_snapshot()
+        if not snapshot:
+            return
+        ordered_keys = [
+            "VmRSS",
+            "RssAnon",
+            "RssFile",
+            "RssShmem",
+            "VmSize",
+            "cgroup_memory_current",
+            "cgroup_anon",
+            "cgroup_file",
+            "cgroup_shmem",
+            "cgroup_inactive_file",
+            "cgroup_active_file",
+            "WorkingSetSize",
+            "PrivateUsage",
+        ]
+        formatted = ", ".join(
+            f"{key}={snapshot[key]}"
+            for key in ordered_keys
+            if key in snapshot
+        )
+        if formatted:
+            LOG.info("Process memory snapshot after %s: %s", reason, formatted)
 
     def _build_openvino_preprocess_runner(
         self,

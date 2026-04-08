@@ -102,7 +102,8 @@
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 - 默认应在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 容器不参与这一路径。允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
-- 主容器在完成非文本模型释放后，必须同步回收非文本批队列线程以及 OCR/InsightFace 相关应用层执行器；如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，还必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
+- 主容器在完成非文本模型释放后，必须同步回收非文本批队列线程以及 OCR/InsightFace 相关应用层执行器；如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，还必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS。Linux 部署下还必须对非文本模型文件与 OpenVINO cache 做 best-effort 文件页缓存回收，降低 cgroup/file cache 残留导致的“模型已释放但容器内存不降”现象；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
+- 主容器在完成非文本 full release 后，必须输出一条进程/cgroup 内存拆分日志，至少覆盖 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`；若 Linux 下文件页缓存回收已执行，也应保留对应日志，便于区分匿名内存、文件页缓存和 shared memory 残留。
 
 ### 3.4 InsightFace
 
@@ -173,6 +174,7 @@
 4. `POST /restart_v2`
 - 语义：延迟 1 秒后 `os.execl` 重启进程。
 - 立即返回：`{"result":"pass"}`。
+- 兼容别名：`POST /restartV2`，语义与 `/restart_v2` 完全一致，仅用于兼容现有 MT-Photos 客户端。
 
 5. `POST /clip/txt`
 - 入参：透传独立 Text-CLIP 服务原始请求体（当前示例为 `{"text": <字符串>}`）。
