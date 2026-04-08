@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import importlib
 import logging
 import os
@@ -107,6 +108,37 @@ def _prepare_windows_openvino_runtime() -> None:
             "Registered Windows DLL search paths for OpenVINO/ORT runtime: %s",
             ",".join(sorted(_WINDOWS_DLL_DIRECTORY_PATHS)),
         )
+
+
+def _trim_process_memory() -> bool:
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            get_current_process = kernel32.GetCurrentProcess
+            get_current_process.restype = ctypes.c_void_p
+            empty_working_set = psapi.EmptyWorkingSet
+            empty_working_set.argtypes = [ctypes.c_void_p]
+            empty_working_set.restype = ctypes.c_int
+            return bool(empty_working_set(get_current_process()))
+        except Exception:
+            return False
+
+    for libc_name in ("libc.so.6", "libc.so"):
+        try:
+            libc = ctypes.CDLL(libc_name)
+        except OSError:
+            continue
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is None:
+            continue
+        try:
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+            return bool(malloc_trim(0))
+        except Exception:
+            return False
+    return False
 
 
 def _normalize_openvino_devices(devices: Any) -> List[str]:

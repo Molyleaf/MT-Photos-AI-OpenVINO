@@ -214,6 +214,10 @@ class InsightFaceMixin(ABC):
     ) -> Any:
         raise NotImplementedError
 
+    @abstractmethod
+    def _ensure_openvino_runtime(self) -> Any:
+        raise NotImplementedError
+
     def _configure_insightface_preprocess_backend(self, device_name: str) -> None:
         normalized_device = str(device_name or "").strip().upper()
         self._face_preprocess_device = "CPU"
@@ -777,12 +781,13 @@ class InsightFaceMixin(ABC):
             self._load_family_serialized("face", self._load_face_locked)
 
     def _load_face_locked(self) -> None:
+        core = self._ensure_openvino_runtime()
         configured_provider_device = _normalize_non_text_openvino_device(
             os.environ.get("INSIGHTFACE_OV_DEVICE", INFERENCE_DEVICE)
         )
         provider_device = _resolve_non_text_openvino_runtime_device(
             configured_provider_device,
-            self.core.available_devices,
+            core.available_devices,
             consumer="ort_ep",
         )
         provider_options = self._build_insightface_provider_options(provider_device)

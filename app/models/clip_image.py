@@ -20,7 +20,7 @@ from .constants import (
 
 
 class ClipImageMixin(ABC):
-    core: ov.Core
+    core: Optional[ov.Core]
     qa_clip_path: Path
     _clip_inference_device: str
     _clip_remote_context: Any
@@ -61,6 +61,10 @@ class ClipImageMixin(ABC):
         mean_values: List[float],
         std_values: List[float],
     ) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _ensure_openvino_runtime(self) -> ov.Core:
         raise NotImplementedError
 
     @abstractmethod
@@ -243,27 +247,29 @@ class ClipImageMixin(ABC):
         model_or_path: Any,
         performance_hint: str,
     ) -> ov.CompiledModel:
+        core = self._ensure_openvino_runtime()
         config = {
             "PERFORMANCE_HINT": performance_hint,
         }
 
         if self._clip_remote_context is not None:
             if isinstance(model_or_path, Path):
-                model = self.core.read_model(str(model_or_path))
+                model = core.read_model(str(model_or_path))
             else:
                 model = model_or_path
-            return self.core.compile_model(model, self._clip_remote_context, config)
+            return core.compile_model(model, self._clip_remote_context, config)
 
         if isinstance(model_or_path, Path):
-            return self.core.compile_model(str(model_or_path), self._clip_inference_device, config)
-        return self.core.compile_model(model_or_path, self._clip_inference_device, config)
+            return core.compile_model(str(model_or_path), self._clip_inference_device, config)
+        return core.compile_model(model_or_path, self._clip_inference_device, config)
 
     def _load_clip_vision_locked(self) -> None:
         vision_model_path = self.qa_clip_path / "openvino_image_fp16.xml"
         if not vision_model_path.exists():
             raise FileNotFoundError(f"Missing vision model: {vision_model_path}")
 
-        model = self.core.read_model(str(vision_model_path))
+        core = self._ensure_openvino_runtime()
+        model = core.read_model(str(vision_model_path))
         model.reshape(
             {
                 model.input(0): ov.PartialShape(

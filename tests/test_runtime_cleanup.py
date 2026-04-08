@@ -202,6 +202,21 @@ class RuntimeCleanupTests(unittest.TestCase):
         models._stop_face_batch_service.assert_called_once_with()
         models._unload_everything_locked.assert_called_once_with()
 
+    def test_release_openvino_runtime_if_unused_drops_core_and_remote_context(self) -> None:
+        models = AIModels.__new__(AIModels)
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+        models.core = object()
+        models._clip_remote_context = object()
+        models._clip_remote_context_device_name = "GPU"
+
+        released = models._release_openvino_runtime_if_unused_locked(keep_family=None)
+
+        self.assertTrue(released)
+        self.assertIsNone(models.core)
+        self.assertIsNone(models._clip_remote_context)
+        self.assertIsNone(models._clip_remote_context_device_name)
+
     def test_openvino_preprocess_runner_release_drops_cached_requests(self) -> None:
         compiled_model = _FakeCompiledModel()
         runner = _OpenVinoPreprocessRunner(

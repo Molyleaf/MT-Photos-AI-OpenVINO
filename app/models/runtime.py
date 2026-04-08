@@ -26,6 +26,7 @@ from .common import (
     _get_openvino_gpu_devices,
     _normalize_openvino_devices,
     _summarize_exception,
+    _trim_process_memory,
 )
 from .constants import (
     INSIGHTFACE_REQUEST_CAPACITY,
@@ -228,6 +229,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             raise
 
     def _initialize_release_defaults(self) -> None:
+        self.core = None
         self.ov_cache_dir = None
         self._clip_remote_context_device_name = None
         self._clip_remote_context = None
@@ -311,10 +313,19 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._runtime_state_dir = self._path_settings.runtime_state_dir
 
     def _initialize_openvino_runtime(self) -> None:
-        self.core = ov.Core()
+        self._ensure_openvino_runtime()
+
+    def _ensure_openvino_runtime(self) -> ov.Core:
+        core = getattr(self, "core", None)
+        if core is not None:
+            return core
+
+        core = ov.Core()
+        self.core = core
         self._configure_openvino_cache()
-        self._clip_remote_context_device_name: Optional[str] = None
+        self._clip_remote_context_device_name = None
         self._clip_remote_context = self._init_clip_remote_context()
+        return core
 
     def _initialize_model_load_locks(self) -> None:
         self._model_lock = threading.Lock()
@@ -472,8 +483,11 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         )
 
     def _configure_openvino_cache(self) -> None:
+        core = getattr(self, "core", None)
+        if core is None or self.ov_cache_dir is None:
+            return
         try:
-            self.core.set_property({"CACHE_DIR": str(self.ov_cache_dir)})
+            core.set_property({"CACHE_DIR": str(self.ov_cache_dir)})
         except Exception as exc:
             LOG.warning("Failed to set global OpenVINO cache dir: %s", exc)
 
@@ -605,13 +619,16 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             self._release_non_text_family_lease("ocr")
 
     def _init_clip_remote_context(self) -> Optional[Any]:
+        core = getattr(self, "core", None)
+        if core is None:
+            raise RuntimeError("OpenVINO runtime is not initialized.")
         clip_device = self._clip_inference_device.strip().upper()
         force_gpu_remote_context = clip_device == "AUTO"
         wants_gpu_remote_context = force_gpu_remote_context or ("GPU" in clip_device)
         if not wants_gpu_remote_context:
             return None
 
-        available_devices = _normalize_openvino_devices(self.core.available_devices)
+        available_devices = _normalize_openvino_devices(core.available_devices)
         gpu_devices = _get_openvino_gpu_devices(available_devices)
         runtime_hint = (
             " Ensure the container exposes a real Intel /dev/dri render node and installs "
@@ -638,7 +655,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
         for candidate in context_candidates:
             try:
-                remote_context = self.core.get_default_context(candidate)
+                remote_context = core.get_default_context(candidate)
                 resolved_device = str(remote_context.get_device_name()).strip().upper()
                 if explicit_gpu_devices and resolved_device not in explicit_gpu_devices:
                     raise RuntimeError(
@@ -654,7 +671,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                 )
 
         try:
-            remote_context = self.core.create_context("GPU", {})
+            remote_context = core.create_context("GPU", {})
             resolved_device = str(remote_context.get_device_name()).strip().upper()
             if explicit_gpu_devices and resolved_device not in explicit_gpu_devices:
                 raise RuntimeError(
@@ -907,10 +924,15 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self,
         keep_family: Optional[str] = None,
     ) -> List[str]:
+        released_openvino_runtime = False
         with self._clip_vision_load_lock, self._rapidocr_load_lock, self._face_load_lock:
             unloaded = self._unload_non_text_models_locked(keep_family=keep_family)
-        if unloaded:
+            released_openvino_runtime = self._release_openvino_runtime_if_unused_locked(
+                keep_family=keep_family
+            )
+        if unloaded or released_openvino_runtime:
             gc.collect()
+            self._trim_native_memory(reason="non-text-release")
         return unloaded
 
     def _release_non_text_models_sync(
@@ -958,7 +980,39 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._unload_clip_vision_model_locked()
         self._unload_rapidocr_model_locked()
         self._unload_face_model_locked()
+        self._release_openvino_runtime_if_unused_locked(keep_family=None)
         gc.collect()
+
+    def _release_openvino_runtime_if_unused_locked(
+        self,
+        keep_family: Optional[str],
+    ) -> bool:
+        if keep_family in {"vision", "face"}:
+            return False
+        if (
+            self._clip_vision_model is not None
+            or self._clip_vision_request is not None
+            or self._clip_vision_ppp is not None
+            or self._face_engine is not None
+        ):
+            return False
+
+        released = False
+        if getattr(self, "_clip_remote_context", None) is not None:
+            self._clip_remote_context = None
+            released = True
+        if getattr(self, "_clip_remote_context_device_name", None) is not None:
+            self._clip_remote_context_device_name = None
+            released = True
+        if getattr(self, "core", None) is not None:
+            self.core = None
+            released = True
+        return released
+
+    def _trim_native_memory(self, reason: str) -> None:
+        trimmed = _trim_process_memory()
+        if trimmed:
+            LOG.info("Returned native heap pages to OS after %s.", reason)
 
     def _build_openvino_preprocess_runner(
         self,
@@ -969,6 +1023,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         mean_values: List[float],
         std_values: List[float],
     ) -> _OpenVinoPreprocessRunner:
+        core = self._ensure_openvino_runtime()
         parameter = ov.opset13.parameter(
             ov.PartialShape([ov.Dimension.dynamic(), 3, int(output_height), int(output_width)]),
             ov.Type.f32,
@@ -993,7 +1048,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         ppp.input().preprocess().scale(std_values)
         ppp.input().model().set_layout(ov.Layout("NCHW"))
 
-        compiled = self.core.compile_model(
+        compiled = core.compile_model(
             ppp.build(),
             device_name,
             {
@@ -1167,6 +1222,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
                     self._unload_everything_locked()
             except Exception as exc:
                 LOG.warning("Final runtime unload failed during shutdown: %s", exc, exc_info=True)
+            self._trim_native_memory(reason="shutdown-final")
             LOG.info("All models released.")
         finally:
             self._release_single_process_lock()

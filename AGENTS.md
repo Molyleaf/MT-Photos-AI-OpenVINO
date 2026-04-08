@@ -102,6 +102,7 @@
 - 默认禁止在启动后自动拉起 RapidOCR；OCR 只允许在首次 `/ocr` 请求时进入内存。
 - 如显式设置 `OCR_PREWARM_ENABLED=true`，只允许做一次性后台预热并在完成后立即释放 OCR 模型；预热线程不得在 `/restart` 或释放后把 OCR 再次拉回内存。
 - 默认应在连续 `60s` 未收到业务请求时自动释放主容器内的 Vision-CLIP / OCR / InsightFace；独立 Text-CLIP 容器不参与这一路径。允许通过 `NON_TEXT_IDLE_RELEASE_SECONDS` 覆盖，`<=0` 表示关闭该兜底释放。
+- 主容器在完成非文本模型释放后，如当前不再持有 Vision-CLIP / InsightFace 的 OpenVINO consumer，必须同步丢弃共享 `ov.Core` 与 CLIP GPU Remote Context，并做一次 best-effort native heap trim（Linux `malloc_trim(0)` / Windows `EmptyWorkingSet`）以尽量把空闲页归还给 OS；后续再次加载 OpenVINO 路径时必须显式重建 runtime，并重新执行 GPU Remote Context 校验，禁止复用“只断模型引用但 runtime 常驻”的假释放状态。
 
 ### 3.4 InsightFace
 
