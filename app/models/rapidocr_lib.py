@@ -176,9 +176,15 @@ class RapidOCRMixin(ABC):
 
     def _instantiate_rapidocr(self) -> RapidOCR:
         self._configure_rapidocr_logger()
+        init_params = self._build_rapidocr_init_params()
         try:
-            engine = RapidOCR(params=self._build_rapidocr_init_params())
+            engine = RapidOCR(params=init_params)
         except Exception as exc:
+            LOG.warning(
+                "RapidOCR native initialization/download check failed: %s",
+                exc,
+                exc_info=True,
+            )
             raise RuntimeError("RapidOCR 初始化失败，无法以 OpenVINO 默认配置启动。") from exc
         self._validate_rapidocr_backend(engine)
         return engine

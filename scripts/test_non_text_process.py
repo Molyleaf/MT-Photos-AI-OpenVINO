@@ -135,6 +135,24 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
+    async def test_ocr_family_stays_in_worker_process_and_releases_on_restart(self) -> None:
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        first = await self.manager.get_ocr_results_async(image)
+        second = await self.manager.get_ocr_results_async(image)
+
+        self.assertEqual(first.texts, second.texts)
+        self.assertEqual("ocr", self.manager.get_loaded_runtime_family())
+
+        with patch("non_text_process._log_current_process_memory") as memory_log_mock:
+            await asyncio.to_thread(self.manager.release_models_for_restart)
+
+        self.assertIsNone(self.manager.get_loaded_runtime_family())
+        memory_log_mock.assert_called_once_with("restart-worker-stop")
+
+        third = await self.manager.get_ocr_results_async(image)
+        self.assertNotEqual(first.texts, third.texts)
+        self.assertEqual("ocr", self.manager.get_loaded_runtime_family())
+
     async def test_request_timeout_releases_worker_and_clears_loaded_family(self) -> None:
         await asyncio.to_thread(self.manager.release_all_models)
         self.manager = NonTextProcessManager(worker_target=_slow_non_text_worker)

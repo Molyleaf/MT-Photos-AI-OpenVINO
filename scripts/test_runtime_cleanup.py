@@ -177,6 +177,41 @@ class _CapturedFaceAnalysis:
 
 
 class RuntimeCleanupTests(unittest.TestCase):
+    def test_rapidocr_init_params_only_override_engine_type(self) -> None:
+        models = AIModels.__new__(AIModels)
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+
+        params = models._build_rapidocr_init_params()
+
+        self.assertEqual(
+            {
+                "Det.engine_type": "openvino",
+                "Cls.engine_type": "openvino",
+                "Rec.engine_type": "openvino",
+            },
+            {key: getattr(value, "value", value) for key, value in params.items()},
+        )
+
+    def test_instantiate_rapidocr_logs_warning_on_native_init_failure(self) -> None:
+        models = AIModels.__new__(AIModels)
+        models._stopping = False
+        AIModels._initialize_release_defaults(models)
+
+        with (
+            patch.object(AIModels, "_configure_rapidocr_logger"),
+            patch("models.rapidocr_lib.RapidOCR", side_effect=RuntimeError("download failed")),
+            patch("models.rapidocr_lib.LOG.warning") as warning_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "RapidOCR 初始化失败"):
+                models._instantiate_rapidocr()
+
+        warning_mock.assert_called_once()
+        self.assertIn(
+            "RapidOCR native initialization/download check failed",
+            str(warning_mock.call_args.args[0]),
+        )
+
     def test_ai_models_init_failure_triggers_release_all_models(self) -> None:
         with (
             patch("models.runtime._prepare_windows_openvino_runtime"),
