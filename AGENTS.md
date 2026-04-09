@@ -343,7 +343,8 @@
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
 - 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，以及 Python/OpenCV 运行时基础库 `ca-certificates`、`libglib2.0-0`、`libgomp1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 独立 Text-CLIP 镜像固定使用 CPU；其基线依赖仅保留 Python/OpenVINO CPU 运行所需最小集合，不安装 Intel GPU runtime，也不映射 `/dev/dri`。
-- Docker 构建阶段在 `pip install -r requirements.txt` 后，必须移除传递安装的 GUI 版 OpenCV（至少 `opencv-python`，如存在也移除 `opencv-contrib-python`），清理 pip 缓存，并显式安装 `opencv-python-headless`。
+- 主服务 Dockerfile 必须使用两阶段构建：builder 阶段安装编译链并把 `requirements.txt` 及其传递依赖预编译/下载为 wheel，runtime 阶段离线安装这些 wheel，避免在最终镜像里再次触发 `insightface` 等源码包编译。
+- runtime 阶段在安装 wheel 后，必须移除传递安装的 GUI 版 OpenCV（至少 `opencv-python`，如存在也移除 `opencv-contrib-python`），清理 pip 缓存，并显式安装 `opencv-python-headless`。
 - 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 CPU `resize`/`warpAffine` 路径，镜像默认不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。

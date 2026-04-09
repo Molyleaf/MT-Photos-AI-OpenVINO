@@ -147,7 +147,8 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
-- 当前 Docker 构建会在 `pip install -r requirements.txt` 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 CPU `resize`/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
+- 当前主 Dockerfile 使用两阶段构建：builder 阶段安装编译链并把 `requirements.txt` 及其传递依赖预编译/下载为 wheel，runtime 阶段离线安装这些 wheel，避免 `insightface` 一类源码包在最终镜像里再触发 `g++` 构建失败。
+- runtime 阶段仍会在安装 wheel 后移除传递安装的 `opencv-python`/`opencv-contrib-python`，再补装 `opencv-python-headless`；当前服务只使用 OpenCV 的图像解码、色彩转换和 CPU `resize`/`warpAffine` 路径，不需要 X11/OpenGL 运行时包。
 - 因此当前运行时镜像不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不再打包 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`。
 - Intel GPU 固件属于宿主机职责；若宿主 Debian 13 需要补齐固件，请在宿主机安装 `firmware-misc-nonfree`（或兼容包名 `firmware-misc-non-free`），而不是放进应用容器。
 - Dockerfile 已固化为清华 APT + 清华 PyPI 镜像；APT 基础列表、sid pin 文件和安装包名单都直接写在仓库文件中，便于回溯与审计。

@@ -1,3 +1,39 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim-trixie AS wheels-builder
+
+WORKDIR /app
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
+    PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn
+
+RUN rm -f /etc/apt/sources.list \
+    && rm -rf /etc/apt/sources.list.d/*
+
+COPY sources.list /etc/apt/sources.list
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates
+
+COPY requirements.txt /tmp/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    set -eux; \
+    # requirements.txt includes the transitions runtime used by the non-text family state machine. \
+    pip wheel --cache-dir /root/.cache/pip --wheel-dir /tmp/wheels --prefer-binary -r /tmp/requirements.txt; \
+    pip wheel --cache-dir /root/.cache/pip --wheel-dir /tmp/wheels --prefer-binary --no-deps opencv-python-headless; \
+    rm -f /tmp/requirements.txt
+
 FROM python:3.12-slim-trixie
 
 WORKDIR /app
@@ -20,6 +56,8 @@ RUN rm -f /etc/apt/sources.list \
 COPY sources.list /etc/apt/sources.list
 COPY sources.sid.list /etc/apt/sources.list.d/sid.list
 COPY intel-gpu-runtime.pref /etc/apt/preferences.d/intel-gpu-runtime
+COPY requirements.txt /tmp/requirements.txt
+COPY --from=wheels-builder /tmp/wheels /tmp/wheels
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -31,21 +69,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libglib2.0-0 \
         libgomp1 \
         libze1 \
+        mesa-opencl-icd \
         ocl-icd-libopencl1; \
     apt-get install -y --no-install-recommends -t sid \
         intel-opencl-icd \
-        libze-intel-gpu1
-
-COPY requirements.txt /tmp/requirements.txt
+        libze-intel-gpu1; \
+    rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     set -eux; \
-    # requirements.txt includes the transitions runtime used by the non-text family state machine. \
-    pip install --cache-dir /root/.cache/pip --prefer-binary -r /tmp/requirements.txt; \
+    pip install --no-index --find-links=/tmp/wheels -r /tmp/requirements.txt; \
     if pip show opencv-python >/dev/null 2>&1; then pip uninstall -y opencv-python; fi; \
     if pip show opencv-contrib-python >/dev/null 2>&1; then pip uninstall -y opencv-contrib-python; fi; \
-    pip install --cache-dir /root/.cache/pip --prefer-binary --force-reinstall --no-deps opencv-python-headless; \
-    rm -f /tmp/requirements.txt
+    pip install --no-index --find-links=/tmp/wheels --force-reinstall --no-deps opencv-python-headless; \
+    rm -rf /tmp/requirements.txt /tmp/wheels
 
 RUN set -eux; \
     RAPIDOCR_MODEL_ROOT="$(python -c "import pathlib, rapidocr; print(pathlib.Path(rapidocr.__file__).resolve().parent / 'models')")"; \
