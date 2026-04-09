@@ -31,7 +31,6 @@ HF_CACHE_DIR = Path(
 ).expanduser().resolve()
 
 IMAGE_CLIP_DEVICE = str(os.environ.get("IMAGE_CLIP_DEVICE", "cuda")).strip() or "cuda"
-IMAGE_CLIP_USE_FP16 = _env_flag("IMAGE_CLIP_USE_FP16", False)
 HF_LOCAL_FILES_ONLY = _env_flag("HF_LOCAL_FILES_ONLY", False)
 
 CLIP_EMBEDDING_DIMS = 768

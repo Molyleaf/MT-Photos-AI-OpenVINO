@@ -67,11 +67,6 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require Hugging Face assets to be available locally.",
     )
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Run Image-CLIP with IMAGE_CLIP_USE_FP16=1.",
-    )
     return parser.parse_args()
 
 
@@ -90,8 +85,6 @@ def _configure_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("HF_CACHE_DIR", str(PROJECT_ROOT / "cache" / "huggingface"))
     if args.local_files_only:
         os.environ["HF_LOCAL_FILES_ONLY"] = "1"
-    if args.fp16:
-        os.environ["IMAGE_CLIP_USE_FP16"] = "1"
 
 
 def _load_bgr(path: Path) -> np.ndarray:

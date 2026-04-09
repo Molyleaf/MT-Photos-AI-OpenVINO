@@ -44,13 +44,13 @@ RUN set -eux; \
     chmod -R 777 /cache; \
     chown -R appuser:appgroup /app /models /cache
 
-COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.xml /models/qa-clip/openvino/openvino_text_fp16.xml
-COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.bin /models/qa-clip/openvino/openvino_text_fp16.bin
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text.xml /models/qa-clip/openvino/openvino_text.xml
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text.bin /models/qa-clip/openvino/openvino_text.bin
 COPY --chown=appuser:appgroup text-clip/app /app
 
 RUN set -eux; \
-    test -f /models/qa-clip/openvino/openvino_text_fp16.xml; \
-    test -f /models/qa-clip/openvino/openvino_text_fp16.bin; \
+    test -f /models/qa-clip/openvino/openvino_text.xml; \
+    test -f /models/qa-clip/openvino/openvino_text.bin; \
     test -f /app/models/QA-CLIP/clip/bert_tokenizer.py; \
     test -f /app/models/QA-CLIP/clip/vocab.txt
 

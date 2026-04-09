@@ -26,7 +26,6 @@ from .constants import (
     HF_CACHE_DIR,
     HF_LOCAL_FILES_ONLY,
     IMAGE_CLIP_DEVICE,
-    IMAGE_CLIP_USE_FP16,
     LOG,
     MAX_PENDING_IMAGE_REQUESTS,
     MODEL_ID,
@@ -90,7 +89,6 @@ class ImageClipRuntime:
         self._loaded = False
         self._device: Optional[torch.device] = None
         self._resolved_device_name = "cuda"
-        self._input_dtype = torch.float16 if IMAGE_CLIP_USE_FP16 else torch.float32
         self._vision_model: Optional[torch.nn.Module] = None
         self._clip_image_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
         self._clip_image_queue: Optional[asyncio.Queue[Optional[_ClipImageTask]]] = None
@@ -100,8 +98,7 @@ class ImageClipRuntime:
 
     @property
     def runtime_device_label(self) -> str:
-        precision = "fp16" if self._input_dtype == torch.float16 else "fp32"
-        return f"{self._resolved_device_name} ({precision})"
+        return f"{self._resolved_device_name} (fp32)"
 
     def _prepare_hf_cache_env(self) -> None:
         cache_root = self.hf_cache_dir.resolve()
@@ -247,7 +244,7 @@ class ImageClipRuntime:
         sample = torch.zeros(
             (1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
             device=self._device,
-            dtype=self._input_dtype,
+            dtype=torch.float32,
         )
         with torch.inference_mode():
             embedding = self._vision_model(sample).detach()
@@ -271,15 +268,13 @@ class ImageClipRuntime:
                     self._model_source,
                     cache_dir=str(self.hf_cache_dir),
                     local_files_only=HF_LOCAL_FILES_ONLY,
+                    torch_dtype=torch.float32,
                 )
                 vision_model = _VisionModelWrapper(loaded_model)
                 del loaded_model
                 gc.collect()
 
-                if self._input_dtype == torch.float16:
-                    vision_model = vision_model.to(device=self._device, dtype=torch.float16)
-                else:
-                    vision_model = vision_model.to(device=self._device)
+                vision_model = vision_model.to(device=self._device, dtype=torch.float32)
                 vision_model.eval()
 
                 self._vision_model = vision_model
@@ -349,7 +344,7 @@ class ImageClipRuntime:
         with torch.inference_mode():
             pixel_values = torch.from_numpy(batch).to(
                 device=self._device,
-                dtype=self._input_dtype,
+                dtype=torch.float32,
                 non_blocking=False,
             )
             embeddings = self._vision_model(pixel_values).detach().float().cpu().numpy()

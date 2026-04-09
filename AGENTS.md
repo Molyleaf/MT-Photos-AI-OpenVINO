@@ -21,7 +21,7 @@
 - Windows 本地 CUDA Image-CLIP 并行子项目命令行入口：`image-clip/starter.py`；服务实现入口：`image-clip/app/server.py`；依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
-- 模型目录：`models/qa-clip/openvino`、`models/insightface/models`。
+- 模型目录：`models/qa-clip/huggingface`、`models/qa-clip/openvino`、`models/insightface/models`。
 - Text-CLIP tokenizer 资源：`text-clip/app/models/QA-CLIP/clip`（保留 `bert_tokenizer.py` 与 `vocab.txt`）。
 - 配置存储：`app/config`。
 - 参考文件（对齐端点用）：`example/`。
@@ -67,12 +67,9 @@
 - 转换过程必须避免“双份内存常驻”：
   - 禁止在同一阶段同时常驻完整 PyTorch 模型副本 + 完整 OpenVINO 中间副本。
   - 视觉分支与文本分支按顺序转换，转换后及时释放前一阶段对象并 `gc.collect()`。
-- FP16 压缩要求：
-  - 使用官方推荐 `--compress_to_fp16`（或等价 API `compress_to_fp16=True`）。
-  - 禁止继续使用旧参数 `--data_type FP16`。
-- NNCF 约束：
-  - 使用 NNCF 流程做转换/压缩集成。
-  - **关键层不压缩**（输入投影、输出投影、LayerNorm/归一化等敏感层保持 FP32）。
+- 必须重新下载原始 Hugging Face FP32 模型后再转换；本地 `models/qa-clip/huggingface` 只允许保存原始 FP32 权重快照。
+- 转换目标仅限“格式转换到 OpenVINO IR”，禁止做 FP16 压缩、量化、NNCF 权重压缩或任何改变权重精度/结构的额外处理。
+- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`。
 
 ### 3.3 RapidOCR
 
@@ -321,7 +318,7 @@
 - [ ] 若仍需要 tokenizer 资源，是否完全切换到 `text-clip/app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
-- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + FP16 压缩 + NNCF 约束”
+- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重 + 仅做 IR 格式转换”
 - [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO（当前固定走库内原生 CPU 路径）+ PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP（仅推理）+ 原生 CPU 检测/识别预处理
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
@@ -339,7 +336,7 @@
   - 实现约束、后端选择原因、无 silent fallback 规则
   - 容器构建内部实践、镜像裁剪策略、依赖清理策略
   - 稳定性修复记录、兼容性说明、上线验收清单
-  - `scripts/convert.py`、NNCF、IR 导出和模型转换流程说明
+  - `scripts/convert.py`、IR 导出和模型转换流程说明
   - Agent/开发自检、压测、调度策略、文档同步要求
 
 ---
@@ -362,7 +359,7 @@
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
-- 主服务镜像不再打包 `openvino_text_fp16.*`；这些文件仅应进入独立 Text-CLIP 镜像。
+- 主服务镜像不再打包 `openvino_text.*`；这些文件仅应进入独立 Text-CLIP 镜像。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - `docker-compose.example.yml` 只允许引用预构建镜像（`image:`）；禁止再保留运行时 `build:`。
@@ -466,9 +463,8 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | 环境变量 | 可选值 | 默认值 |
 |---|---|---|
 | `PROJECT_ROOT` | 项目根目录路径 | 自动探测 |
-| `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
+| `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/huggingface` 与 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
 | `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
-| `QA_CLIP_ENABLE_NNCF_WEIGHT_COMPRESSION` | `0`（关闭）或 `1`（开启） | `0` |
-| `QA_CLIP_NNCF_WEIGHT_MODE` | NNCF 压缩模式名（常见：`INT8_ASYM` / `INT8_SYM` / `NF4` / `E2M1`） | `INT8_ASYM` |
+| `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径（脚本启动前会清理） | `<PROJECT_ROOT>/cache/openvino` |
 
 `scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。

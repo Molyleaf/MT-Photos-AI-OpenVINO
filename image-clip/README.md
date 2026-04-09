@@ -15,7 +15,7 @@
 - Python `3.12`
 - Windows 本地开发机
 - 已安装可用的 CUDA 版 PyTorch，且 `torch.cuda.is_available()` 返回 `True`
-- 可访问或已缓存 `TencentARC/QA-CLIP-ViT-L-14`
+- 可访问 `TencentARC/QA-CLIP-ViT-L-14`，或已通过仓库根目录的 `python scripts/convert.py` 预先落地 `models/qa-clip/huggingface`
 
 ## 安装
 
@@ -36,7 +36,6 @@ pip install -r image-clip\requirement.txt
 | `HF_CACHE_DIR` | Hugging Face 缓存目录 | `<repo>/cache/huggingface` |
 | `HF_LOCAL_FILES_ONLY` | 是否只使用本地缓存加载 Hugging Face 模型 | `false` |
 | `IMAGE_CLIP_DEVICE` | CUDA 设备，只接受 `cuda` / `cuda:0` 这类 CUDA 设备表达式 | `cuda` |
-| `IMAGE_CLIP_USE_FP16` | 是否以 `fp16` 在 CUDA 上运行，显存紧张时可开启 | `false` |
 | `CLIP_IMAGE_BATCH` | `/clip/img` 微批上限 | `8` |
 | `CLIP_IMAGE_BATCH_WAIT_MS` | `/clip/img` 微批等待窗口（毫秒） | `5` |
 | `INFERENCE_QUEUE_MAX_SIZE` | 图片请求总名额硬上限，运行时最多 `10` | `10` |

@@ -62,7 +62,7 @@ class TextClipRuntime:
             if self._compiled_model is not None and self._infer_request is not None:
                 return
 
-            text_model_path = self.qa_clip_path / "openvino_text_fp16.xml"
+            text_model_path = self.qa_clip_path / "openvino_text.xml"
             if not text_model_path.exists():
                 raise FileNotFoundError(f"Missing text model: {text_model_path}")
 

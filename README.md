@@ -7,6 +7,7 @@
 - Python **3.12**
 - 已准备模型目录（至少包含）：
   - `models/qa-clip/openvino`
+  - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `python scripts/convert.py` 自动重建）
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
   - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 主服务入口：`app/server.py`
@@ -15,6 +16,7 @@
 - Windows 本地 CUDA Image-CLIP 子项目命令行入口：`image-clip/starter.py`
 - Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
+- `scripts/convert.py` 会先清理 `cache/huggingface`、`cache/openvino`、旧 QA-CLIP IR 和本地 QA-CLIP 快照，再重新下载原始 FP32 `TencentARC/QA-CLIP-ViT-L-14`，导出 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据；`scrfd_10g_bnkps.onnx` 保持原生 detector 路径
 
