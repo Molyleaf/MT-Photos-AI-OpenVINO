@@ -343,9 +343,10 @@
 - 仓库应提供 `.dockerignore` 以降低构建上下文体积。
 - 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，以及 Python/OpenCV 运行时基础库 `ca-certificates`、`libglib2.0-0`、`libgomp1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 独立 Text-CLIP 镜像固定使用 CPU；其基线依赖仅保留 Python/OpenVINO CPU 运行所需最小集合，不安装 Intel GPU runtime，也不映射 `/dev/dri`。
-- 主服务 Dockerfile 必须使用两阶段构建：builder 阶段安装编译链并把 `requirements.txt` 及其传递依赖预编译/下载为 wheel，runtime 阶段离线安装这些 wheel，避免在最终镜像里再次触发 `insightface` 等源码包编译。
-- runtime 阶段在安装 wheel 后，必须移除传递安装的 GUI 版 OpenCV（至少 `opencv-python`，如存在也移除 `opencv-contrib-python`），清理 pip 缓存，并显式安装 `opencv-python-headless`。
-- 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 CPU `resize`/`warpAffine` 路径，镜像默认不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
+- 主服务 Dockerfile 必须使用两阶段构建：builder 阶段在用户目录（当前基线 `/home/appuser/.venv` 与 `/home/appuser/wheels`）内安装编译链、预编译/下载 `requirements.txt` 及其传递依赖的 wheel，并在该用户目录内完成离线依赖安装。
+- runtime 阶段只允许复制 builder 产出的用户目录依赖（至少包含 `.venv` 与 wheel 目录）并加入 `PATH`，禁止再次执行 `pip install`；主镜像必须收敛为单一 `opencv-python-headless`，若传递依赖带入 `opencv-python` / `opencv-contrib-python*`，必须在 builder 阶段卸载包并清理对应 wheel，禁止最终镜像内重复保留多个 OpenCV Python wheel/package 变体。
+- builder 阶段应继续做无风险体积裁剪，例如移除 venv 中运行时不需要的 `pip`/`wheel` 包、`include`/`share` 目录、`__pycache__`、测试目录、头文件与静态库；禁止通过删改运行时必须的共享库、模型文件或 Python 包来换取体积下降。
+- 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 CPU `resize`/`warpAffine` 路径，镜像默认不包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
