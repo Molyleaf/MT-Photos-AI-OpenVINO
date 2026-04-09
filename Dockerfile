@@ -64,16 +64,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
-        libdrm2 \
-        libglib2.0-0 \
-        libgomp1 \
-        libze1 \
-        mesa-opencl-icd \
-        ocl-icd-libopencl1; \
+            ca-certificates \
+            libdrm2 \
+            libglib2.0-0 \
+            libgomp1 \
+            libze1 \
+            ocl-icd-libopencl1; \
     apt-get install -y --no-install-recommends -t sid \
-        intel-opencl-icd \
-        libze-intel-gpu1; \
+            intel-opencl-icd \
+            libze-intel-gpu1 \
     rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
