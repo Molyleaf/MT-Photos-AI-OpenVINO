@@ -36,16 +36,17 @@ if find_spec("rapidocr") is None:
     class _FakeRapidOCR:
         pass
 
+    class _FakeEngineType:
+        OPENVINO = types.SimpleNamespace(value="openvino")
+
     fake_rapidocr.RapidOCR = _FakeRapidOCR
+    fake_rapidocr.EngineType = _FakeEngineType
     fake_rapidocr_utils = types.ModuleType("rapidocr.utils")
     fake_rapidocr_log = types.ModuleType("rapidocr.utils.log")
     fake_rapidocr_log.logger = logging.getLogger("rapidocr")
-    fake_rapidocr_typings = types.ModuleType("rapidocr.utils.typings")
-    fake_rapidocr_typings.EngineType = object
     sys.modules["rapidocr"] = fake_rapidocr
     sys.modules["rapidocr.utils"] = fake_rapidocr_utils
     sys.modules["rapidocr.utils.log"] = fake_rapidocr_log
-    sys.modules["rapidocr.utils.typings"] = fake_rapidocr_typings
 
 try:
     from insightface.app import FaceAnalysis as _InsightFaceAnalysis  # type: ignore[attr-defined]

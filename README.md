@@ -9,7 +9,6 @@
   - `models/qa-clip/openvino`
   - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `python scripts/convert.py` 自动重建）
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
-  - `models/rapidocr`（需预置 PP-OCRv5 mobile det/rec/dict + cls 本地文件）
 - 主服务入口：`app/server.py`
 - 主服务仍由 `app/server.py` 暴露路由；同目录 `app/bootstrap.py`、`app/image_io.py`、`app/text_clip_proxy.py` 仅用于维护性拆分，不改变启动方式和接口语义
 - Text-CLIP 服务入口：`text-clip/app/server.py`
@@ -45,28 +44,11 @@
 | `MODEL_PATH` | 模型根目录 | `<repo>/models` |
 | `NON_TEXT_IDLE_RELEASE_SECONDS` | 主容器非文本模型空闲释放窗口；`<=0` 表示关闭 | `60` |
 | `OCR_EXEC_TIMEOUT` | OCR 执行超时，单位秒 | `max(30, INFERENCE_EXEC_TIMEOUT)` |
-| `OCR_MAX_CONCURRENT_REQUESTS` | OCR 应用层最大并发请求数；不会超过共享图片名额 | `min(INFERENCE_QUEUE_MAX_SIZE, max(2, RAPIDOCR_PERFORMANCE_NUM_REQUESTS*2))` |
+| `OCR_MAX_CONCURRENT_REQUESTS` | OCR 应用层最大并发请求数；不会超过共享图片名额 | `4` |
 | `OCR_PREWARM_DELAY_SECONDS` | RapidOCR 一次性后台预热延迟，单位秒 | `1.0` |
 | `OCR_PREWARM_ENABLED` | 是否启用一次性后台 RapidOCR 预热 | `false` |
-| `OV_CACHE_DIR` | OpenVINO 编译缓存目录；当前主要作用于主服务自管的 OpenVINO 路径，不控制 RapidOCR upstream CPU backend | `<repo>/cache/openvino` |
+| `OV_CACHE_DIR` | OpenVINO 编译缓存目录；当前主要作用于主服务自管的 OpenVINO 路径 | `<repo>/cache/openvino` |
 | `PORT` | 服务端口；同时影响镜像入口与健康检查 | `8060` |
-| `RAPIDOCR_CLS_BATCH_NUM` | RapidOCR 方向分类批大小 | `8` |
-| `RAPIDOCR_DET_LIMIT_SIDE_LEN` | RapidOCR 检测输入边长限制 | `960` |
-| `RAPIDOCR_DET_LIMIT_TYPE` | RapidOCR 检测缩放策略 | `max` |
-| `RAPIDOCR_DEVICE` | RapidOCR 请求设备；因上游 `rapidocr` OpenVINO 引擎写死 `CPU`，当前实现会强制收敛到 `CPU` | `CPU` |
-| `RAPIDOCR_ENABLE_CPU_PINNING` | 是否启用 CPU 绑核 | `true` |
-| `RAPIDOCR_ENABLE_HYPER_THREADING` | 是否启用超线程 | `true` |
-| `RAPIDOCR_FONT_PATH` | RapidOCR 字体文件路径；空表示不指定 | 空 |
-| `RAPIDOCR_INFERENCE_NUM_THREADS` | RapidOCR 推理线程数 | `-1` |
-| `RAPIDOCR_MAX_SIDE_LEN` | OCR 全图最大边限制 | `960` |
-| `RAPIDOCR_MODEL_DIR` | RapidOCR 本地模型目录 | `<repo>/models/rapidocr` |
-| `RAPIDOCR_NUM_STREAMS` | RapidOCR OpenVINO stream 数 | `2` |
-| `RAPIDOCR_OPENVINO_CONFIG_PATH` | RapidOCR YAML 配置文件路径 | `app/config/cfg_openvino_cpu.yaml` |
-| `RAPIDOCR_PERFORMANCE_HINT` | RapidOCR OpenVINO 性能提示 | `THROUGHPUT` |
-| `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` | RapidOCR OpenVINO request 数；同时决定 OCR worker 基线 | `2` |
-| `RAPIDOCR_REC_BATCH_NUM` | RapidOCR 识别批大小 | `8` |
-| `RAPIDOCR_SCHEDULING_CORE_TYPE` | RapidOCR OpenVINO 核调度类型 | `ANY_CORE` |
-| `RAPIDOCR_USE_CLS` | 是否启用方向分类器 | `true` |
 | `TEXT_CLIP_API_KEY` | 主服务转发 `/clip/txt` 时使用的上游 API Key；未设置时复用 `API_AUTH_KEY` | 跟随 `API_AUTH_KEY` |
 | `TEXT_CLIP_REQUEST_TIMEOUT` | 主服务转发 `/clip/txt` 的上游请求超时，单位秒 | `30` |
 | `TEXT_CLIP_SERVER_URL` | 独立 Text-CLIP 服务 URL；主服务会自动拼接 `/clip/txt`，并把请求体原样转发给上游 | `http://127.0.0.1:8061` |
@@ -83,14 +65,14 @@
 
 补充说明：
 
-- 开发机本地验证时，主服务建议把所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
+- 开发机本地验证时，主服务建议把主要后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。
 - `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 现已统一语义：同步释放当前非文本子进程，不重启主服务进程。
-- RapidOCR 上游 `rapidocr==3.7.0` 的 OpenVINO 推理类在本地安装包中把 `core.set_property("CPU", ...)` 与 `compile_model(..., device_name="CPU")` 写死，因此本仓库遵从其原生 CPU 行为，不再额外伪装成 `AUTO/GPU`。
-- 主服务当前尽量直接复用 RapidOCR 原生 `config_path + params` 配置合并逻辑；仓库侧只补充本地模型路径、显式环境变量覆盖以及应用层实例池/超时控制。
+- OCR 已切到 `rapidocr==3.8.0` 原生最简初始化：仅把 `Det/Cls/Rec.engine_type` 设为 `openvino`，其它全部使用上游默认配置。
+- RapidOCR 会在首次加载 OCR 时按上游内置 URL 检查并下载默认模型；镜像不再内置 OCR 模型，因此首次 `/ocr` 在空缓存环境下需要联网，并且容器运行用户需要可写的 `rapidocr/models` 目录。
 - `PORT` 会同时影响容器入口和健康检查；如果修改它，请同步调整 `docker-compose.yml` 的 `ports:` 或 `docker run -p`。
 - 如果手动执行 `uvicorn server:app`，最早期的 uvicorn bootstrap 日志仍以 CLI `--log-level` 为准。
 
@@ -116,7 +98,6 @@ $env:API_AUTH_KEY="your_secret_key"
 $env:INFERENCE_DEVICE="CPU"
 $env:CLIP_INFERENCE_DEVICE="CPU"
 $env:CLIP_IMAGE_BATCH="8"
-$env:RAPIDOCR_DEVICE="CPU"
 $env:INSIGHTFACE_OV_DEVICE="CPU"
 $env:TEXT_CLIP_SERVER_URL="http://127.0.0.1:8061"
 $env:LOG_LEVEL="INFO"
@@ -204,9 +185,10 @@ cp docker-compose.example.yml docker-compose.yml
 - 生产环境建议覆盖 `API_AUTH_KEY`
 - 主容器需要映射 `/dev/dri` 并设置正确的 `video/render` 组；`mt-photos-ai-text-clip` 固定走 CPU，不需要 `/dev/dri`
 - `mt-photos-ai-text-clip` 启动后会常驻加载文本模型；主服务请通过 `TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061` 代理转发 `/clip/txt`
-- 有 Intel iGPU 且已映射 `/dev/dri` 时，主容器建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=AUTO`
+- 有 Intel iGPU 且已映射 `/dev/dri` 时，主容器建议使用 `INFERENCE_DEVICE=AUTO`、`CLIP_INFERENCE_DEVICE=AUTO`、`INSIGHTFACE_OV_DEVICE=AUTO`
 - 如需修改服务监听端口，请同时调整 `PORT` 和 `ports:` 映射
 - 如需挂载自定义模型或自定义 OpenVINO cache 目录，再显式覆盖 `MODEL_PATH` / `OV_CACHE_DIR`
+- 首次 `/ocr` 若容器内还没有 RapidOCR 默认模型，会在线下载；离线环境请先完成一次带网络的 OCR 预热
 - 若 `/clip/img` 仍未跑满 GPU，可结合业务流量逐步调大 `CLIP_IMAGE_BATCH`，并保持 `CLIP_IMAGE_BATCH_WAIT_MS` 在个位数毫秒级，避免明显放大单请求尾延迟
 - 如需限制 OCR 首次冷加载带来的单次长尾，可显式设置 `OCR_EXEC_TIMEOUT=30`
 - `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求聚合预算；如需权衡吞吐与尾延迟，可只小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`
@@ -260,7 +242,6 @@ docker run -d \
   -e NON_TEXT_IDLE_RELEASE_SECONDS=60 \
   -e OCR_EXEC_TIMEOUT=30 \
   -e PORT=8060 \
-  -e RAPIDOCR_DEVICE=CPU \
   -e TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061 \
   mt-photos-ai-openvino
 ```
@@ -278,38 +259,13 @@ docker exec -it mt-photos-ai-openvino python -c "import openvino as ov; print(ov
 
 若请求了 GPU 推理但容器内 GPU 设备不可用，服务会直接报错并终止启动。
 
-## RapidOCR 模型预置
+## RapidOCR 默认模型下载
 
-部署前请在 `models/rapidocr` 预置以下 4 个文件：
+主服务不再随镜像内置 OCR 模型。`/ocr` 首次懒加载时会由 `rapidocr==3.8.0` 按上游内置 `default_models.yaml` 自动检查并下载默认模型，运行时只额外把 `Det`、`Cls`、`Rec` 的 `engine_type` 改为 `openvino`。
 
-- `ch_PP-OCRv5_mobile_det.onnx`
-- `ch_PP-OCRv5_rec_mobile_infer.onnx`
-- `ppocrv5_dict.txt`
-- `ch_ppocr_mobile_v2.0_cls_infer.onnx`
-
-缺失任一文件都会导致构建或启动失败。
-
-Linux/macOS 下载示例：
-
-```bash
-mkdir -p models/rapidocr
-curl -L -o models/rapidocr/ch_PP-OCRv5_mobile_det.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx"
-curl -L -o models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx"
-curl -L -o models/rapidocr/ppocrv5_dict.txt "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt"
-curl -L -o models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-```
-
-Windows PowerShell 下载示例：
-
-```powershell
-$dir = "models/rapidocr"
-New-Item -ItemType Directory -Path $dir -Force | Out-Null
-
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx" -OutFile "$dir/ch_PP-OCRv5_mobile_det.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx" -OutFile "$dir/ch_PP-OCRv5_rec_mobile_infer.onnx"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt" -OutFile "$dir/ppocrv5_dict.txt"
-Invoke-WebRequest "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.7.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx" -OutFile "$dir/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-```
+- 首次加载 OCR 时需要可访问上游内置模型 URL
+- Docker 镜像已预创建并授权 `rapidocr/models` 目录，容器内无需再手动挂载 `models/rapidocr`
+- 如需验证上游内置样例图片，可直接使用官方文档里的 `img_url=https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/resources/test_files/ch_en_num.jpg`
 
 ## 冒烟检查
 
@@ -321,7 +277,6 @@ docker build -t mt-photos-ai-openvino .
 docker run --rm -it \
   -e INFERENCE_DEVICE=CPU \
   -e CLIP_INFERENCE_DEVICE=CPU \
-  -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=CPU \
   mt-photos-ai-openvino \
   python scripts/smoke_insightface.py --device CPU
@@ -336,7 +291,6 @@ docker run --rm -it \
   --group-add $(getent group render | cut -d: -f3) \
   -e INFERENCE_DEVICE=CPU \
   -e CLIP_INFERENCE_DEVICE=CPU \
-  -e RAPIDOCR_DEVICE=CPU \
   -e INSIGHTFACE_OV_DEVICE=GPU \
   mt-photos-ai-openvino \
   python scripts/smoke_insightface.py --device GPU

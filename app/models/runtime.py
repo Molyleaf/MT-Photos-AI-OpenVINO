@@ -239,6 +239,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._model_lock = threading.Lock()
         self._clip_vision_load_lock = threading.Lock()
         self._rapidocr_load_lock = threading.Lock()
+        self._rapidocr_run_lock = threading.Lock()
         self._face_load_lock = threading.Lock()
         self._clip_image_worker_lock = threading.Lock()
         self._face_worker_lock = threading.Lock()
@@ -255,8 +256,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._clip_image_worker = None
 
         self._rapidocr_engine = None
-        self._rapidocr_engines = None
-        self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg = None
 
         self._face_engine = None
@@ -275,7 +274,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ocr_prewarm_delay_seconds = 0.0
 
         self._image_admission = _AdmissionController("image", 1)
-        self._ocr_worker_count = 1
         self._face_preprocess_worker_count = 1
         self._ocr_admission = _AdmissionController("ocr", 1)
         self._face_admission = _AdmissionController("face", 1)
@@ -310,10 +308,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self.qa_clip_path = self._path_settings.qa_clip_path
         self._clip_inference_device = self._clip_image_settings.inference_device
         self.ov_cache_dir = self._path_settings.ov_cache_dir
-        self.rapidocr_config_path = self._path_settings.rapidocr_config_path
-        self.rapidocr_model_dir = self._path_settings.rapidocr_model_dir
-        self.rapidocr_model_dir_path = self._path_settings.rapidocr_model_dir_path
-        self.rapidocr_font_path = self._path_settings.rapidocr_font_path
         self._runtime_state_dir = self._path_settings.runtime_state_dir
 
     def _initialize_openvino_runtime(self) -> None:
@@ -335,6 +329,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._model_lock = threading.Lock()
         self._clip_vision_load_lock = threading.Lock()
         self._rapidocr_load_lock = threading.Lock()
+        self._rapidocr_run_lock = threading.Lock()
         self._face_load_lock = threading.Lock()
         self._single_process_lock = _InterProcessFileLock(
             self._runtime_state_dir / "single-process.lock"
@@ -366,8 +361,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _initialize_non_text_model_state(self) -> None:
         self._rapidocr_engine = None
-        self._rapidocr_engines = None
-        self._rapidocr_engine_pool = None
         self._rapidocr_runtime_cfg: Optional[Dict[str, Any]] = None
         self._face_engine = None
         self._face_dispatch_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -399,7 +392,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         self._ocr_prewarm_delay_seconds = self._execution_settings.ocr_prewarm_delay_seconds
 
         self._image_admission = _AdmissionController("image", self._queue_capacity)
-        self._ocr_worker_count = self._execution_settings.ocr_worker_count
         self._face_preprocess_worker_count = (
             self._execution_settings.face_preprocess_worker_count
         )
@@ -447,7 +439,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
 
     def _build_ocr_executor(self) -> ThreadPoolExecutor:
         return ThreadPoolExecutor(
-            max_workers=self._ocr_worker_count,
+            max_workers=1,
             thread_name_prefix="ocr",
         )
 
@@ -944,8 +936,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             loaded.append("vision")
         if (
             self._rapidocr_engine is not None
-            or self._rapidocr_engines is not None
-            or self._rapidocr_engine_pool is not None
             or self._rapidocr_runtime_cfg is not None
         ):
             loaded.append("ocr")
@@ -999,8 +989,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
             unloaded.append("vision")
         if keep_family != "ocr" and (
             self._rapidocr_engine is not None
-            or self._rapidocr_engines is not None
-            or self._rapidocr_engine_pool is not None
             or self._rapidocr_runtime_cfg is not None
         ):
             self._unload_rapidocr_model_locked()
@@ -1132,7 +1120,6 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         evicted_files, evicted_bytes = _drop_filesystem_page_cache(
             [
                 getattr(self, "qa_clip_path", None),
-                getattr(self, "rapidocr_model_dir_path", None),
                 getattr(self, "insightface_model_root", None),
                 (insightface_root / "_runtime_models") if insightface_root is not None else None,
                 getattr(self, "ov_cache_dir", None),

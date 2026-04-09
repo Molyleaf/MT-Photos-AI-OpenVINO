@@ -12,9 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
     PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn \
     INFERENCE_DEVICE=AUTO \
-    MODEL_PATH=/models \
-    RAPIDOCR_OPENVINO_CONFIG_PATH=/app/config/cfg_openvino_cpu.yaml \
-    RAPIDOCR_MODEL_DIR=/models/rapidocr
+    MODEL_PATH=/models
 
 RUN rm -f /etc/apt/sources.list \
     && rm -rf /etc/apt/sources.list.d/*
@@ -50,26 +48,22 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     rm -f /tmp/requirements.txt
 
 RUN set -eux; \
+    RAPIDOCR_MODEL_ROOT="$(python -c "import pathlib, rapidocr; print(pathlib.Path(rapidocr.__file__).resolve().parent / 'models')")"; \
     groupadd --gid "${APP_GID}" appgroup; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
-    mkdir -p /cache /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/rapidocr /models/cache/openvino; \
+    mkdir -p /cache /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/cache/openvino "${RAPIDOCR_MODEL_ROOT}"; \
     chmod 777 /cache; \
-    chown -R appuser:appgroup /app /models
+    chown -R appuser:appgroup /app /models "${RAPIDOCR_MODEL_ROOT}"
 
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image.xml /models/qa-clip/openvino/openvino_image.xml
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image.bin /models/qa-clip/openvino/openvino_image.bin
 COPY --chown=appuser:appgroup models/insightface/models/antelopev2 /models/insightface/models/antelopev2
-COPY --chown=appuser:appgroup models/rapidocr /models/rapidocr
 
 RUN set -eux; \
     test -f /models/qa-clip/openvino/openvino_image.xml; \
     test -f /models/qa-clip/openvino/openvino_image.bin; \
     test -f /models/insightface/models/antelopev2/glintr100.onnx; \
-    test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx; \
-    test -f /models/rapidocr/ch_PP-OCRv5_mobile_det.onnx; \
-    test -f /models/rapidocr/ch_PP-OCRv5_rec_mobile_infer.onnx; \
-    test -f /models/rapidocr/ppocrv5_dict.txt; \
-    test -f /models/rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx
+    test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx
 
 COPY --chown=appuser:appgroup app /app
 COPY --chown=appuser:appgroup scripts /app/scripts

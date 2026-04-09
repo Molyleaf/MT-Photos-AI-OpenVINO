@@ -37,11 +37,6 @@ EXEC_TIMEOUT_SECONDS = int(
     os.environ.get("INFERENCE_EXEC_TIMEOUT", str(max(30, TASK_TIMEOUT_SECONDS)))
 )
 
-RAPIDOCR_V5_MOBILE_DET_FILE = "ch_PP-OCRv5_mobile_det.onnx"
-RAPIDOCR_V5_MOBILE_REC_FILE = "ch_PP-OCRv5_rec_mobile_infer.onnx"
-RAPIDOCR_V5_DICT_FILE = "ppocrv5_dict.txt"
-RAPIDOCR_CLS_MOBILE_V2_FILE = "ch_ppocr_mobile_v2.0_cls_infer.onnx"
-
 LOG = logging.getLogger("mt_photos_ai.models")
 DEFAULT_NON_TEXT_OV_DEVICE = "AUTO"
 PROCESS_LOCK_POLL_SECONDS = 0.05

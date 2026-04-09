@@ -4,7 +4,6 @@ from pathlib import Path
 
 from .common import _as_bool, _as_float, _as_int
 from .constants import (
-    APP_DIR,
     CLIP_INFERENCE_DEVICE,
     EXEC_TIMEOUT_SECONDS,
     INSIGHTFACE_PREPROCESS_WORKERS,
@@ -23,10 +22,6 @@ class RuntimePathSettings:
     insightface_model_root: Path
     qa_clip_path: Path
     ov_cache_dir: Path
-    rapidocr_config_path: Path
-    rapidocr_model_dir: str
-    rapidocr_model_dir_path: Path
-    rapidocr_font_path: str
     runtime_state_dir: Path
 
 
@@ -45,7 +40,6 @@ class ExecutionControlSettings:
     execution_timeout_seconds: int
     ocr_execution_timeout_seconds: int
     idle_release_timeout_seconds: float
-    ocr_worker_count: int
     ocr_admission_capacity: int
     face_preprocess_worker_count: int
     face_batch_size: int
@@ -67,24 +61,12 @@ def load_runtime_path_settings() -> RuntimePathSettings:
     runtime_state_dir = (PROJECT_ROOT / "cache" / "runtime").resolve()
     runtime_state_dir.mkdir(parents=True, exist_ok=True)
 
-    rapidocr_config_path = Path(
-        os.environ.get(
-            "RAPIDOCR_OPENVINO_CONFIG_PATH",
-            str(APP_DIR / "config" / "cfg_openvino_cpu.yaml"),
-        )
-    )
-    rapidocr_model_dir = os.environ.get("RAPIDOCR_MODEL_DIR", str(model_base_path / "rapidocr"))
-
     return RuntimePathSettings(
         model_base_path=model_base_path,
         insightface_root=model_base_path / "insightface",
         insightface_model_root=model_base_path / "insightface" / "models",
         qa_clip_path=model_base_path / "qa-clip" / "openvino",
         ov_cache_dir=ov_cache_dir,
-        rapidocr_config_path=rapidocr_config_path,
-        rapidocr_model_dir=rapidocr_model_dir,
-        rapidocr_model_dir_path=Path(rapidocr_model_dir).expanduser().resolve(),
-        rapidocr_font_path=os.environ.get("RAPIDOCR_FONT_PATH", ""),
         runtime_state_dir=runtime_state_dir,
     )
 
@@ -110,13 +92,11 @@ def load_execution_control_settings() -> ExecutionControlSettings:
     configured_queue_capacity = max(1, QUEUE_MAX_SIZE)
     queue_capacity = min(MAX_PENDING_IMAGE_REQUESTS, configured_queue_capacity)
     execution_timeout_seconds = max(1, EXEC_TIMEOUT_SECONDS)
-    ocr_worker_count = max(1, _as_int(os.environ.get("RAPIDOCR_PERFORMANCE_NUM_REQUESTS"), 2))
-    ocr_default_capacity = max(2, int(ocr_worker_count) * 2)
     ocr_admission_capacity = max(
         1,
         min(
             queue_capacity,
-            _as_int(os.environ.get("OCR_MAX_CONCURRENT_REQUESTS"), ocr_default_capacity),
+            _as_int(os.environ.get("OCR_MAX_CONCURRENT_REQUESTS"), 4),
         ),
     )
     face_batch_size = max(1, min(queue_capacity, INSIGHTFACE_REQUEST_CAPACITY))
@@ -137,7 +117,6 @@ def load_execution_control_settings() -> ExecutionControlSettings:
             0.0,
             _as_float(os.environ.get("NON_TEXT_IDLE_RELEASE_SECONDS"), 60.0),
         ),
-        ocr_worker_count=ocr_worker_count,
         ocr_admission_capacity=ocr_admission_capacity,
         face_preprocess_worker_count=max(
             1,

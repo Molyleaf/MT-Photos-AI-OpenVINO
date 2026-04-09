@@ -510,13 +510,6 @@ def _openvino_device_expr_requests_npu(device_expr: str) -> bool:
     return any(token.startswith("NPU") for token in _split_openvino_device_expr(normalized))
 
 
-def _normalize_rapidocr_limit_type(value: Any, default: str = "max") -> str:
-    normalized = str(value).strip().lower()
-    if normalized in {"max", "min"}:
-        return normalized
-    return default
-
-
 def _as_contiguous_bgr_uint8(image: Any, context: str) -> np.ndarray:
     image_array = np.asarray(image)
     if image_array.ndim != 3 or image_array.shape[2] != 3:

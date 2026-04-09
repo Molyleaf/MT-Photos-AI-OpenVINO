@@ -73,26 +73,15 @@
 
 ### 3.3 RapidOCR
 
-- 依赖固定：`rapidocr==3.7.0`。
+- 依赖固定：`rapidocr==3.8.0`。
 - 禁止使用：`rapidocr-openvino`。
 - 禁止对 RapidOCR 模型做量化或结构改写。
-- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；必须把 `app/config/cfg_openvino_cpu.yaml` 作为 `RapidOCR(config_path=...)` 传入，禁止继续依赖库内默认 YAML。
-- RapidOCR 当前运行基线收敛为 **库内原生 OpenVINO CPU 路径**；`rapidocr==3.7.0` 上游 OpenVINO 推理类已写死 `CPU`，因此 `RAPIDOCR_DEVICE` 默认与实际运行时都必须为 `CPU`，显式传入 `AUTO/GPU` 仅允许记录告警后强制回到 `CPU`。
-- `RAPIDOCR_DET_DEVICE/RAPIDOCR_CLS_DEVICE/RAPIDOCR_REC_DEVICE` 仅保留兼容环境变量名，当前实现**不再参与**运行时 stage 选路；禁止再恢复本地 stage 级 session 包装。
-- 默认使用 **PP-OCRv5 mobile** 模型配置（`Det/Rec`）。
-- 默认开启方向分类器（`Global.use_cls=true`），并预置分类模型。
-- 运行基线：`max_side_len=960`、`Det.limit_side_len=960`、`Det.limit_type=max`、`Rec.rec_batch_num=8`、`Cls.cls_batch_num=8`。
-- OpenVINO 参数基线：`device_name=CPU`、`performance_hint=THROUGHPUT`、`performance_num_requests=2`、`inference_num_threads=-1`、`num_streams=2`。
-- `RAPIDOCR_PERFORMANCE_NUM_REQUESTS` 当前除透传给 RapidOCR/OpenVINO 外，还作为 OCR 多实例池与应用层执行器默认 worker 数基线。
-- 配置优先级必须为：**显式环境变量 `RAPIDOCR_*` > YAML(`cfg_openvino_cpu.yaml`) > 代码默认值**；但设备相关项最终仍必须收敛到 `CPU`。
-- RapidOCR 配置合并必须尽量直接复用上游 `RapidOCR(config_path=..., params=...)` 逻辑；仓库侧只允许补充本地模型路径、显式环境变量覆盖、实例池/准入/超时封装，禁止再维护一份 shadow YAML 解析后回填给上游。
-- 示例参数文件为 `app/config/cfg_openvino_cpu.yaml`；关键配置项包括 `device_name`、`inference_num_threads`、`performance_hint`、`performance_num_requests`、`enable_cpu_pinning`、`num_streams`、`enable_hyper_threading`、`scheduling_core_type`。
-- `rapidocr==3.7.0` 当前原生 OpenVINO CPU backend 未暴露 `cache_dir` 注入路径；仓库不得继续伪造未生效的 `cache_dir/device_name` 参数来制造“已启用缓存/可切设备”的假象。
-- RapidOCR v3 模型与字体资源需在镜像构建前预下载到本地路径（避免部署后在线下载）。
-- RapidOCR 必须执行“本地模型强校验 + 缺失即失败”，移除线上下载回退逻辑。
+- 必须使用 RapidOCR 内置后端选择能力，指定 **OpenVINO** 后端；初始化时只允许覆盖 `Det/Cls/Rec.engine_type=openvino`，其余配置全部保持上游默认值。
+- RapidOCR 默认模型、字典和样例资源都应走上游内置 URL；镜像构建时不再内置 `models/rapidocr`，首次 OCR 懒加载时按上游默认规则自动检查并下载。
+- 每次初始化 RapidOCR 时，都必须依赖其原生“检查文件是否有效，不存在则自动下载”的逻辑；不要再维护仓库内本地模型强校验失败即中止、手工拼装下载 URL、或 shadow config 覆盖层。
 - RapidOCR 与 OpenVINO 的衔接必须直接走库原生实现；严禁 monkey patch 第三方类/模块，也禁止继续替换 `text_det/text_cls/text_rec.session` 或自定义 stage session 包装。
 - OCR 运行链必须直接委托 `RapidOCR.__call__` / 库内 `run_ocr_steps`，不要再维护仓库内自定义 det/cls/rec 预处理、批调度和输出拼装分支。
-- OCR 并发必须通过**有界 RapidOCR 多实例池**实现；每个 worker 独占一个库原生 `RapidOCR` 实例，禁止多个线程共享同一个 OpenVINO `InferRequest`/session 对象后再用全局锁硬串行。
+- OCR 并发控制应优先保持实现简单且有界；不要再为 RapidOCR 维护 stage 级 session 包装、多实例池参数映射或自定义 OpenVINO 配置分发层。
 - OCR 输入预处理必须基于 OpenCV BGR `numpy`（零拷贝优先）：连续 `uint8` 缓冲区直接透传，禁止引入 `PIL` 中转链。
 - OCR 执行超时允许通过 `OCR_EXEC_TIMEOUT` 单独覆盖；默认不得低于 `30s`，且异步路径中模型加载/切换等待不得挤占 OCR 纯执行超时窗口。
 - OCR 必须提供应用层有界准入；执行超时后必须先触发协作取消，再等待已受理任务退场，禁止把超时任务脱离调用方继续在后台无界堆积。
@@ -284,13 +273,13 @@
   - `requirements.txt`
   - `image-clip/requirement.txt`（若改动独立 Windows CUDA Image-CLIP 子项目）
   - `text-clip/requirement.txt`（若改动独立 Text-CLIP 容器）
-- 若引入/调整 RapidOCR OpenVINO 参数文件，需提供示例 `cfg_openvino_cpu.yaml` 并说明关键参数（含设备与批量策略）。
+- 若调整 RapidOCR 初始化行为，必须同步说明是否仍保持“仅覆盖 `engine_type=openvino`，其它全部使用上游默认配置”。
 
 ---
 
 ## 10. 开发/自检命令（至少执行到可验证）
 
-- 开发机本地验证时，所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`RAPIDOCR_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。
+- 开发机本地验证时，所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。
 - `python -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
 - `python -m compileall app`
@@ -303,7 +292,7 @@
 - `python scripts/smoke_non_text_process.py`
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
-- `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
+- `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
 - `uvicorn server:app --host 0.0.0.0 --port 8061`（在 `text-clip/app/` 目录）
 - 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
@@ -319,7 +308,7 @@
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
 - [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重 + 仅做 IR 格式转换”
-- [ ] RapidOCR 是否为 `rapidocr==3.7.0` + OpenVINO（当前固定走库内原生 CPU 路径）+ PP-OCRv5 mobile（Det/Rec）+ `use_cls=true`
+- [ ] RapidOCR 是否为 `rapidocr==3.8.0`，且仅覆盖 `Det/Cls/Rec.engine_type=openvino`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP（仅推理）+ 原生 CPU 检测/识别预处理
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
 - [ ] 是否保持 OCR 默认懒加载，且显式预热后会立即释放
@@ -394,7 +383,6 @@ services:
       - NON_TEXT_IDLE_RELEASE_SECONDS=60
       - OCR_EXEC_TIMEOUT=30
       - PORT=8060
-      - RAPIDOCR_DEVICE=CPU
       - TEXT_CLIP_SERVER_URL=http://mt-photos-ai-text-clip:8061
   mt-photos-ai-text-clip:
     image: mt-photos-ai-text-clip:latest
@@ -405,7 +393,7 @@ services:
 ```
 
 说明：
-- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛，但 RapidOCR 当前固定走库内原生 `CPU` 路径；InsightFace 仅推理侧 EP 会收敛到 `GPU`，仓库内预处理固定走 `CPU`。
+- `INFERENCE_DEVICE` 可保持 `AUTO`，`CLIP_INFERENCE_DEVICE` 推荐使用 `AUTO`；非文本 OpenVINO 路径会在 GPU 可见时按 GPU 优先收敛；RapidOCR 当前仅把三段 `engine_type` 切到 `openvino`，其余保持上游默认；InsightFace 仅推理侧 EP 会收敛到 `GPU`，仓库内预处理固定走 `CPU`。
 - `mt-photos-ai-text-clip` 固定走 CPU，并独立对外提供 `/clip/txt`；该容器不需要 `/dev/dri`、`VIDEO_GID` 或 `RENDER_GID`，且文本模型在进程生命周期内保持常驻。主服务如需对外统一端口，必须配置 `TEXT_CLIP_SERVER_URL` 做纯代理。
 - `/represent` 当前固定为单 lane OpenVINO EP 推理 + 4 请求聚合预算 + 4 路 CPU 预处理 worker；如需权衡吞吐与尾延迟，只允许小幅调整 `INSIGHTFACE_BATCH_WAIT_MS`，不要重新引入额外的 worker/batch 容量环境变量。
 - 如需限制 OCR 纯执行窗口，可额外设置 `OCR_EXEC_TIMEOUT`；否则默认至少保留 `30s`，避免模型切换/冷加载把执行超时提前耗尽。
@@ -447,7 +435,7 @@ docker compose up -d
 docker compose ps
 docker compose logs --tail=200 mt-photos-ai-openvino
 docker compose logs --tail=200 mt-photos-ai-text-clip
-docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e RAPIDOCR_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU
+docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU
 
 curl -s http://127.0.0.1:8060/
 curl -s -X POST http://127.0.0.1:8060/check -H "api-key: mt_photos_ai_extra"

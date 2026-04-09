@@ -50,7 +50,6 @@ def _configure_env(device: str) -> None:
     os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
     os.environ.setdefault("INFERENCE_DEVICE", "CPU")
     os.environ.setdefault("CLIP_INFERENCE_DEVICE", "CPU")
-    os.environ.setdefault("RAPIDOCR_DEVICE", "CPU")
     os.environ["INSIGHTFACE_OV_DEVICE"] = str(device).strip().upper()
     os.environ.setdefault("NON_TEXT_IDLE_RELEASE_SECONDS", "0")
     os.environ.setdefault("LOG_LEVEL", "INFO")

@@ -23,7 +23,6 @@ services:
       NON_TEXT_IDLE_RELEASE_SECONDS: "60"
       OCR_EXEC_TIMEOUT: "30"
       PORT: "8060"
-      RAPIDOCR_DEVICE: "CPU"
       TEXT_CLIP_SERVER_URL: "http://mt-photos-ai-text-clip:8061"
     devices:
       # Linux 容器访问 Intel iGPU 时需要映射 /dev/dri。
