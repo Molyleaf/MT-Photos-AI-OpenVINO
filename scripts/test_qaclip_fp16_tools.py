@@ -7,6 +7,7 @@ import torch
 
 import scripts.convert_fp16 as convert_fp16_module
 import scripts.indicate_precision_impact as indicate_precision_impact_module
+import scripts.qaclip_precision_utils as precision_utils_module
 
 
 class _SmallPrecisionVisionModel(torch.nn.Module):
@@ -57,6 +58,34 @@ def _export_baseline_ir(baseline_dir: Path) -> None:
 
 
 class QaclipFp16ToolTests(unittest.TestCase):
+    def test_resolve_sample_value_for_input_falls_back_to_input_order_when_names_are_internal(self) -> None:
+        input_ids = torch.randint(0, 128, (1, 77), dtype=torch.long).numpy()
+        attention_mask = torch.ones((1, 77), dtype=torch.long).numpy()
+        sample = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+        class _FakeInputPort:
+            def __init__(self, names: tuple[str, ...], any_name: str) -> None:
+                self._names = names
+                self._any_name = any_name
+
+            def get_names(self) -> tuple[str, ...]:
+                return self._names
+
+            def get_any_name(self) -> str:
+                return self._any_name
+
+        first_port = _FakeInputPort(("49",), "49")
+        second_port = _FakeInputPort(("50",), "50")
+
+        resolved_input_ids = precision_utils_module._resolve_sample_value_for_input(0, first_port, sample)
+        resolved_attention_mask = precision_utils_module._resolve_sample_value_for_input(1, second_port, sample)
+
+        self.assertTrue((resolved_input_ids == input_ids).all())
+        self.assertTrue((resolved_attention_mask == attention_mask).all())
+
     def test_fp16_compression_and_precision_impact_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_name:
             root = Path(temp_dir_name)

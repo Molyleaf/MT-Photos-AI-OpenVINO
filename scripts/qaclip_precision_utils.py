@@ -129,12 +129,55 @@ def embedding_fidelity_score(reference_embeddings: np.ndarray, candidate_embeddi
     return float(np.clip((0.7 * direct_similarity) + (0.3 * structure_score), 0.0, 1.0))
 
 
+def _candidate_input_names(input_port: Any) -> tuple[str, ...]:
+    candidate_names: list[str] = []
+    get_names = getattr(input_port, "get_names", None)
+    if callable(get_names):
+        try:
+            candidate_names.extend(str(name) for name in get_names() if str(name))
+        except Exception:
+            pass
+
+    get_any_name = getattr(input_port, "get_any_name", None)
+    if callable(get_any_name):
+        try:
+            any_name = str(get_any_name())
+            if any_name:
+                candidate_names.append(any_name)
+        except Exception:
+            pass
+
+    deduplicated_names: list[str] = []
+    seen_names: set[str] = set()
+    for candidate_name in candidate_names:
+        if candidate_name in seen_names:
+            continue
+        seen_names.add(candidate_name)
+        deduplicated_names.append(candidate_name)
+    return tuple(deduplicated_names)
+
+
+def _resolve_sample_value_for_input(index: int, input_port: Any, sample: dict[str, np.ndarray]) -> np.ndarray:
+    for candidate_name in _candidate_input_names(input_port):
+        if candidate_name in sample:
+            return sample[candidate_name]
+
+    ordered_values = list(sample.values())
+    if index < len(ordered_values):
+        return ordered_values[index]
+
+    raise KeyError(
+        f"Unable to resolve input sample for port index={index}, "
+        f"candidate_names={_candidate_input_names(input_port)}, sample_keys={tuple(sample.keys())}"
+    )
+
+
 def _set_infer_request_inputs(ov: Any, compiled_model: Any, infer_request: Any, sample: Any) -> None:
     if isinstance(sample, dict):
         for index, input_port in enumerate(compiled_model.inputs):
             infer_request.set_input_tensor(
                 index,
-                ov.Tensor(np.ascontiguousarray(sample[input_port.get_any_name()])),
+                ov.Tensor(np.ascontiguousarray(_resolve_sample_value_for_input(index, input_port, sample))),
             )
         return
 
