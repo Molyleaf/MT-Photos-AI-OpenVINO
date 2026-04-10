@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import openvino as ov
 import torch
+import cv2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = PROJECT_ROOT / "app"
@@ -94,6 +95,72 @@ class _FakeLoadedModel:
 
 
 class ClipOpenvinoPipelineTests(unittest.TestCase):
+    @staticmethod
+    def _build_sample_images() -> dict[str, np.ndarray]:
+        height = 480
+        width = 640
+        y_coords, x_coords = np.indices((height, width))
+        blue = np.asarray((x_coords * 255) / max(1, width - 1), dtype=np.uint8)
+        green = np.asarray((y_coords * 255) / max(1, height - 1), dtype=np.uint8)
+        red = np.asarray(
+            ((x_coords + y_coords) * 255) / max(1, width + height - 2),
+            dtype=np.uint8,
+        )
+        base = np.dstack((blue, green, red))
+        cv2.rectangle(base, (40, 60), (260, 220), (20, 40, 220), thickness=-1)
+        cv2.circle(base, (460, 150), 90, (220, 200, 30), thickness=-1)
+        cv2.line(base, (20, 430), (620, 250), (255, 255, 255), thickness=6)
+        cv2.putText(
+            base,
+            "QA-CLIP",
+            (120, 360),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2.0,
+            (0, 0, 0),
+            6,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            base,
+            "SMOKE",
+            (115, 355),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2.0,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        return {
+            "base": np.ascontiguousarray(base),
+            "black": np.zeros_like(base),
+            "white": np.full_like(base, 255),
+        }
+
+    @staticmethod
+    def _resize_and_center_crop(image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        scale = float(CLIP_IMAGE_RESOLUTION) / float(min(height, width))
+        resized_width = max(CLIP_IMAGE_RESOLUTION, int(round(width * scale)))
+        resized_height = max(CLIP_IMAGE_RESOLUTION, int(round(height * scale)))
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        top = max(0, (resized_height - CLIP_IMAGE_RESOLUTION) // 2)
+        left = max(0, (resized_width - CLIP_IMAGE_RESOLUTION) // 2)
+        cropped = resized[
+            top : top + CLIP_IMAGE_RESOLUTION,
+            left : left + CLIP_IMAGE_RESOLUTION,
+        ]
+        return np.ascontiguousarray(cropped, dtype=np.uint8)
+
+    @staticmethod
+    def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+        left = np.asarray(left, dtype=np.float32).reshape(-1)
+        right = np.asarray(right, dtype=np.float32).reshape(-1)
+        return float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right)))
+
     def test_openvino_ppp_matches_clip_manual_normalization(self) -> None:
         models = AIModels.__new__(AIModels)
         runner = None
@@ -124,6 +191,63 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
 
             self.assertEqual((3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION), actual.shape)
             self.assertLess(float(np.max(np.abs(actual - expected))), 1e-5)
+        finally:
+            if runner is not None:
+                runner.release()
+
+    def test_current_ir_image_pipeline_preserves_embedding_separation(self) -> None:
+        model_path = PROJECT_ROOT / "models" / "qa-clip" / "openvino" / "openvino_image.xml"
+        self.assertTrue(model_path.exists(), f"missing model: {model_path}")
+
+        models = AIModels.__new__(AIModels)
+        runner = None
+        compiled_model = None
+        infer_request = None
+
+        with patch.object(AIModels, "_ensure_openvino_runtime", return_value=ov.Core()):
+            runner = AIModels._build_openvino_preprocess_runner(
+                models,
+                runner_name="clip_vision_runtime_test",
+                device_name="CPU",
+                output_height=CLIP_IMAGE_RESOLUTION,
+                output_width=CLIP_IMAGE_RESOLUTION,
+                mean_values=_CLIP_IMAGE_MEAN.tolist(),
+                std_values=_CLIP_IMAGE_STD.tolist(),
+            )
+
+        try:
+            core = ov.Core()
+            compiled_model = core.compile_model(str(model_path), "CPU")
+            infer_request = compiled_model.create_infer_request()
+
+            embeddings: dict[str, np.ndarray] = {}
+            for name, image in self._build_sample_images().items():
+                cropped = self._resize_and_center_crop(image)
+                preprocessed = runner.run(cropped[np.newaxis, ...])
+                infer_request.set_input_tensor(
+                    0,
+                    ov.Tensor(np.ascontiguousarray(preprocessed), shared_memory=True),
+                )
+                infer_request.infer()
+                embeddings[name] = np.array(
+                    infer_request.get_output_tensor(0).data,
+                    dtype=np.float32,
+                    copy=True,
+                )[0]
+
+            base_black_cosine = self._cosine_similarity(embeddings["base"], embeddings["black"])
+            base_white_cosine = self._cosine_similarity(embeddings["base"], embeddings["white"])
+
+            self.assertLess(
+                base_black_cosine,
+                0.75,
+                f"base/black cosine unexpectedly high: {base_black_cosine}",
+            )
+            self.assertLess(
+                base_white_cosine,
+                0.75,
+                f"base/white cosine unexpectedly high: {base_white_cosine}",
+            )
         finally:
             if runner is not None:
                 runner.release()
