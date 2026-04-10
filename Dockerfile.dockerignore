@@ -11,7 +11,12 @@ server.log
 cache/
 example/
 image-clip/
+text-clip/
 models/insightface/_runtime_models/
 models/insightface/models/buffalo_l/
 models/qa-clip/huggingface/
 models/qa-clip/openvino_fp32/
+models/qa-clip/openvino/openvino_text_fp16.bin
+models/qa-clip/openvino/openvino_text_fp16.xml
+scripts/*
+!scripts/smoke_insightface.py
