@@ -69,9 +69,11 @@
   - 禁止在同一阶段同时常驻完整 PyTorch 模型副本 + 完整 OpenVINO 中间副本。
   - 视觉分支与文本分支按顺序转换，转换后及时释放前一阶段对象并 `gc.collect()`。
 - 必须重新下载原始 Hugging Face FP32 模型后再转换；本地 `models/qa-clip/huggingface` 只允许保存原始 FP32 权重快照。
-- 转换目标仅限“格式转换到 OpenVINO IR”，禁止做 FP16 压缩、量化、NNCF 权重压缩或任何改变权重精度/结构的额外处理。
-- 保存 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=False)`，禁止依赖 OpenVINO 默认行为把浮点权重压成 FP16。
-- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`。
+- 转换链路固定为“先导出临时 FP32 IR，再对图像/文本分支分别执行 OpenVINO NNCF 自动压缩”；禁止直接提交来源不明的量化后权重，禁止绕过临时 FP32 基线做手工改图或私有后处理。
+- NNCF 路径必须使用**只压缩部分层**的混合精度权重策略，并继续叠加 `quantize_with_accuracy_control`（Accuracy-Aware Quantization）；不得把全部层强压到同一低比特精度。
+- 候选策略必须按“更激进压缩优先”做受控搜索，并在满足精度阈值与“无表征崩塌”前提下选出当前最优候选；至少保留候选模式、ratio、保真度得分和是否崩塌的元数据记录。
+- 最终保存 IR 时允许对剩余浮点权重执行 FP16 压缩；默认可通过 `ov.save_model(..., compress_to_fp16=True)` 落盘，但临时基线 IR 仍必须保持 `compress_to_fp16=False`，便于 Accuracy-Aware 对照与回归。
+- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；对应压缩元数据基线为 `openvino_image.compression.json` 与 `openvino_text.compression.json`。
 
 ### 3.3 RapidOCR
 
@@ -309,7 +311,7 @@
 - [ ] 若仍需要 tokenizer 资源，是否完全切换到 `text-clip/app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
-- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重 + 仅做 IR 格式转换”
+- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重快照 + NNCF 部分层混合精度压缩 + Accuracy-Aware Quantization + 无表征崩塌”
 - [ ] RapidOCR 是否为 `rapidocr==3.8.0`，且仅覆盖 `Det/Cls/Rec.engine_type=openvino`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP（仅推理）+ 原生 CPU 检测/识别预处理
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
@@ -458,5 +460,9 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/huggingface` 与 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
 | `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径（脚本启动前会清理） | `<PROJECT_ROOT>/cache/openvino` |
+| `QACLIP_WEIGHT_CANDIDATES` | 逗号分隔的 `MODE:RATIO` 候选集，如 `INT4_ASYM:0.75,INT4_SYM:0.5` | `INT4_ASYM:0.75,INT4_SYM:0.75,INT4_ASYM:0.5,INT4_SYM:0.5` |
+| `QACLIP_MAX_ACCURACY_DROP` | Accuracy-Aware Quantization 允许的最大绝对精度下降 | `0.01` |
+| `QACLIP_MIN_FIDELITY_SCORE` | 候选导出必须达到的最小 embedding 保真度分数 | `0.985` |
+| `QACLIP_SAVE_FP16` | 是否对最终 IR 中剩余浮点权重执行 FP16 压缩 | `true` |
 
-`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。
+`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本还会额外生成 `openvino_image.compression.json` 与 `openvino_text.compression.json`，用于记录当前选中的混合精度候选、保真度得分以及是否触发表征崩塌保护。

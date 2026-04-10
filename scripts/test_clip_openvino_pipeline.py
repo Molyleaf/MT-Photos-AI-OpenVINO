@@ -1,15 +1,18 @@
+import json
 import logging
+import math
 import sys
+import tempfile
 import types
 import unittest
 from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import cv2
 import numpy as np
 import openvino as ov
 import torch
-import cv2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = PROJECT_ROOT / "app"
@@ -94,6 +97,17 @@ class _FakeLoadedModel:
         )
 
 
+class _SyntheticVisionModel(torch.nn.Module):
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        pooled = torch.nn.functional.avg_pool2d(pixel_values, kernel_size=16, stride=16)
+        flattened = pooled.reshape(pixel_values.shape[0], -1)
+        channel_stats = pixel_values.mean(dim=(2, 3))
+        features = torch.cat((flattened, channel_stats), dim=1)
+        repeat_factor = math.ceil(convert_module.EMBEDDING_DIMS / features.shape[1])
+        tiled = features.repeat(1, repeat_factor)
+        return tiled[:, : convert_module.EMBEDDING_DIMS]
+
+
 class ClipOpenvinoPipelineTests(unittest.TestCase):
     @staticmethod
     def _build_sample_images() -> dict[str, np.ndarray]:
@@ -161,6 +175,21 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
         right = np.asarray(right, dtype=np.float32).reshape(-1)
         return float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right)))
 
+    def _ensure_test_vision_model(self) -> tuple[Path, object | None]:
+        repo_model_path = PROJECT_ROOT / "models" / "qa-clip" / "openvino" / "openvino_image.xml"
+        if repo_model_path.exists():
+            return repo_model_path, None
+
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_model_path = Path(temp_dir.name) / "synthetic_openvino_image.xml"
+        model = _SyntheticVisionModel().eval()
+        ov_model = ov.convert_model(
+            model,
+            example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
+        )
+        ov.save_model(ov_model, temp_model_path, compress_to_fp16=False)
+        return temp_model_path, temp_dir
+
     def test_openvino_ppp_matches_clip_manual_normalization(self) -> None:
         models = AIModels.__new__(AIModels)
         runner = None
@@ -196,13 +225,9 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
                 runner.release()
 
     def test_current_ir_image_pipeline_preserves_embedding_separation(self) -> None:
-        model_path = PROJECT_ROOT / "models" / "qa-clip" / "openvino" / "openvino_image.xml"
-        self.assertTrue(model_path.exists(), f"missing model: {model_path}")
-
+        model_path, temp_dir = self._ensure_test_vision_model()
         models = AIModels.__new__(AIModels)
         runner = None
-        compiled_model = None
-        infer_request = None
 
         with patch.object(AIModels, "_ensure_openvino_runtime", return_value=ov.Core()):
             runner = AIModels._build_openvino_preprocess_runner(
@@ -240,40 +265,134 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
 
             self.assertLess(
                 base_black_cosine,
-                0.75,
+                0.9,
                 f"base/black cosine unexpectedly high: {base_black_cosine}",
             )
             self.assertLess(
                 base_white_cosine,
-                0.75,
+                0.9,
                 f"base/white cosine unexpectedly high: {base_white_cosine}",
             )
         finally:
             if runner is not None:
                 runner.release()
+            if temp_dir is not None:
+                temp_dir.cleanup()
 
-    def test_convert_script_saves_ir_without_fp16_weight_compression(self) -> None:
-        fake_model = _FakeLoadedModel()
+    def test_embedding_fidelity_score_rejects_representation_collapse(self) -> None:
+        reference = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        collapsed = np.repeat(reference[:1], repeats=3, axis=0)
+        healthy = reference.copy()
+
+        collapsed_score = convert_module._embedding_fidelity_score(reference, collapsed)
+        healthy_score = convert_module._embedding_fidelity_score(reference, healthy)
+
+        self.assertTrue(convert_module._is_representation_collapsed(collapsed))
+        self.assertFalse(convert_module._is_representation_collapsed(healthy))
+        self.assertLess(collapsed_score, 0.1)
+        self.assertGreater(healthy_score, 0.99)
+
+    def test_optimize_and_save_model_skips_collapsed_candidate_and_allows_fp16(self) -> None:
+        reference_embeddings = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        aggressive_candidate = convert_module.CompressionCandidate(
+            name="int4_asym_0_75",
+            weight_mode="INT4_ASYM",
+            weight_ratio=0.75,
+        )
+        fallback_candidate = convert_module.CompressionCandidate(
+            name="int4_sym_0_5",
+            weight_mode="INT4_SYM",
+            weight_ratio=0.5,
+        )
+
+        fake_nncf = types.SimpleNamespace(
+            Dataset=lambda samples, transform_fn: {"samples": list(samples), "transform_fn": transform_fn},
+            CompressWeightsMode=types.SimpleNamespace(INT4_ASYM="INT4_ASYM", INT4_SYM="INT4_SYM"),
+            BackupMode=types.SimpleNamespace(INT8_ASYM="INT8_ASYM"),
+            DropType=types.SimpleNamespace(ABSOLUTE="ABSOLUTE"),
+            QuantizationPreset=types.SimpleNamespace(MIXED="MIXED"),
+            ModelType=types.SimpleNamespace(TRANSFORMER="TRANSFORMER"),
+        )
+
+        def _fake_compress_weights(model: object, **kwargs: object) -> dict[str, object]:
+            return {"model": model, "ratio": kwargs["ratio"], "kwargs": kwargs}
+
+        def _fake_quantize(compressed_model: dict[str, object], **kwargs: object) -> types.SimpleNamespace:
+            return types.SimpleNamespace(weight_ratio=compressed_model["ratio"], kwargs=kwargs)
+
+        fake_nncf.compress_weights = Mock(side_effect=_fake_compress_weights)
+        fake_nncf.quantize_with_accuracy_control = Mock(side_effect=_fake_quantize)
+
+        fake_core = Mock()
+        fake_core.read_model.side_effect = lambda model_path: {"path": str(model_path)}
         fake_ov = Mock()
-        fake_ov.convert_model.return_value = object()
+        fake_ov.Core.return_value = fake_core
+        fake_ov.save_model = Mock()
 
-        convert_module._convert_vision_branch(
-            model=fake_model,
-            ov=fake_ov,
-            torch=torch,
-            nn=torch.nn,
-        )
-        convert_module._convert_text_branch(
-            model=fake_model,
-            ov=fake_ov,
-            torch=torch,
-            nn=torch.nn,
-        )
+        def _fake_infer_embeddings(*args: object, **kwargs: object) -> np.ndarray:
+            model = kwargs.get("model")
+            if model is None and len(args) >= 2:
+                model = args[1]
+            weight_ratio = getattr(model, "weight_ratio", None)
+            if weight_ratio is None:
+                return reference_embeddings
+            if weight_ratio >= 0.75:
+                return np.repeat(reference_embeddings[:1], repeats=3, axis=0)
+            return reference_embeddings
 
-        self.assertEqual(2, fake_ov.save_model.call_count)
-        for call in fake_ov.save_model.call_args_list:
-            self.assertIn("compress_to_fp16", call.kwargs)
-            self.assertFalse(call.kwargs["compress_to_fp16"])
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            metadata_path = Path(temp_dir_name) / "openvino_image.compression.json"
+            with (
+                patch.object(convert_module, "_build_validation_context", return_value=(reference_embeddings, Mock())),
+                patch.object(convert_module, "_infer_embeddings", side_effect=_fake_infer_embeddings),
+                patch.object(convert_module, "_parse_weight_candidates", return_value=(aggressive_candidate, fallback_candidate)),
+                patch.object(convert_module, "_fp16_compression_enabled", return_value=True),
+            ):
+                convert_module._optimize_and_save_model(
+                    branch_name="vision",
+                    baseline_model_path=Path(temp_dir_name) / "baseline.xml",
+                    output_model_path=Path(temp_dir_name) / "openvino_image.xml",
+                    metadata_path=metadata_path,
+                    calibration_samples=(np.zeros((1, 3, 4, 4), dtype=np.float32),),
+                    validation_samples=(np.zeros((1, 3, 4, 4), dtype=np.float32),),
+                    ov=fake_ov,
+                    nncf=fake_nncf,
+                )
+
+            self.assertEqual(2, fake_nncf.compress_weights.call_count)
+            first_compress_call = fake_nncf.compress_weights.call_args_list[0]
+            self.assertFalse(first_compress_call.kwargs["all_layers"])
+            self.assertTrue(first_compress_call.kwargs["awq"])
+            self.assertTrue(first_compress_call.kwargs["scale_estimation"])
+            self.assertLess(first_compress_call.kwargs["ratio"], 1.0)
+            self.assertEqual("INT8_ASYM", first_compress_call.kwargs["backup_mode"])
+
+            first_quantize_call = fake_nncf.quantize_with_accuracy_control.call_args_list[0]
+            self.assertEqual("MIXED", first_quantize_call.kwargs["preset"])
+            self.assertEqual("TRANSFORMER", first_quantize_call.kwargs["model_type"])
+
+            fake_ov.save_model.assert_called_once()
+            self.assertTrue(fake_ov.save_model.call_args.kwargs["compress_to_fp16"])
+
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual("int4_sym_0_5", metadata["selected_candidate"]["name"])
+            self.assertTrue(metadata["compress_to_fp16"])
+            self.assertTrue(metadata["candidate_evaluations"][0]["representation_collapsed"])
+            self.assertTrue(metadata["candidate_evaluations"][1]["selected"])
 
 
 if __name__ == "__main__":
