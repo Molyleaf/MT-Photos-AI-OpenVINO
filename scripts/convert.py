@@ -38,9 +38,19 @@ def _resolve_project_root() -> Path:
 PROJECT_ROOT = _resolve_project_root()
 MODEL_BASE_PATH = Path(os.environ.get("MODEL_PATH", str(PROJECT_ROOT / "models")))
 OV_SAVE_PATH = MODEL_BASE_PATH / "qa-clip" / "openvino"
+OV_FP32_SAVE_PATH = MODEL_BASE_PATH / "qa-clip" / "openvino_fp32"
 HF_SAVE_PATH = MODEL_BASE_PATH / "qa-clip" / "huggingface"
 CACHE_PATH = Path(os.environ.get("HF_CACHE_DIR", str(PROJECT_ROOT / "cache" / "huggingface")))
 OPENVINO_CACHE_PATH = Path(os.environ.get("OV_CACHE_DIR", str(PROJECT_ROOT / "cache" / "openvino")))
+
+MAINLINE_EXPORTS: dict[str, tuple[Path, bool]] = {
+    "vision": (OV_SAVE_PATH / "openvino_image_fp16.xml", True),
+    "text": (OV_SAVE_PATH / "openvino_text_fp16.xml", True),
+}
+REFERENCE_EXPORTS: dict[str, tuple[Path, bool]] = {
+    "vision": (OV_FP32_SAVE_PATH / "openvino_image_fp32.xml", False),
+    "text": (OV_FP32_SAVE_PATH / "openvino_text_fp32.xml", False),
+}
 
 
 def _prepare_hf_cache_env() -> None:
@@ -77,7 +87,7 @@ def _remove_path(path: Path) -> None:
 
 
 def _reset_conversion_artifacts() -> None:
-    removable_paths = [OPENVINO_CACHE_PATH, OV_SAVE_PATH]
+    removable_paths = [OPENVINO_CACHE_PATH, OV_SAVE_PATH, OV_FP32_SAVE_PATH]
     if _env_flag("QACLIP_RESET_HF_SNAPSHOT", False):
         removable_paths.append(HF_SAVE_PATH)
     if _env_flag("QACLIP_RESET_HF_CACHE", False):
@@ -87,6 +97,7 @@ def _reset_conversion_artifacts() -> None:
         _remove_path(path)
 
     OV_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+    OV_FP32_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     HF_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -179,18 +190,25 @@ def _export_hf_snapshot(model: Any, load_source: str) -> None:
     model.save_pretrained(HF_SAVE_PATH, safe_serialization=True)
 
 
-def _save_original_precision_ir(*, branch_name: str, ov: Any, ov_model: Any, output_model_path: Path) -> None:
-    output_model_path.parent.mkdir(parents=True, exist_ok=True)
-    ov.save_model(ov_model, output_model_path, compress_to_fp16=False)
-    logging.info(
-        "%s branch saved to %s with original precision and structure.",
-        branch_name,
-        output_model_path,
-    )
+def _save_branch_exports(*, branch_name: str, ov: Any, ov_model: Any) -> None:
+    for export_group_name, export_map in (
+        ("mainline_fp16", MAINLINE_EXPORTS),
+        ("reference_fp32", REFERENCE_EXPORTS),
+    ):
+        output_model_path, compress_to_fp16 = export_map[branch_name]
+        output_model_path.parent.mkdir(parents=True, exist_ok=True)
+        ov.save_model(ov_model, output_model_path, compress_to_fp16=compress_to_fp16)
+        logging.info(
+            "%s branch saved to %s (%s, compress_to_fp16=%s).",
+            branch_name,
+            output_model_path,
+            export_group_name,
+            compress_to_fp16,
+        )
 
 
 def _convert_vision_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
-    logging.info("Converting vision branch with original precision and structure...")
+    logging.info("Converting vision branch for mainline FP16 export and FP32 reference export...")
 
     class VisionModelWrapper(nn.Module):
         def __init__(self, loaded_model: Any):
@@ -206,12 +224,7 @@ def _convert_vision_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
     vision_wrapper = VisionModelWrapper(model).eval()
     dummy_input = torch.randn(1, 3, INPUT_RESOLUTION, INPUT_RESOLUTION)
     ov_model = ov.convert_model(vision_wrapper, example_input=dummy_input)
-    _save_original_precision_ir(
-        branch_name="vision",
-        ov=ov,
-        ov_model=ov_model,
-        output_model_path=OV_SAVE_PATH / "openvino_image.xml",
-    )
+    _save_branch_exports(branch_name="vision", ov=ov, ov_model=ov_model)
     del ov_model
     del dummy_input
     del vision_wrapper
@@ -239,7 +252,7 @@ def _resolve_vocab_size(model: Any) -> int:
 
 
 def _convert_text_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
-    logging.info("Converting text branch with original precision and structure...")
+    logging.info("Converting text branch for mainline FP16 export and FP32 reference export...")
 
     class TextModelWrapper(nn.Module):
         def __init__(self, loaded_model: Any):
@@ -262,43 +275,52 @@ def _convert_text_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
         "attention_mask": torch.ones(1, CONTEXT_LENGTH, dtype=torch.long),
     }
     ov_model = ov.convert_model(text_wrapper, example_input=dummy_inputs)
-    _save_original_precision_ir(
-        branch_name="text",
-        ov=ov,
-        ov_model=ov_model,
-        output_model_path=OV_SAVE_PATH / "openvino_text.xml",
-    )
+    _save_branch_exports(branch_name="text", ov=ov, ov_model=ov_model)
     del ov_model
     del dummy_inputs
     del text_wrapper
     gc.collect()
 
 
-def _verify_models(ov: Any) -> None:
+def _verify_model_path(*, ov: Any, model_path: Path, expected_inputs: int) -> None:
     core = ov.Core()
-    vision_path = OV_SAVE_PATH / "openvino_image.xml"
-    text_path = OV_SAVE_PATH / "openvino_text.xml"
-
-    vision_model = core.read_model(vision_path)
-    vision_dim = vision_model.output(0).get_partial_shape()[1].get_length()
-    if vision_dim != EMBEDDING_DIMS:
-        raise RuntimeError(f"Vision output dim mismatch: expected={EMBEDDING_DIMS}, got={vision_dim}")
-    if len(vision_model.inputs) != 1:
-        raise RuntimeError(f"Vision input count mismatch: expected=1, got={len(vision_model.inputs)}")
-    del vision_model
-    gc.collect()
-
-    text_model = core.read_model(text_path)
-    text_dim = text_model.output(0).get_partial_shape()[1].get_length()
-    if text_dim != EMBEDDING_DIMS:
-        raise RuntimeError(f"Text output dim mismatch: expected={EMBEDDING_DIMS}, got={text_dim}")
-    if len(text_model.inputs) != 2:
-        raise RuntimeError(f"Text input count mismatch: expected=2, got={len(text_model.inputs)}")
-    del text_model
+    model = core.read_model(model_path)
+    output_dim = model.output(0).get_partial_shape()[1].get_length()
+    if output_dim != EMBEDDING_DIMS:
+        raise RuntimeError(
+            f"Model output dim mismatch: path={model_path} expected={EMBEDDING_DIMS} got={output_dim}"
+        )
+    if len(model.inputs) != expected_inputs:
+        raise RuntimeError(
+            f"Model input count mismatch: path={model_path} expected={expected_inputs} got={len(model.inputs)}"
+        )
+    del model
     del core
     gc.collect()
 
-    logging.info("Model verification passed: both branches output %s dimensions.", EMBEDDING_DIMS)
+
+def _verify_models(ov: Any) -> None:
+    _verify_model_path(
+        ov=ov,
+        model_path=MAINLINE_EXPORTS["vision"][0],
+        expected_inputs=1,
+    )
+    _verify_model_path(
+        ov=ov,
+        model_path=REFERENCE_EXPORTS["vision"][0],
+        expected_inputs=1,
+    )
+    _verify_model_path(
+        ov=ov,
+        model_path=MAINLINE_EXPORTS["text"][0],
+        expected_inputs=2,
+    )
+    _verify_model_path(
+        ov=ov,
+        model_path=REFERENCE_EXPORTS["text"][0],
+        expected_inputs=2,
+    )
+    logging.info("Model verification passed: all mainline/reference branches output %s dimensions.", EMBEDDING_DIMS)
 
 
 def convert_models() -> None:
@@ -306,11 +328,12 @@ def convert_models() -> None:
     _prepare_hf_cache_env()
 
     logging.info("Project root: %s", PROJECT_ROOT)
-    logging.info("OpenVINO output directory: %s", OV_SAVE_PATH)
+    logging.info("Mainline FP16 OpenVINO output directory: %s", OV_SAVE_PATH)
+    logging.info("Reference FP32 OpenVINO output directory: %s", OV_FP32_SAVE_PATH)
     logging.info("Local Hugging Face snapshot directory: %s", HF_SAVE_PATH)
     logging.info("Hugging Face cache directory: %s", CACHE_PATH)
     logging.info("OpenVINO cache directory cleaned: %s", OPENVINO_CACHE_PATH)
-    logging.info("Original precision/structure export enabled: True")
+    logging.info("Mainline/export layout: openvino/*_fp16 + openvino_fp32/*_fp32")
     logging.info(
         "Hugging Face cache reset enabled: cache=%s snapshot=%s force_download=%s",
         _env_flag("QACLIP_RESET_HF_CACHE", False),

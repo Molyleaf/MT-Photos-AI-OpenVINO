@@ -1,3 +1,4 @@
+# Text-CLIP loads the mainline QA-CLIP OpenVINO FP16 IR from models/qa-clip/openvino/*_fp16.
 numpy==2.3.5
 fastapi
 pydantic

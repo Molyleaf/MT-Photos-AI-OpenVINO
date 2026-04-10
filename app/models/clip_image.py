@@ -268,7 +268,7 @@ class ClipImageMixin(ABC):
         return core.compile_model(model_or_path, self._clip_inference_device, config)
 
     def _load_clip_vision_locked(self) -> None:
-        vision_model_path = self.qa_clip_path / "openvino_image.xml"
+        vision_model_path = self.qa_clip_path / "openvino_image_fp16.xml"
         if not vision_model_path.exists():
             raise FileNotFoundError(f"Missing vision model: {vision_model_path}")
 

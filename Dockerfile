@@ -117,13 +117,13 @@ RUN set -eux; \
     mkdir -p "${RAPIDOCR_MODEL_ROOT}"; \
     chown -R appuser:appgroup "${RAPIDOCR_MODEL_ROOT}"
 
-COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image.xml /models/qa-clip/openvino/openvino_image.xml
-COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image.bin /models/qa-clip/openvino/openvino_image.bin
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image_fp16.xml /models/qa-clip/openvino/openvino_image_fp16.xml
+COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_image_fp16.bin /models/qa-clip/openvino/openvino_image_fp16.bin
 COPY --chown=appuser:appgroup models/insightface/models/antelopev2 /models/insightface/models/antelopev2
 
 RUN set -eux; \
-    test -f /models/qa-clip/openvino/openvino_image.xml; \
-    test -f /models/qa-clip/openvino/openvino_image.bin; \
+    test -f /models/qa-clip/openvino/openvino_image_fp16.xml; \
+    test -f /models/qa-clip/openvino/openvino_image_fp16.bin; \
     test -f /models/insightface/models/antelopev2/glintr100.onnx; \
     test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx
 

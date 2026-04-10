@@ -6,7 +6,8 @@
 
 - Python **3.12**
 - 已准备模型目录（至少包含）：
-  - `models/qa-clip/openvino`
+  - `models/qa-clip/openvino`（主线 FP16 IR，文件名固定为 `openvino_image_fp16.*` 与 `openvino_text_fp16.*`）
+  - `models/qa-clip/openvino_fp32`（FP32 对照组 IR，供精度观测脚本使用，文件名固定为 `openvino_image_fp32.*` 与 `openvino_text_fp32.*`）
   - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `py -3.12 scripts/convert.py` 自动重建）
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
 - 主服务入口：`app/server.py`
@@ -16,9 +17,9 @@
 - Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
 - `scripts/convert.py` 默认只清理 OpenVINO 导出产物与 OpenVINO cache，不会重复删除 Hugging Face cache 或本地 QA-CLIP snapshot；脚本会优先复用 `models/qa-clip/huggingface` 本地 snapshot，其次复用 `cache/huggingface`，仅在本地都缺失时才回源下载 `TencentARC/QA-CLIP-ViT-L-14`
-- `scripts/convert.py` 会按原始精度和结构直接导出 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；保存时固定使用 `ov.save_model(..., compress_to_fp16=False)`，不会执行 FP16 压缩、INT8/INT4 量化、NNCF 权重压缩或任何改图后处理
-- `scripts/convert_fp16.py` 会基于现有原始 IR 额外生成一套实验性 FP16 IR 到 `models/qa-clip/openvino-fp16`；该脚本仅调用 OpenVINO 原生 `ov.save_model(..., compress_to_fp16=True)`，不会替换主服务默认使用的 `models/qa-clip/openvino`
-- `scripts/indicate_precision_impact.py` 会比较 `models/qa-clip/openvino` 与 `models/qa-clip/openvino-fp16` 两套模型的 embedding 保真度、结构差异、低比特常量检查和文件体积变化，并默认输出 `models/qa-clip/openvino-fp16/precision_impact.json`
+- `scripts/convert.py` 会顺序导出两套 QA-CLIP OpenVINO IR：主线 `models/qa-clip/openvino/openvino_image_fp16.xml` 与 `models/qa-clip/openvino/openvino_text_fp16.xml` 固定使用 OpenVINO 原生 `ov.save_model(..., compress_to_fp16=True)`，同时生成 FP32 对照组 `models/qa-clip/openvino_fp32/openvino_image_fp32.xml` 与 `models/qa-clip/openvino_fp32/openvino_text_fp32.xml`
+- 仓库不再保留单独的 `scripts/convert_fp16.py`；FP16 与 FP32 对照组统一由 `scripts/convert.py` 一次导出完成
+- `scripts/indicate_precision_impact.py` 默认比较 `models/qa-clip/openvino_fp32` 与主线 `models/qa-clip/openvino`，并输出 `models/qa-clip/openvino/precision_impact.json`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`；其中 `onnx` 用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据
 
@@ -70,8 +71,8 @@
 
 - 开发机本地验证时，主服务建议把主要后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
-- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前“原始精度 + 原始结构 + 纯 IR 格式转换”基线一致。
-- 如需额外评估 FP16 浮点压缩，可先执行 `py -3.12 scripts/convert_fp16.py`，再执行 `py -3.12 scripts/indicate_precision_impact.py`。这两步只会生成实验性产物和报告，不会修改主服务默认使用的原始 IR。
+- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前“主线 FP16 + FP32 对照组”导出基线一致。
+- 如需评估主线 FP16 与 FP32 对照组之间的 embedding 保真度、结构差异和体积变化，直接执行 `py -3.12 scripts/indicate_precision_impact.py` 即可。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。

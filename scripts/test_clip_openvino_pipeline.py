@@ -173,18 +173,18 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
         return float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right)))
 
     def _ensure_test_vision_model(self) -> tuple[Path, object | None]:
-        repo_model_path = PROJECT_ROOT / "models" / "qa-clip" / "openvino" / "openvino_image.xml"
+        repo_model_path = PROJECT_ROOT / "models" / "qa-clip" / "openvino" / "openvino_image_fp16.xml"
         if repo_model_path.exists():
             return repo_model_path, None
 
         temp_dir = tempfile.TemporaryDirectory()
-        temp_model_path = Path(temp_dir.name) / "synthetic_openvino_image.xml"
+        temp_model_path = Path(temp_dir.name) / "synthetic_openvino_image_fp16.xml"
         model = _SyntheticVisionModel().eval()
         ov_model = ov.convert_model(
             model,
             example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
         )
-        ov.save_model(ov_model, temp_model_path, compress_to_fp16=False)
+        ov.save_model(ov_model, temp_model_path, compress_to_fp16=True)
         return temp_model_path, temp_dir
 
     def test_openvino_ppp_matches_clip_manual_normalization(self) -> None:
@@ -314,15 +314,17 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             root = Path(temp_dir_name)
             ov_path = root / "openvino"
+            ov_fp32_path = root / "openvino_fp32"
             hf_path = root / "huggingface"
             cache_path = root / "cache"
             ov_cache_path = root / "ov_cache"
-            for path in (ov_path, hf_path, cache_path, ov_cache_path):
+            for path in (ov_path, ov_fp32_path, hf_path, cache_path, ov_cache_path):
                 path.mkdir(parents=True, exist_ok=True)
                 (path / "sentinel.txt").write_text("sentinel", encoding="utf-8")
 
             with (
                 patch.object(convert_module, "OV_SAVE_PATH", ov_path),
+                patch.object(convert_module, "OV_FP32_SAVE_PATH", ov_fp32_path),
                 patch.object(convert_module, "HF_SAVE_PATH", hf_path),
                 patch.object(convert_module, "CACHE_PATH", cache_path),
                 patch.object(convert_module, "OPENVINO_CACHE_PATH", ov_cache_path),
@@ -330,17 +332,30 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
                 convert_module._reset_conversion_artifacts()
 
             self.assertFalse((ov_path / "sentinel.txt").exists())
+            self.assertFalse((ov_fp32_path / "sentinel.txt").exists())
             self.assertFalse((ov_cache_path / "sentinel.txt").exists())
             self.assertTrue((hf_path / "sentinel.txt").exists())
             self.assertTrue((cache_path / "sentinel.txt").exists())
 
-    def test_convert_vision_branch_saves_original_precision_ir(self) -> None:
+    def test_convert_vision_branch_saves_fp16_mainline_and_fp32_reference_ir(self) -> None:
         fake_ov = Mock()
         fake_ov_model = object()
         fake_ov.convert_model.return_value = fake_ov_model
 
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            with patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)):
+            export_root = Path(temp_dir_name)
+            with (
+                patch.object(
+                    convert_module,
+                    "MAINLINE_EXPORTS",
+                    {"vision": (export_root / "openvino" / "openvino_image_fp16.xml", True)},
+                ),
+                patch.object(
+                    convert_module,
+                    "REFERENCE_EXPORTS",
+                    {"vision": (export_root / "openvino_fp32" / "openvino_image_fp32.xml", False)},
+                ),
+            ):
                 convert_module._convert_vision_branch(
                     model=_FakeLoadedModel(),
                     ov=fake_ov,
@@ -349,19 +364,35 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
                 )
 
         fake_ov.convert_model.assert_called_once()
-        fake_ov.save_model.assert_called_once()
-        args, kwargs = fake_ov.save_model.call_args
-        self.assertIs(args[0], fake_ov_model)
-        self.assertEqual(Path(temp_dir_name) / "openvino_image.xml", args[1])
-        self.assertFalse(kwargs["compress_to_fp16"])
+        self.assertEqual(2, fake_ov.save_model.call_count)
+        first_args, first_kwargs = fake_ov.save_model.call_args_list[0]
+        second_args, second_kwargs = fake_ov.save_model.call_args_list[1]
+        self.assertIs(first_args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino" / "openvino_image_fp16.xml", first_args[1])
+        self.assertTrue(first_kwargs["compress_to_fp16"])
+        self.assertIs(second_args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino_fp32" / "openvino_image_fp32.xml", second_args[1])
+        self.assertFalse(second_kwargs["compress_to_fp16"])
 
-    def test_convert_text_branch_saves_original_precision_ir(self) -> None:
+    def test_convert_text_branch_saves_fp16_mainline_and_fp32_reference_ir(self) -> None:
         fake_ov = Mock()
         fake_ov_model = object()
         fake_ov.convert_model.return_value = fake_ov_model
 
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            with patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)):
+            export_root = Path(temp_dir_name)
+            with (
+                patch.object(
+                    convert_module,
+                    "MAINLINE_EXPORTS",
+                    {"text": (export_root / "openvino" / "openvino_text_fp16.xml", True)},
+                ),
+                patch.object(
+                    convert_module,
+                    "REFERENCE_EXPORTS",
+                    {"text": (export_root / "openvino_fp32" / "openvino_text_fp32.xml", False)},
+                ),
+            ):
                 convert_module._convert_text_branch(
                     model=_FakeLoadedModel(),
                     ov=fake_ov,
@@ -370,11 +401,15 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
                 )
 
         fake_ov.convert_model.assert_called_once()
-        fake_ov.save_model.assert_called_once()
-        args, kwargs = fake_ov.save_model.call_args
-        self.assertIs(args[0], fake_ov_model)
-        self.assertEqual(Path(temp_dir_name) / "openvino_text.xml", args[1])
-        self.assertFalse(kwargs["compress_to_fp16"])
+        self.assertEqual(2, fake_ov.save_model.call_count)
+        first_args, first_kwargs = fake_ov.save_model.call_args_list[0]
+        second_args, second_kwargs = fake_ov.save_model.call_args_list[1]
+        self.assertIs(first_args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino" / "openvino_text_fp16.xml", first_args[1])
+        self.assertTrue(first_kwargs["compress_to_fp16"])
+        self.assertIs(second_args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino_fp32" / "openvino_text_fp32.xml", second_args[1])
+        self.assertFalse(second_kwargs["compress_to_fp16"])
 
 
 if __name__ == "__main__":

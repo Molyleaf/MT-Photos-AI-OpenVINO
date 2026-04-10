@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 PROJECT_ROOT = resolve_project_root()
 MODEL_BASE_PATH = resolve_model_base_path(PROJECT_ROOT)
-BASELINE_DIR = MODEL_BASE_PATH / "qa-clip" / "openvino"
-CANDIDATE_DIR = MODEL_BASE_PATH / "qa-clip" / "openvino-fp16"
+BASELINE_DIR = MODEL_BASE_PATH / "qa-clip" / "openvino_fp32"
+CANDIDATE_DIR = MODEL_BASE_PATH / "qa-clip" / "openvino"
 DEFAULT_REPORT_PATH = CANDIDATE_DIR / "precision_impact.json"
 DEFAULT_SAMPLE_COUNT = max(8, int(os.environ.get("QACLIP_PRECISION_IMPACT_SAMPLES", "12")))
 DEFAULT_MIN_FIDELITY = float(os.environ.get("QACLIP_FP16_MIN_FIDELITY", "0.995"))
@@ -61,15 +61,15 @@ def analyze_precision_impact(
 
     vision_report = evaluate_model_pair(
         ov=openvino_module,
-        baseline_model_path=resolved_baseline_dir / "openvino_image.xml",
-        candidate_model_path=resolved_candidate_dir / "openvino_image.xml",
+        baseline_model_path=resolved_baseline_dir / "openvino_image_fp32.xml",
+        candidate_model_path=resolved_candidate_dir / "openvino_image_fp16.xml",
         samples=build_synthetic_vision_samples(sample_count),
         device_name=device_name,
     )
     text_report = evaluate_model_pair(
         ov=openvino_module,
-        baseline_model_path=resolved_baseline_dir / "openvino_text.xml",
-        candidate_model_path=resolved_candidate_dir / "openvino_text.xml",
+        baseline_model_path=resolved_baseline_dir / "openvino_text_fp32.xml",
+        candidate_model_path=resolved_candidate_dir / "openvino_text_fp16.xml",
         samples=build_synthetic_text_samples(sample_count, token_upper_bound=token_upper_bound),
         device_name=device_name,
     )
@@ -106,9 +106,21 @@ def analyze_precision_impact(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate the precision impact of QA-CLIP FP16 OpenVINO IR.")
-    parser.add_argument("--baseline-dir", type=Path, default=BASELINE_DIR, help="Baseline FP32 IR directory.")
-    parser.add_argument("--candidate-dir", type=Path, default=CANDIDATE_DIR, help="Candidate FP16 IR directory.")
+    parser = argparse.ArgumentParser(
+        description="Compare QA-CLIP FP32 reference IR against the mainline FP16 OpenVINO IR."
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        type=Path,
+        default=BASELINE_DIR,
+        help="FP32 reference IR directory. Defaults to models/qa-clip/openvino_fp32.",
+    )
+    parser.add_argument(
+        "--candidate-dir",
+        type=Path,
+        default=CANDIDATE_DIR,
+        help="Mainline FP16 IR directory. Defaults to models/qa-clip/openvino.",
+    )
     parser.add_argument(
         "--report-path",
         type=Path,

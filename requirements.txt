@@ -1,3 +1,4 @@
+# QA-CLIP mainline IR lives in models/qa-clip/openvino/*_fp16 and the FP32 control group in models/qa-clip/openvino_fp32/*_fp32.
 numpy==2.3.5
 insightface==0.7.3
 fastapi

@@ -21,7 +21,7 @@
 - Windows 本地 CUDA Image-CLIP 并行子项目命令行入口：`image-clip/starter.py`；服务实现入口：`image-clip/app/server.py`；依赖文件为 `image-clip/requirement.txt`。
 - 模型编排：主服务使用 `app/models/`（入口 `app/models/runtime.py`，按 `clip_image.py`、`rapidocr_lib.py`、`insightface.py` 拆分）；独立 Text-CLIP 服务代码位于 `text-clip/app/models/`。
 - 模型转换：`scripts/convert.py`（QA-CLIP -> OpenVINO IR）。
-- 模型目录：`models/qa-clip/huggingface`、`models/qa-clip/openvino`、`models/insightface/models`。
+- 模型目录：`models/qa-clip/huggingface`、`models/qa-clip/openvino`、`models/qa-clip/openvino_fp32`、`models/insightface/models`。
 - Text-CLIP tokenizer 资源：`text-clip/app/models/QA-CLIP/clip`（保留 `bert_tokenizer.py` 与 `vocab.txt`）。
 - 配置存储：`app/config`。
 - 参考文件（对齐端点用）：`example/`。
@@ -69,11 +69,13 @@
   - 禁止在同一阶段同时常驻完整 PyTorch 模型副本 + 完整 OpenVINO 中间副本。
   - 视觉分支与文本分支按顺序转换，转换后及时释放前一阶段对象并 `gc.collect()`。
 - 本地 `models/qa-clip/huggingface` 与 `cache/huggingface` 默认都应被复用；只有本地 snapshot 和 cache 都缺失，或显式设置强制刷新环境变量时，才允许重新从 Hugging Face 拉取原始 FP32 模型。
-- 转换链路固定为顺序导出视觉分支与文本分支到 OpenVINO IR；禁止引入 NNCF、AWQ、AccuracyAwareQuantization、FP16 压缩、INT8/INT4 量化或任何手工改图/私有后处理。
-- 保存 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=False)`，保持原始精度与结构不变。
-- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`。
-- 如需评估 OpenVINO 原生 FP16 浮点压缩，只允许通过独立脚本 `scripts/convert_fp16.py` 基于原始 IR 额外生成实验性产物到 `models/qa-clip/openvino-fp16`；该产物不得替换主服务默认使用的 `models/qa-clip/openvino`。
-- `scripts/indicate_precision_impact.py` 只用于比较原始 IR 与实验性 FP16 IR 的 embedding 保真度、结构差异、低比特常量检查和文件体积变化，不得把它当作服务上线前自动改写模型的链路。
+- 转换链路固定为顺序导出视觉分支与文本分支到两套 OpenVINO IR：主线 `models/qa-clip/openvino/*_fp16` 使用 OpenVINO 原生 `compress_to_fp16=True`，对照组 `models/qa-clip/openvino_fp32/*_fp32` 保持 `compress_to_fp16=False`；禁止引入 NNCF、AWQ、AccuracyAwareQuantization、INT8/INT4 量化或任何手工改图/私有后处理。
+- 保存主线 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=True)`；保存 FP32 对照组 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=False)`。
+- OpenVINO IR 文件基线固定为：
+  - 主线：`models/qa-clip/openvino/openvino_image_fp16.xml` 与 `models/qa-clip/openvino/openvino_text_fp16.xml`
+  - 对照组：`models/qa-clip/openvino_fp32/openvino_image_fp32.xml` 与 `models/qa-clip/openvino_fp32/openvino_text_fp32.xml`
+- 仓库不再保留独立 `scripts/convert_fp16.py`；主线 FP16 与 FP32 对照组都必须由 `scripts/convert.py` 一次导出完成。
+- `scripts/indicate_precision_impact.py` 只用于比较 FP32 对照组与主线 FP16 IR 的 embedding 保真度、结构差异、低比特常量检查和文件体积变化，不得把它当作服务上线前自动改写模型的链路。
 
 ### 3.3 RapidOCR
 
@@ -290,7 +292,7 @@
 - `py -3.12 -m compileall text-clip/app`
 - `py -3.12 -m compileall scripts`
 - `py -3.12 -m compileall image-clip`
-- `py -3.12 scripts/convert_fp16.py`
+- `py -3.12 scripts/convert.py`
 - `py -3.12 scripts/indicate_precision_impact.py`
 - `cd image-clip && py -3.12 starter.py`
 - `py -3.12 scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
@@ -313,7 +315,7 @@
 - [ ] 若仍需要 tokenizer 资源，是否完全切换到 `text-clip/app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
-- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重快照/本地 cache 复用 + 仅做原始精度/结构的 IR 格式转换”
+- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重快照/本地 cache 复用 + 主线 `openvino/*_fp16` 与对照组 `openvino_fp32/*_fp32` 一次导出”
 - [ ] RapidOCR 是否为 `rapidocr==3.8.0`，且仅覆盖 `Det/Cls/Rec.engine_type=openvino`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP（仅推理）+ 原生 CPU 检测/识别预处理
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
@@ -356,7 +358,7 @@
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
-- 主服务镜像不再打包 `openvino_text.*`；这些文件仅应进入独立 Text-CLIP 镜像。
+- 主服务镜像不再打包 `openvino_text_fp16.*`；这些文件仅应进入独立 Text-CLIP 镜像。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - `docker-compose.example.yml` 只允许引用预构建镜像（`image:`）；禁止再保留运行时 `build:`。
@@ -459,7 +461,7 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | 环境变量 | 可选值 | 默认值 |
 |---|---|---|
 | `PROJECT_ROOT` | 项目根目录路径 | 自动探测 |
-| `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/huggingface` 与 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
+| `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/huggingface`、`qa-clip/openvino` 与 `qa-clip/openvino_fp32`） | `<PROJECT_ROOT>/models` |
 | `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径（脚本启动前会清理） | `<PROJECT_ROOT>/cache/openvino` |
 | `QACLIP_FORCE_CLEANUP_HF_CACHE` | 是否在脚本退出前强制删除 Hugging Face 缓存；Windows 默认关闭以规避 `.locks` 文件短暂占用 | `false`（Windows） |
@@ -467,6 +469,6 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `QACLIP_RESET_HF_CACHE` | 启动前是否清理 Hugging Face cache | `false` |
 | `QACLIP_RESET_HF_SNAPSHOT` | 启动前是否清理本地 Hugging Face snapshot | `false` |
 
-`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本只输出 QA-CLIP 原始精度/结构对应的 OpenVINO IR 文件，不会额外生成精度元数据。
+`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本会一次输出 QA-CLIP 主线 FP16 IR 到 `models/qa-clip/openvino/*_fp16`，并同时输出 FP32 对照组 IR 到 `models/qa-clip/openvino_fp32/*_fp32`。
 
-`scripts/convert_fp16.py` 默认读取 `models/qa-clip/openvino` 并输出到 `models/qa-clip/openvino-fp16`；`scripts/indicate_precision_impact.py` 默认比较这两个目录并输出 `models/qa-clip/openvino-fp16/precision_impact.json`。
+`scripts/indicate_precision_impact.py` 默认比较 `models/qa-clip/openvino_fp32` 与 `models/qa-clip/openvino`，并输出 `models/qa-clip/openvino/precision_impact.json`。
