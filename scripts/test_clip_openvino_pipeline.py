@@ -92,9 +92,7 @@ class _FakeLoadedModel:
         self.visual_projection = torch.nn.Identity()
         self.text_model = _FakeTextBackbone()
         self.text_projection = torch.nn.Identity()
-        self.config = types.SimpleNamespace(
-            text_config=types.SimpleNamespace(vocab_size=21128)
-        )
+        self.config = types.SimpleNamespace(text_config=types.SimpleNamespace(vocab_size=21128))
 
 
 class _SyntheticVisionModel(torch.nn.Module):
@@ -106,6 +104,22 @@ class _SyntheticVisionModel(torch.nn.Module):
         repeat_factor = math.ceil(convert_module.EMBEDDING_DIMS / features.shape[1])
         tiled = features.repeat(1, repeat_factor)
         return tiled[:, : convert_module.EMBEDDING_DIMS]
+
+
+class _WeightedSyntheticVisionModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.features = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=1),
+            torch.nn.GELU(),
+            torch.nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.head = torch.nn.Linear(8 * 4 * 4, convert_module.EMBEDDING_DIMS)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        features = self.features(pixel_values)
+        flattened = features.reshape(pixel_values.shape[0], -1)
+        return self.head(flattened)
 
 
 class ClipOpenvinoPipelineTests(unittest.TestCase):
@@ -260,19 +274,8 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
                     copy=True,
                 )[0]
 
-            base_black_cosine = self._cosine_similarity(embeddings["base"], embeddings["black"])
-            base_white_cosine = self._cosine_similarity(embeddings["base"], embeddings["white"])
-
-            self.assertLess(
-                base_black_cosine,
-                0.9,
-                f"base/black cosine unexpectedly high: {base_black_cosine}",
-            )
-            self.assertLess(
-                base_white_cosine,
-                0.9,
-                f"base/white cosine unexpectedly high: {base_white_cosine}",
-            )
+            self.assertLess(self._cosine_similarity(embeddings["base"], embeddings["black"]), 0.9)
+            self.assertLess(self._cosine_similarity(embeddings["base"], embeddings["white"]), 0.9)
         finally:
             if runner is not None:
                 runner.release()
@@ -291,108 +294,139 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
         collapsed = np.repeat(reference[:1], repeats=3, axis=0)
         healthy = reference.copy()
 
-        collapsed_score = convert_module._embedding_fidelity_score(reference, collapsed)
-        healthy_score = convert_module._embedding_fidelity_score(reference, healthy)
-
         self.assertTrue(convert_module._is_representation_collapsed(collapsed))
         self.assertFalse(convert_module._is_representation_collapsed(healthy))
-        self.assertLess(collapsed_score, 0.1)
-        self.assertGreater(healthy_score, 0.99)
+        self.assertLess(convert_module._embedding_fidelity_score(reference, collapsed), 0.1)
+        self.assertGreater(convert_module._embedding_fidelity_score(reference, healthy), 0.99)
 
-    def test_optimize_and_save_model_skips_collapsed_candidate_and_allows_fp16(self) -> None:
-        reference_embeddings = np.asarray(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        aggressive_candidate = convert_module.CompressionCandidate(
-            name="int4_asym_0_75",
-            weight_mode="INT4_ASYM",
-            weight_ratio=0.75,
-        )
-        fallback_candidate = convert_module.CompressionCandidate(
-            name="int4_sym_0_5",
-            weight_mode="INT4_SYM",
-            weight_ratio=0.5,
-        )
-
-        fake_nncf = types.SimpleNamespace(
-            Dataset=lambda samples, transform_fn: {"samples": list(samples), "transform_fn": transform_fn},
-            CompressWeightsMode=types.SimpleNamespace(INT4_ASYM="INT4_ASYM", INT4_SYM="INT4_SYM"),
-            BackupMode=types.SimpleNamespace(INT8_ASYM="INT8_ASYM"),
-            DropType=types.SimpleNamespace(ABSOLUTE="ABSOLUTE"),
-            QuantizationPreset=types.SimpleNamespace(MIXED="MIXED"),
-            ModelType=types.SimpleNamespace(TRANSFORMER="TRANSFORMER"),
-        )
-
-        def _fake_compress_weights(model: object, **kwargs: object) -> dict[str, object]:
-            return {"model": model, "ratio": kwargs["ratio"], "kwargs": kwargs}
-
-        def _fake_quantize(compressed_model: dict[str, object], **kwargs: object) -> types.SimpleNamespace:
-            return types.SimpleNamespace(weight_ratio=compressed_model["ratio"], kwargs=kwargs)
-
-        fake_nncf.compress_weights = Mock(side_effect=_fake_compress_weights)
-        fake_nncf.quantize_with_accuracy_control = Mock(side_effect=_fake_quantize)
-
-        fake_core = Mock()
-        fake_core.read_model.side_effect = lambda model_path: {"path": str(model_path)}
-        fake_ov = Mock()
-        fake_ov.Core.return_value = fake_core
-        fake_ov.save_model = Mock()
-
-        def _fake_infer_embeddings(*args: object, **kwargs: object) -> np.ndarray:
-            model = kwargs.get("model")
-            if model is None and len(args) >= 2:
-                model = args[1]
-            weight_ratio = getattr(model, "weight_ratio", None)
-            if weight_ratio is None:
-                return reference_embeddings
-            if weight_ratio >= 0.75:
-                return np.repeat(reference_embeddings[:1], repeats=3, axis=0)
-            return reference_embeddings
+    def test_load_hf_model_prefers_existing_local_snapshot(self) -> None:
+        fake_model = Mock()
+        fake_model.eval = Mock()
+        auto_model_cls = Mock()
+        auto_model_cls.from_pretrained.return_value = fake_model
 
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            metadata_path = Path(temp_dir_name) / "openvino_image.compression.json"
+            snapshot_path = Path(temp_dir_name) / "huggingface"
+            snapshot_path.mkdir(parents=True, exist_ok=True)
+            (snapshot_path / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot_path / "model.safetensors").write_bytes(b"stub")
+            with patch.object(convert_module, "HF_SAVE_PATH", snapshot_path):
+                model, source = convert_module._load_hf_model(auto_model_cls)
+
+        self.assertIs(model, fake_model)
+        self.assertEqual("local_snapshot", source)
+        auto_model_cls.from_pretrained.assert_called_once()
+        self.assertEqual(str(snapshot_path), auto_model_cls.from_pretrained.call_args.args[0])
+        self.assertTrue(auto_model_cls.from_pretrained.call_args.kwargs["local_files_only"])
+        self.assertFalse(auto_model_cls.from_pretrained.call_args.kwargs["force_download"])
+        fake_model.eval.assert_called_once()
+
+    def test_load_hf_model_uses_local_cache_before_remote(self) -> None:
+        fake_model = Mock()
+        fake_model.eval = Mock()
+        auto_model_cls = Mock()
+        auto_model_cls.from_pretrained.return_value = fake_model
+
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            snapshot_path = Path(temp_dir_name) / "missing_snapshot"
+            cache_path = Path(temp_dir_name) / "cache"
+            cache_path.mkdir(parents=True, exist_ok=True)
             with (
-                patch.object(convert_module, "_build_validation_context", return_value=(reference_embeddings, Mock())),
-                patch.object(convert_module, "_infer_embeddings", side_effect=_fake_infer_embeddings),
-                patch.object(convert_module, "_parse_weight_candidates", return_value=(aggressive_candidate, fallback_candidate)),
-                patch.object(convert_module, "_fp16_compression_enabled", return_value=True),
+                patch.object(convert_module, "HF_SAVE_PATH", snapshot_path),
+                patch.object(convert_module, "CACHE_PATH", cache_path),
             ):
-                convert_module._optimize_and_save_model(
+                _, source = convert_module._load_hf_model(auto_model_cls)
+
+        self.assertEqual("local_cache", source)
+        auto_model_cls.from_pretrained.assert_called_once()
+        self.assertEqual(convert_module.MODEL_ID, auto_model_cls.from_pretrained.call_args.args[0])
+        self.assertEqual(str(cache_path), auto_model_cls.from_pretrained.call_args.kwargs["cache_dir"])
+        self.assertTrue(auto_model_cls.from_pretrained.call_args.kwargs["local_files_only"])
+        self.assertFalse(auto_model_cls.from_pretrained.call_args.kwargs["force_download"])
+
+    def test_reset_conversion_artifacts_preserves_hf_cache_and_snapshot_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            root = Path(temp_dir_name)
+            ov_path = root / "openvino"
+            hf_path = root / "huggingface"
+            cache_path = root / "cache"
+            ov_cache_path = root / "ov_cache"
+            for path in (ov_path, hf_path, cache_path, ov_cache_path):
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "sentinel.txt").write_text("sentinel", encoding="utf-8")
+
+            with (
+                patch.object(convert_module, "OV_SAVE_PATH", ov_path),
+                patch.object(convert_module, "HF_SAVE_PATH", hf_path),
+                patch.object(convert_module, "CACHE_PATH", cache_path),
+                patch.object(convert_module, "OPENVINO_CACHE_PATH", ov_cache_path),
+            ):
+                convert_module._reset_conversion_artifacts()
+
+            self.assertFalse((ov_path / "sentinel.txt").exists())
+            self.assertFalse((ov_cache_path / "sentinel.txt").exists())
+            self.assertTrue((hf_path / "sentinel.txt").exists())
+            self.assertTrue((cache_path / "sentinel.txt").exists())
+
+    def test_precision_summary_reports_fp16_without_low_bit_quantization(self) -> None:
+        model = _WeightedSyntheticVisionModel().eval()
+        ov_model = ov.convert_model(
+            model,
+            example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            model_path = Path(temp_dir_name) / "synthetic_fp16.xml"
+            ov.save_model(ov_model, model_path, compress_to_fp16=True)
+            summary = convert_module._summarize_model_precision(ov=ov, model_path=model_path)
+
+        self.assertGreater(summary["constant_type_counts"].get("f16", 0), 0)
+        self.assertEqual({}, summary["low_bit_constant_type_counts"])
+        self.assertIn("f32", summary["output_type_names"])
+
+    def test_export_branch_models_saves_fp16_and_writes_precision_metadata(self) -> None:
+        model = _WeightedSyntheticVisionModel().eval()
+        ov_model = ov.convert_model(
+            model,
+            example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
+        )
+        validation_samples = convert_module._build_synthetic_vision_samples(8)
+
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            output_model_path = Path(temp_dir_name) / "openvino_image.xml"
+            metadata_path = Path(temp_dir_name) / "openvino_image.precision.json"
+            with (
+                patch.object(convert_module, "_fp16_compression_enabled", return_value=True),
+                patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)),
+            ):
+                convert_module._export_branch_models(
                     branch_name="vision",
-                    baseline_model_path=Path(temp_dir_name) / "baseline.xml",
-                    output_model_path=Path(temp_dir_name) / "openvino_image.xml",
+                    ov_model=ov_model,
+                    final_model_path=output_model_path,
                     metadata_path=metadata_path,
-                    calibration_samples=(np.zeros((1, 3, 4, 4), dtype=np.float32),),
-                    validation_samples=(np.zeros((1, 3, 4, 4), dtype=np.float32),),
-                    ov=fake_ov,
-                    nncf=fake_nncf,
+                    validation_samples=validation_samples,
+                    ov=ov,
+                    export_context={
+                        "requested_torch_device": "AUTO",
+                        "warmup_torch_device": "CPU",
+                        "openvino_conversion_device": "CPU",
+                    },
                 )
 
-            self.assertEqual(2, fake_nncf.compress_weights.call_count)
-            first_compress_call = fake_nncf.compress_weights.call_args_list[0]
-            self.assertFalse(first_compress_call.kwargs["all_layers"])
-            self.assertTrue(first_compress_call.kwargs["awq"])
-            self.assertTrue(first_compress_call.kwargs["scale_estimation"])
-            self.assertLess(first_compress_call.kwargs["ratio"], 1.0)
-            self.assertEqual("INT8_ASYM", first_compress_call.kwargs["backup_mode"])
-
-            first_quantize_call = fake_nncf.quantize_with_accuracy_control.call_args_list[0]
-            self.assertEqual("MIXED", first_quantize_call.kwargs["preset"])
-            self.assertEqual("TRANSFORMER", first_quantize_call.kwargs["model_type"])
-
-            fake_ov.save_model.assert_called_once()
-            self.assertTrue(fake_ov.save_model.call_args.kwargs["compress_to_fp16"])
-
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual("int4_sym_0_5", metadata["selected_candidate"]["name"])
+            self.assertEqual("fp16_weights_fp32_compute", metadata["conversion_policy"])
             self.assertTrue(metadata["compress_to_fp16"])
-            self.assertTrue(metadata["candidate_evaluations"][0]["representation_collapsed"])
-            self.assertTrue(metadata["candidate_evaluations"][1]["selected"])
+            self.assertFalse(metadata["representation_collapsed"])
+            self.assertEqual({}, metadata["exported_precision_summary"]["low_bit_constant_type_counts"])
+            self.assertGreater(metadata["fidelity_score"], 0.99)
+            self.assertIn("f16", metadata["exported_precision_summary"]["constant_type_counts"])
+
+    def test_resolve_torch_export_device_prefers_cuda_when_available(self) -> None:
+        with patch.object(torch.cuda, "is_available", return_value=True):
+            device, requested = convert_module._resolve_torch_export_device(torch)
+
+        self.assertEqual("cuda", device.type)
+        self.assertEqual("AUTO", requested)
 
 
 if __name__ == "__main__":

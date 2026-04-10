@@ -1,12 +1,10 @@
 import gc
-import inspect
 import json
 import logging
 import os
 import shutil
 import tempfile
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence, Tuple
 
@@ -21,17 +19,11 @@ INPUT_RESOLUTION = 224
 CONTEXT_LENGTH = 77
 CLIP_IMAGE_MEAN = np.asarray((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
 CLIP_IMAGE_STD = np.asarray((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
-DEFAULT_WEIGHT_CANDIDATES = "INT4_ASYM:0.75,INT4_SYM:0.75,INT4_ASYM:0.5,INT4_SYM:0.5"
-CALIBRATION_SAMPLE_COUNT = max(8, int(os.environ.get("QACLIP_CALIBRATION_SAMPLES", "16")))
 VALIDATION_SAMPLE_COUNT = max(8, int(os.environ.get("QACLIP_VALIDATION_SAMPLES", "12")))
-WEIGHT_SUBSET_SIZE = max(8, int(os.environ.get("QACLIP_WEIGHT_SUBSET_SIZE", "32")))
-QUANTIZATION_SUBSET_SIZE = max(8, int(os.environ.get("QACLIP_QUANTIZATION_SUBSET_SIZE", "32")))
-MAX_ACCURACY_DROP = float(os.environ.get("QACLIP_MAX_ACCURACY_DROP", "0.01"))
 MIN_FIDELITY_SCORE = float(os.environ.get("QACLIP_MIN_FIDELITY_SCORE", "0.985"))
-WEIGHT_GROUP_SIZE = int(os.environ.get("QACLIP_WEIGHT_GROUP_SIZE", "128"))
-WEIGHT_COMPRESSION_BACKUP_MODE = os.environ.get("QACLIP_WEIGHT_BACKUP_MODE", "INT8_ASYM").upper()
 COLLAPSE_SIMILARITY_THRESHOLD = float(os.environ.get("QACLIP_COLLAPSE_SIMILARITY_THRESHOLD", "0.999"))
 COLLAPSE_RANK_THRESHOLD = max(2, int(os.environ.get("QACLIP_COLLAPSE_RANK_THRESHOLD", "2")))
+LOW_BIT_CONSTANT_TYPES = frozenset({"i4", "u4", "i8", "u8"})
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -54,60 +46,6 @@ def _resolve_project_root() -> Path:
     return convert_dir.parent
 
 
-@dataclass(frozen=True)
-class CompressionCandidate:
-    name: str
-    weight_mode: str
-    weight_ratio: float
-    backup_mode: str = WEIGHT_COMPRESSION_BACKUP_MODE
-    group_size: int = WEIGHT_GROUP_SIZE
-    all_layers: bool = False
-    awq: bool = True
-    scale_estimation: bool = True
-    quantization_preset: str = "MIXED"
-
-    @property
-    def estimated_weight_bits(self) -> float:
-        primary_bits = 4.0 if "INT4" in self.weight_mode else 8.0
-        backup_bits = 8.0 if "INT8" in self.backup_mode else 32.0
-        return (self.weight_ratio * primary_bits) + ((1.0 - self.weight_ratio) * backup_bits)
-
-
-@dataclass
-class CandidateEvaluation:
-    name: str
-    weight_mode: str
-    weight_ratio: float
-    backup_mode: str
-    estimated_weight_bits: float
-    fidelity_score: float
-    representation_collapsed: bool
-    selected: bool = False
-    error: str | None = None
-
-    @classmethod
-    def from_candidate(
-        cls,
-        candidate: CompressionCandidate,
-        *,
-        fidelity_score: float,
-        representation_collapsed: bool,
-        selected: bool = False,
-        error: str | None = None,
-    ) -> "CandidateEvaluation":
-        return cls(
-            name=candidate.name,
-            weight_mode=candidate.weight_mode,
-            weight_ratio=candidate.weight_ratio,
-            backup_mode=candidate.backup_mode,
-            estimated_weight_bits=candidate.estimated_weight_bits,
-            fidelity_score=fidelity_score,
-            representation_collapsed=representation_collapsed,
-            selected=selected,
-            error=error,
-        )
-
-
 PROJECT_ROOT = _resolve_project_root()
 MODEL_BASE_PATH = Path(os.environ.get("MODEL_PATH", str(PROJECT_ROOT / "models")))
 OV_SAVE_PATH = MODEL_BASE_PATH / "qa-clip" / "openvino"
@@ -124,19 +62,18 @@ def _prepare_hf_cache_env() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
-def _import_conversion_dependencies() -> Tuple[Any, Any, Any, Any, Any]:
+def _import_conversion_dependencies() -> Tuple[Any, Any, Any, Any]:
     try:
         import openvino as ov
-        import nncf
         import torch
         import torch.nn as nn
         from transformers import AutoModel
     except ImportError as exc:
-        install_cmd = "pip install openvino nncf torch transformers"
+        install_cmd = "pip install openvino torch transformers"
         logging.error("Missing conversion dependencies. Install manually with: %s", install_cmd)
         raise SystemExit(1) from exc
 
-    return ov, nncf, torch, nn, AutoModel
+    return ov, torch, nn, AutoModel
 
 
 def _remove_path(path: Path) -> None:
@@ -151,19 +88,22 @@ def _remove_path(path: Path) -> None:
 
 
 def _reset_conversion_artifacts() -> None:
-    for path in (CACHE_PATH, OPENVINO_CACHE_PATH, HF_SAVE_PATH, OV_SAVE_PATH):
+    removable_paths = [OPENVINO_CACHE_PATH, OV_SAVE_PATH]
+    if _env_flag("QACLIP_RESET_HF_SNAPSHOT", False):
+        removable_paths.append(HF_SAVE_PATH)
+    if _env_flag("QACLIP_RESET_HF_CACHE", False):
+        removable_paths.append(CACHE_PATH)
+
+    for path in removable_paths:
         _remove_path(path)
 
     OV_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     HF_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+    CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 def _cleanup_hf_cache() -> None:
-    if os.name == "nt" and not _env_flag("QACLIP_FORCE_CLEANUP_HF_CACHE", False):
-        logging.info(
-            "Skipping in-process Hugging Face cache cleanup on Windows. "
-            "huggingface_hub may keep .locks handles briefly; the next run will clean it at startup."
-        )
+    if not _env_flag("QACLIP_FORCE_CLEANUP_HF_CACHE", False):
         return
 
     gc.collect()
@@ -182,19 +122,71 @@ def _cleanup_hf_cache() -> None:
             time.sleep(0.5 * (attempt + 1))
 
 
-def _load_hf_model(auto_model_cls: Any) -> Any:
-    logging.info("Loading model from Hugging Face: %s", MODEL_ID)
+def _snapshot_is_populated(snapshot_path: Path) -> bool:
+    if not snapshot_path.exists():
+        return False
+    if not (snapshot_path / "config.json").exists():
+        return False
+    direct_weight_files = {
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    }
+    if any((snapshot_path / file_name).exists() for file_name in direct_weight_files):
+        return True
+    if any(snapshot_path.glob("model-*.safetensors")):
+        return True
+    if any(snapshot_path.glob("pytorch_model-*.bin")):
+        return True
+    return False
+
+
+def _load_hf_model(auto_model_cls: Any) -> tuple[Any, str]:
+    if _snapshot_is_populated(HF_SAVE_PATH) and not _env_flag("QACLIP_FORCE_HF_DOWNLOAD", False):
+        logging.info("Loading model from local snapshot: %s", HF_SAVE_PATH)
+        model = auto_model_cls.from_pretrained(
+            str(HF_SAVE_PATH),
+            local_files_only=True,
+            force_download=False,
+        )
+        model.eval()
+        return model, "local_snapshot"
+
+    if not _env_flag("QACLIP_FORCE_HF_DOWNLOAD", False):
+        try:
+            logging.info("Loading model from local Hugging Face cache: %s", CACHE_PATH)
+            model = auto_model_cls.from_pretrained(
+                MODEL_ID,
+                cache_dir=str(CACHE_PATH),
+                local_files_only=True,
+                force_download=False,
+            )
+            model.eval()
+            return model, "local_cache"
+        except OSError:
+            logging.info("Local Hugging Face cache miss detected. Falling back to remote download.")
+
+    logging.info("Loading model from Hugging Face Hub: %s", MODEL_ID)
     model = auto_model_cls.from_pretrained(
         MODEL_ID,
         cache_dir=str(CACHE_PATH),
-        force_download=True,
+        force_download=False,
+        local_files_only=False,
     )
     model.eval()
-    return model
+    return model, "remote"
 
 
-def _export_hf_snapshot(model: Any) -> None:
-    logging.info("Saving original Hugging Face model snapshot to %s", HF_SAVE_PATH)
+def _export_hf_snapshot(model: Any, load_source: str) -> None:
+    if load_source == "local_snapshot" and _snapshot_is_populated(HF_SAVE_PATH):
+        logging.info("Local Hugging Face snapshot already present, skipping save_pretrained.")
+        return
+    if _snapshot_is_populated(HF_SAVE_PATH) and not _env_flag("QACLIP_OVERWRITE_HF_SNAPSHOT", False):
+        logging.info("Hugging Face snapshot already present, keeping existing files at %s", HF_SAVE_PATH)
+        return
+
+    logging.info("Saving Hugging Face model snapshot to %s", HF_SAVE_PATH)
     model.save_pretrained(HF_SAVE_PATH, safe_serialization=True)
 
 
@@ -202,40 +194,83 @@ def _fp16_compression_enabled() -> bool:
     return _env_flag("QACLIP_SAVE_FP16", True)
 
 
-def _parse_weight_candidates() -> tuple[CompressionCandidate, ...]:
-    raw_candidates = os.environ.get("QACLIP_WEIGHT_CANDIDATES", DEFAULT_WEIGHT_CANDIDATES)
-    candidates: list[CompressionCandidate] = []
-    for raw_item in raw_candidates.split(","):
-        item = raw_item.strip()
-        if not item:
-            continue
-        parts = item.split(":")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid QACLIP_WEIGHT_CANDIDATES item: {item}")
-        weight_mode = parts[0].strip().upper()
-        weight_ratio = float(parts[1].strip())
-        if not 0.0 < weight_ratio < 1.0:
-            raise ValueError(f"QACLIP weight ratio must be in (0, 1): {item}")
-        candidates.append(
-            CompressionCandidate(
-                name=f"{weight_mode.lower()}_{str(weight_ratio).replace('.', '_')}",
-                weight_mode=weight_mode,
-                weight_ratio=weight_ratio,
-            )
+def _resolve_torch_export_device(torch: Any) -> tuple[Any, str]:
+    requested_device = os.environ.get("QACLIP_TORCH_DEVICE", "AUTO").strip().upper()
+    if requested_device not in {"AUTO", "CPU", "CUDA"}:
+        raise ValueError(f"Unsupported QACLIP_TORCH_DEVICE: {requested_device}")
+
+    if requested_device == "CPU":
+        return torch.device("cpu"), requested_device
+
+    if torch.cuda.is_available():
+        return torch.device("cuda"), requested_device
+
+    if requested_device == "CUDA":
+        logging.warning("QACLIP_TORCH_DEVICE=CUDA requested but CUDA is unavailable. Falling back to CPU.")
+
+    return torch.device("cpu"), requested_device
+
+
+def _move_torch_inputs_to_device(example_input: Any, device: Any) -> Any:
+    if isinstance(example_input, dict):
+        return {key: value.to(device) for key, value in example_input.items()}
+    if isinstance(example_input, (tuple, list)):
+        moved = [value.to(device) for value in example_input]
+        return tuple(moved) if isinstance(example_input, tuple) else moved
+    return example_input.to(device)
+
+
+def _run_torch_forward(module: Any, example_input: Any) -> Any:
+    if isinstance(example_input, dict):
+        return module(**example_input)
+    if isinstance(example_input, (tuple, list)):
+        return module(*example_input)
+    return module(example_input)
+
+
+def _cleanup_torch_cuda(torch: Any) -> None:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _prepare_module_for_openvino_export(
+    *,
+    branch_name: str,
+    module: Any,
+    example_input: Any,
+    torch: Any,
+) -> tuple[Any, Any, dict[str, str]]:
+    export_device, requested_device = _resolve_torch_export_device(torch)
+    warmup_device = "CPU"
+
+    if export_device.type == "cuda":
+        logging.info(
+            "Attempting CUDA warmup for %s branch before OpenVINO conversion. requested_device=%s",
+            branch_name,
+            requested_device,
         )
-    if not candidates:
-        raise ValueError("QACLIP_WEIGHT_CANDIDATES resolved to an empty candidate set")
-    return tuple(sorted(candidates, key=lambda candidate: candidate.estimated_weight_bits))
+        try:
+            module = module.to(export_device)
+            example_input = _move_torch_inputs_to_device(example_input, export_device)
+            with torch.inference_mode():
+                _run_torch_forward(module, example_input)
+            warmup_device = "CUDA"
+        except Exception as exc:
+            logging.warning(
+                "CUDA warmup for %s branch failed, falling back to CPU-only export: %s",
+                branch_name,
+                exc,
+            )
+        finally:
+            module = module.to("cpu")
+            example_input = _move_torch_inputs_to_device(example_input, torch.device("cpu"))
+            _cleanup_torch_cuda(torch)
 
-
-def _resolve_enum(nncf: Any, enum_group_name: str, value_name: str) -> Any:
-    enum_group = getattr(nncf, enum_group_name, None)
-    if enum_group is None:
-        raise AttributeError(f"nncf missing enum group: {enum_group_name}")
-    try:
-        return getattr(enum_group, value_name)
-    except AttributeError as exc:
-        raise AttributeError(f"nncf missing enum value: {enum_group_name}.{value_name}") from exc
+    return module, example_input, {
+        "requested_torch_device": requested_device,
+        "warmup_torch_device": warmup_device,
+        "openvino_conversion_device": "CPU",
+    }
 
 
 def _normalize_clip_rgb(rgb_image: np.ndarray) -> np.ndarray:
@@ -284,28 +319,8 @@ def _build_synthetic_text_samples(
         input_ids[0, 0] = 101 % valid_vocab_size
         input_ids[0, sequence_length - 1] = 102 % valid_vocab_size
         attention_mask[0, :sequence_length] = 1
-        samples.append(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            }
-        )
+        samples.append({"input_ids": input_ids, "attention_mask": attention_mask})
     return tuple(samples)
-
-
-def _build_nncf_dataset(nncf: Any, samples: Sequence[Any]) -> Any:
-    dataset_ctor = nncf.Dataset
-    identity_transform = lambda sample: sample
-    try:
-        parameters = inspect.signature(dataset_ctor).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-
-    if "transform_func" in parameters:
-        return dataset_ctor(list(samples), transform_func=identity_transform)
-    if "transform_fn" in parameters:
-        return dataset_ctor(list(samples), transform_fn=identity_transform)
-    return dataset_ctor(list(samples), identity_transform)
 
 
 def _normalized_embeddings(embeddings: np.ndarray) -> np.ndarray:
@@ -318,8 +333,7 @@ def _is_representation_collapsed(embeddings: np.ndarray) -> bool:
     normalized = _normalized_embeddings(embeddings)
     if normalized.shape[0] < 2:
         return False
-    matrix_rank = np.linalg.matrix_rank(normalized, tol=1e-3)
-    if matrix_rank < COLLAPSE_RANK_THRESHOLD:
+    if np.linalg.matrix_rank(normalized, tol=1e-3) < COLLAPSE_RANK_THRESHOLD:
         return True
     similarity_matrix = normalized @ normalized.T
     off_diagonal = similarity_matrix[~np.eye(similarity_matrix.shape[0], dtype=bool)]
@@ -381,166 +395,134 @@ def _infer_embeddings(ov: Any, model: Any, samples: Sequence[Any]) -> np.ndarray
     return np.stack(embeddings, axis=0)
 
 
-def _build_validation_context(
-    *,
-    ov: Any,
-    baseline_model_path: Path,
-    validation_samples: Sequence[Any],
-) -> tuple[np.ndarray, Any]:
-    baseline_model = ov.Core().read_model(str(baseline_model_path))
-    reference_embeddings = _infer_embeddings(ov=ov, model=baseline_model, samples=validation_samples)
-    del baseline_model
+def _element_type_name(element_type: Any) -> str:
+    if hasattr(element_type, "get_type_name"):
+        return str(element_type.get_type_name()).lower()
+    return str(element_type).lower().replace("<type:", "").replace(">", "").strip()
+
+
+def _summarize_model_precision(ov: Any, model_path: Path) -> dict[str, Any]:
+    model = ov.Core().read_model(str(model_path))
+    constant_type_counts: dict[str, int] = {}
+    for operation in model.get_ops():
+        if operation.get_type_name() != "Constant":
+            continue
+        element_type_name = _element_type_name(operation.output(0).get_element_type())
+        constant_type_counts[element_type_name] = constant_type_counts.get(element_type_name, 0) + 1
+
+    low_bit_constant_type_counts = {
+        key: value for key, value in constant_type_counts.items() if key in LOW_BIT_CONSTANT_TYPES
+    }
+    summary = {
+        "constant_type_counts": constant_type_counts,
+        "input_type_names": sorted({_element_type_name(input_port.get_element_type()) for input_port in model.inputs}),
+        "output_type_names": sorted({_element_type_name(output_port.get_element_type()) for output_port in model.outputs}),
+        "low_bit_constant_type_counts": low_bit_constant_type_counts,
+    }
+    del model
     gc.collect()
-
-    def _validation_fn(model: Any, _: Any) -> tuple[float, None]:
-        candidate_embeddings = _infer_embeddings(ov=ov, model=model, samples=validation_samples)
-        return _embedding_fidelity_score(reference_embeddings, candidate_embeddings), None
-
-    return reference_embeddings, _validation_fn
+    return summary
 
 
-def _write_compression_metadata(metadata_path: Path, payload: dict[str, Any]) -> None:
-    metadata_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    logging.info("Compression metadata saved to %s", metadata_path)
-
-
-def _optimize_and_save_model(
+def _validate_exported_branch_model(
     *,
     branch_name: str,
     baseline_model_path: Path,
     output_model_path: Path,
-    metadata_path: Path,
-    calibration_samples: Sequence[Any],
     validation_samples: Sequence[Any],
     ov: Any,
-    nncf: Any,
-) -> None:
-    core = ov.Core()
-    reference_embeddings, validation_fn = _build_validation_context(
-        ov=ov,
-        baseline_model_path=baseline_model_path,
-        validation_samples=validation_samples,
-    )
-    calibration_dataset = _build_nncf_dataset(nncf, calibration_samples)
-    validation_dataset = _build_nncf_dataset(nncf, validation_samples)
-    candidate_evaluations: list[CandidateEvaluation] = []
-    selected_model = None
-    selected_candidate = None
-    selected_fidelity_score = None
-
-    for candidate in _parse_weight_candidates():
-        logging.info(
-            "Evaluating %s candidate: mode=%s ratio=%.2f backup=%s estimated_weight_bits=%.2f",
-            branch_name,
-            candidate.weight_mode,
-            candidate.weight_ratio,
-            candidate.backup_mode,
-            candidate.estimated_weight_bits,
-        )
-        model = core.read_model(str(baseline_model_path))
-        compressed_model = None
-        quantized_model = None
-        try:
-            compressed_model = nncf.compress_weights(
-                model,
-                mode=_resolve_enum(nncf, "CompressWeightsMode", candidate.weight_mode),
-                ratio=candidate.weight_ratio,
-                group_size=candidate.group_size,
-                all_layers=candidate.all_layers,
-                dataset=calibration_dataset,
-                subset_size=min(WEIGHT_SUBSET_SIZE, len(calibration_samples)),
-                awq=candidate.awq,
-                scale_estimation=candidate.scale_estimation,
-                backup_mode=_resolve_enum(nncf, "BackupMode", candidate.backup_mode),
-            )
-            quantized_model = nncf.quantize_with_accuracy_control(
-                compressed_model,
-                calibration_dataset=calibration_dataset,
-                validation_dataset=validation_dataset,
-                validation_fn=validation_fn,
-                max_drop=MAX_ACCURACY_DROP,
-                drop_type=_resolve_enum(nncf, "DropType", "ABSOLUTE"),
-                preset=_resolve_enum(nncf, "QuantizationPreset", candidate.quantization_preset),
-                model_type=_resolve_enum(nncf, "ModelType", "TRANSFORMER"),
-                subset_size=min(QUANTIZATION_SUBSET_SIZE, len(calibration_samples)),
-                fast_bias_correction=False,
-            )
-            candidate_embeddings = _infer_embeddings(ov=ov, model=quantized_model, samples=validation_samples)
-            fidelity_score = _embedding_fidelity_score(reference_embeddings, candidate_embeddings)
-            collapsed = _is_representation_collapsed(candidate_embeddings)
-            evaluation = CandidateEvaluation.from_candidate(
-                candidate,
-                fidelity_score=fidelity_score,
-                representation_collapsed=collapsed,
-            )
-            candidate_evaluations.append(evaluation)
-            if not collapsed and fidelity_score >= MIN_FIDELITY_SCORE:
-                evaluation.selected = True
-                selected_model = quantized_model
-                selected_candidate = candidate
-                selected_fidelity_score = fidelity_score
-                break
-        except Exception as exc:
-            candidate_evaluations.append(
-                CandidateEvaluation.from_candidate(
-                    candidate,
-                    fidelity_score=0.0,
-                    representation_collapsed=True,
-                    error=str(exc),
-                )
-            )
-            logging.warning("Candidate %s failed for %s branch: %s", candidate.name, branch_name, exc)
-        finally:
-            if quantized_model is not None and quantized_model is not selected_model:
-                del quantized_model
-            if compressed_model is not None:
-                del compressed_model
-            del model
-            gc.collect()
-
-    if selected_model is None or selected_candidate is None or selected_fidelity_score is None:
-        raise RuntimeError(
-            f"{branch_name} branch could not satisfy fidelity>={MIN_FIDELITY_SCORE:.4f} "
-            f"with max_drop<={MAX_ACCURACY_DROP:.4f}; refusing to export a collapsed model"
-        )
-
-    compress_to_fp16 = _fp16_compression_enabled()
-    ov.save_model(selected_model, output_model_path, compress_to_fp16=compress_to_fp16)
-    _write_compression_metadata(
-        metadata_path,
-        {
-            "branch_name": branch_name,
-            "model_id": MODEL_ID,
-            "baseline_model_path": str(baseline_model_path),
-            "output_model_path": str(output_model_path),
-            "compress_to_fp16": compress_to_fp16,
-            "max_accuracy_drop": MAX_ACCURACY_DROP,
-            "min_fidelity_score": MIN_FIDELITY_SCORE,
-            "calibration_sample_count": len(calibration_samples),
-            "validation_sample_count": len(validation_samples),
-            "selected_candidate": asdict(selected_candidate),
-            "selected_fidelity_score": selected_fidelity_score,
-            "candidate_evaluations": [asdict(item) for item in candidate_evaluations],
-        },
-    )
-    logging.info(
-        "%s branch saved to %s using candidate %s with fidelity %.6f",
-        branch_name,
-        output_model_path,
-        selected_candidate.name,
-        selected_fidelity_score,
-    )
-
-    del selected_model
-    del core
+) -> dict[str, Any]:
+    baseline_model = ov.Core().read_model(str(baseline_model_path))
+    exported_model = ov.Core().read_model(str(output_model_path))
+    baseline_embeddings = _infer_embeddings(ov=ov, model=baseline_model, samples=validation_samples)
+    exported_embeddings = _infer_embeddings(ov=ov, model=exported_model, samples=validation_samples)
+    fidelity_score = _embedding_fidelity_score(baseline_embeddings, exported_embeddings)
+    representation_collapsed = _is_representation_collapsed(exported_embeddings)
+    precision_summary = _summarize_model_precision(ov=ov, model_path=output_model_path)
+    del baseline_model
+    del exported_model
     gc.collect()
 
+    if precision_summary["low_bit_constant_type_counts"]:
+        raise RuntimeError(
+            f"{branch_name} branch exported low-bit constants unexpectedly: "
+            f"{precision_summary['low_bit_constant_type_counts']}"
+        )
+    if representation_collapsed:
+        raise RuntimeError(f"{branch_name} branch representation collapsed after export")
+    if fidelity_score < MIN_FIDELITY_SCORE:
+        raise RuntimeError(
+            f"{branch_name} branch fidelity too low after export: "
+            f"{fidelity_score:.6f} < {MIN_FIDELITY_SCORE:.6f}"
+        )
 
-def _convert_vision_branch(model: Any, ov: Any, nncf: Any, torch: Any, nn: Any) -> None:
-    logging.info("Converting vision branch with NNCF mixed precision search...")
+    return {
+        "fidelity_score": fidelity_score,
+        "representation_collapsed": representation_collapsed,
+        "precision_summary": precision_summary,
+    }
+
+
+def _write_precision_metadata(metadata_path: Path, payload: dict[str, Any]) -> None:
+    metadata_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logging.info("Precision metadata saved to %s", metadata_path)
+
+
+def _export_branch_models(
+    *,
+    branch_name: str,
+    ov_model: Any,
+    final_model_path: Path,
+    metadata_path: Path,
+    validation_samples: Sequence[Any],
+    ov: Any,
+    export_context: dict[str, str],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"qaclip_{branch_name}_", dir=str(OV_SAVE_PATH)) as temp_dir:
+        baseline_model_path = Path(temp_dir) / f"{final_model_path.stem}.baseline.xml"
+        ov.save_model(ov_model, baseline_model_path, compress_to_fp16=False)
+
+        compress_to_fp16 = _fp16_compression_enabled()
+        ov.save_model(ov_model, final_model_path, compress_to_fp16=compress_to_fp16)
+
+        validation = _validate_exported_branch_model(
+            branch_name=branch_name,
+            baseline_model_path=baseline_model_path,
+            output_model_path=final_model_path,
+            validation_samples=validation_samples,
+            ov=ov,
+        )
+        baseline_precision_summary = _summarize_model_precision(ov=ov, model_path=baseline_model_path)
+        metadata = {
+            "branch_name": branch_name,
+            "model_id": MODEL_ID,
+            "conversion_policy": "fp16_weights_fp32_compute" if compress_to_fp16 else "fp32_full_precision",
+            "compress_to_fp16": compress_to_fp16,
+            "baseline_model_path": str(baseline_model_path),
+            "output_model_path": str(final_model_path),
+            "validation_sample_count": len(validation_samples),
+            "fidelity_score": validation["fidelity_score"],
+            "representation_collapsed": validation["representation_collapsed"],
+            "baseline_precision_summary": baseline_precision_summary,
+            "exported_precision_summary": validation["precision_summary"],
+            "torch_export": export_context,
+        }
+        _write_precision_metadata(metadata_path, metadata)
+        logging.info(
+            "%s branch saved to %s. conversion_policy=%s fidelity=%.6f low_bit_constants=%s",
+            branch_name,
+            final_model_path,
+            metadata["conversion_policy"],
+            validation["fidelity_score"],
+            validation["precision_summary"]["low_bit_constant_type_counts"],
+        )
+
+
+def _convert_vision_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
+    logging.info("Converting vision branch with FP32 baseline and FP16 weight compression export...")
 
     class VisionModelWrapper(nn.Module):
         def __init__(self, loaded_model: Any):
@@ -553,30 +535,25 @@ def _convert_vision_branch(model: Any, ov: Any, nncf: Any, torch: Any, nn: Any) 
             pooled_output = vision_outputs[1]
             return self.visual_projection(pooled_output)
 
-    vision_wrapper = VisionModelWrapper(model)
+    vision_wrapper = VisionModelWrapper(model).eval()
     dummy_input = torch.randn(1, 3, INPUT_RESOLUTION, INPUT_RESOLUTION)
-    vision_path = OV_SAVE_PATH / "openvino_image.xml"
-    metadata_path = OV_SAVE_PATH / "openvino_image.compression.json"
-
-    with tempfile.TemporaryDirectory(prefix="qaclip_vision_", dir=str(OV_SAVE_PATH)) as temp_dir:
-        temporary_model_path = Path(temp_dir) / "openvino_image_fp32.xml"
-        ov_model = ov.convert_model(vision_wrapper, example_input=dummy_input)
-        ov.save_model(ov_model, temporary_model_path, compress_to_fp16=False)
-        _optimize_and_save_model(
-            branch_name="vision",
-            baseline_model_path=temporary_model_path,
-            output_model_path=vision_path,
-            metadata_path=metadata_path,
-            calibration_samples=_build_synthetic_vision_samples(CALIBRATION_SAMPLE_COUNT, seed_offset=0),
-            validation_samples=_build_synthetic_vision_samples(
-                VALIDATION_SAMPLE_COUNT,
-                seed_offset=CALIBRATION_SAMPLE_COUNT,
-            ),
-            ov=ov,
-            nncf=nncf,
-        )
-        del ov_model
-
+    vision_wrapper, dummy_input, export_context = _prepare_module_for_openvino_export(
+        branch_name="vision",
+        module=vision_wrapper,
+        example_input=dummy_input,
+        torch=torch,
+    )
+    ov_model = ov.convert_model(vision_wrapper, example_input=dummy_input)
+    _export_branch_models(
+        branch_name="vision",
+        ov_model=ov_model,
+        final_model_path=OV_SAVE_PATH / "openvino_image.xml",
+        metadata_path=OV_SAVE_PATH / "openvino_image.precision.json",
+        validation_samples=_build_synthetic_vision_samples(VALIDATION_SAMPLE_COUNT),
+        ov=ov,
+        export_context=export_context,
+    )
+    del ov_model
     del dummy_input
     del vision_wrapper
     gc.collect()
@@ -602,8 +579,8 @@ def _resolve_vocab_size(model: Any) -> int:
     return fallback_vocab_size
 
 
-def _convert_text_branch(model: Any, ov: Any, nncf: Any, torch: Any, nn: Any) -> None:
-    logging.info("Converting text branch with NNCF mixed precision search...")
+def _convert_text_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
+    logging.info("Converting text branch with FP32 baseline and FP16 weight compression export...")
 
     class TextModelWrapper(nn.Module):
         def __init__(self, loaded_model: Any):
@@ -616,39 +593,32 @@ def _convert_text_branch(model: Any, ov: Any, nncf: Any, torch: Any, nn: Any) ->
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
-            last_hidden_state = text_outputs[0]
-            pooled_output = last_hidden_state[:, 0, :]
+            pooled_output = text_outputs[0][:, 0, :]
             return self.text_projection(pooled_output)
 
-    text_wrapper = TextModelWrapper(model)
+    text_wrapper = TextModelWrapper(model).eval()
     vocab_size = _resolve_vocab_size(model)
     dummy_inputs = {
         "input_ids": torch.randint(0, vocab_size, (1, CONTEXT_LENGTH), dtype=torch.long),
         "attention_mask": torch.ones(1, CONTEXT_LENGTH, dtype=torch.long),
     }
-    text_path = OV_SAVE_PATH / "openvino_text.xml"
-    metadata_path = OV_SAVE_PATH / "openvino_text.compression.json"
-
-    with tempfile.TemporaryDirectory(prefix="qaclip_text_", dir=str(OV_SAVE_PATH)) as temp_dir:
-        temporary_model_path = Path(temp_dir) / "openvino_text_fp32.xml"
-        ov_model = ov.convert_model(text_wrapper, example_input=dummy_inputs)
-        ov.save_model(ov_model, temporary_model_path, compress_to_fp16=False)
-        _optimize_and_save_model(
-            branch_name="text",
-            baseline_model_path=temporary_model_path,
-            output_model_path=text_path,
-            metadata_path=metadata_path,
-            calibration_samples=_build_synthetic_text_samples(vocab_size, CALIBRATION_SAMPLE_COUNT, seed_offset=0),
-            validation_samples=_build_synthetic_text_samples(
-                vocab_size,
-                VALIDATION_SAMPLE_COUNT,
-                seed_offset=CALIBRATION_SAMPLE_COUNT,
-            ),
-            ov=ov,
-            nncf=nncf,
-        )
-        del ov_model
-
+    text_wrapper, dummy_inputs, export_context = _prepare_module_for_openvino_export(
+        branch_name="text",
+        module=text_wrapper,
+        example_input=dummy_inputs,
+        torch=torch,
+    )
+    ov_model = ov.convert_model(text_wrapper, example_input=dummy_inputs)
+    _export_branch_models(
+        branch_name="text",
+        ov_model=ov_model,
+        final_model_path=OV_SAVE_PATH / "openvino_text.xml",
+        metadata_path=OV_SAVE_PATH / "openvino_text.precision.json",
+        validation_samples=_build_synthetic_text_samples(vocab_size, VALIDATION_SAMPLE_COUNT),
+        ov=ov,
+        export_context=export_context,
+    )
+    del ov_model
     del dummy_inputs
     del text_wrapper
     gc.collect()
@@ -683,7 +653,6 @@ def _verify_models(ov: Any) -> None:
 
 def convert_models() -> None:
     _reset_conversion_artifacts()
-    CACHE_PATH.mkdir(parents=True, exist_ok=True)
     _prepare_hf_cache_env()
 
     logging.info("Project root: %s", PROJECT_ROOT)
@@ -692,16 +661,24 @@ def convert_models() -> None:
     logging.info("Hugging Face cache directory: %s", CACHE_PATH)
     logging.info("OpenVINO cache directory cleaned: %s", OPENVINO_CACHE_PATH)
     logging.info("FP16 compression for exported IR enabled: %s", _fp16_compression_enabled())
+    logging.info(
+        "Hugging Face cache reset enabled: cache=%s snapshot=%s force_download=%s",
+        _env_flag("QACLIP_RESET_HF_CACHE", False),
+        _env_flag("QACLIP_RESET_HF_SNAPSHOT", False),
+        _env_flag("QACLIP_FORCE_HF_DOWNLOAD", False),
+    )
 
-    ov = nncf = torch = nn = auto_model_cls = None
+    ov = torch = nn = auto_model_cls = None
     model = None
+    load_source = "unknown"
     try:
-        ov, nncf, torch, nn, auto_model_cls = _import_conversion_dependencies()
-        model = _load_hf_model(auto_model_cls)
-        _export_hf_snapshot(model)
-        _convert_vision_branch(model=model, ov=ov, nncf=nncf, torch=torch, nn=nn)
+        ov, torch, nn, auto_model_cls = _import_conversion_dependencies()
+        model, load_source = _load_hf_model(auto_model_cls)
+        logging.info("Hugging Face model load source: %s", load_source)
+        _export_hf_snapshot(model, load_source)
+        _convert_vision_branch(model=model, ov=ov, torch=torch, nn=nn)
         gc.collect()
-        _convert_text_branch(model=model, ov=ov, nncf=nncf, torch=torch, nn=nn)
+        _convert_text_branch(model=model, ov=ov, torch=torch, nn=nn)
         gc.collect()
         _verify_models(ov=ov)
     except Exception as exc:
@@ -711,6 +688,8 @@ def convert_models() -> None:
         if model is not None:
             del model
             gc.collect()
+        if torch is not None:
+            _cleanup_torch_cuda(torch)
         _cleanup_hf_cache()
 
     logging.info("QA-CLIP conversion completed successfully.")

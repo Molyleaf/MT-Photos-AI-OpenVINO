@@ -68,12 +68,12 @@
 - 转换过程必须避免“双份内存常驻”：
   - 禁止在同一阶段同时常驻完整 PyTorch 模型副本 + 完整 OpenVINO 中间副本。
   - 视觉分支与文本分支按顺序转换，转换后及时释放前一阶段对象并 `gc.collect()`。
-- 必须重新下载原始 Hugging Face FP32 模型后再转换；本地 `models/qa-clip/huggingface` 只允许保存原始 FP32 权重快照。
-- 转换链路固定为“先导出临时 FP32 IR，再对图像/文本分支分别执行 OpenVINO NNCF 自动压缩”；禁止直接提交来源不明的量化后权重，禁止绕过临时 FP32 基线做手工改图或私有后处理。
-- NNCF 路径必须使用**只压缩部分层**的混合精度权重策略，并继续叠加 `quantize_with_accuracy_control`（Accuracy-Aware Quantization）；不得把全部层强压到同一低比特精度。
-- 候选策略必须按“更激进压缩优先”做受控搜索，并在满足精度阈值与“无表征崩塌”前提下选出当前最优候选；至少保留候选模式、ratio、保真度得分和是否崩塌的元数据记录。
-- 最终保存 IR 时允许对剩余浮点权重执行 FP16 压缩；默认可通过 `ov.save_model(..., compress_to_fp16=True)` 落盘，但临时基线 IR 仍必须保持 `compress_to_fp16=False`，便于 Accuracy-Aware 对照与回归。
-- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；对应压缩元数据基线为 `openvino_image.compression.json` 与 `openvino_text.compression.json`。
+- 本地 `models/qa-clip/huggingface` 与 `cache/huggingface` 默认都应被复用；只有本地 snapshot 和 cache 都缺失，或显式设置强制刷新环境变量时，才允许重新从 Hugging Face 拉取 FP32 模型。
+- 转换链路固定为“先导出临时 FP32 IR，再导出最终 IR”；禁止提交来源不明的低比特量化后权重，禁止绕过临时 FP32 基线做手工改图或私有后处理。
+- 最终 IR 只允许使用 OpenVINO `ov.save_model(..., compress_to_fp16=True)` 做浮点权重 FP16 压缩；禁止导出 INT8/INT4 低比特常量，导出后必须显式校验图中不存在 `i4/u4/i8/u8` 常量类型。
+- 导出后必须做一次应用层保真度回归：至少比较临时 FP32 IR 与最终 IR 的 embedding 保真度，并确保无表征崩塌。
+- 若本机可用 CUDA，允许在 PyTorch 侧做一次 best-effort 的 CUDA 预热再回到 CPU 执行 OpenVINO 导出；该步骤不得引入最终 IR 的 CUDA 运行时依赖，也不得把失败静默吞掉。
+- OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；对应精度元数据基线为 `openvino_image.precision.json` 与 `openvino_text.precision.json`。
 
 ### 3.3 RapidOCR
 
@@ -311,7 +311,7 @@
 - [ ] 若仍需要 tokenizer 资源，是否完全切换到 `text-clip/app/models/QA-CLIP/clip` 引用路径
 - [ ] 是否保持所有端点语义与响应处理兼容（含 `msg` 字段规则）
 - [ ] QA-CLIP 是否固定为 ViT-L/14 且输出维度 768
-- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重快照 + NNCF 部分层混合精度压缩 + Accuracy-Aware Quantization + 无表征崩塌”
+- [ ] QA-CLIP 转换是否满足“无双份内存常驻 + 原始 FP32 权重快照/本地 cache 复用 + 最终 IR 仅 FP16/FP32 浮点混合 + 无 INT8/INT4 常量 + 无表征崩塌”
 - [ ] RapidOCR 是否为 `rapidocr==3.8.0`，且仅覆盖 `Det/Cls/Rec.engine_type=openvino`
 - [ ] InsightFace 是否使用 ORT + OpenVINO EP（仅推理）+ 原生 CPU 检测/识别预处理
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
@@ -461,9 +461,11 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径（脚本启动前会清理） | `<PROJECT_ROOT>/cache/openvino` |
 | `QACLIP_FORCE_CLEANUP_HF_CACHE` | 是否在脚本退出前强制删除 Hugging Face 缓存；Windows 默认关闭以规避 `.locks` 文件短暂占用 | `false`（Windows） |
-| `QACLIP_WEIGHT_CANDIDATES` | 逗号分隔的 `MODE:RATIO` 候选集，如 `INT4_ASYM:0.75,INT4_SYM:0.5` | `INT4_ASYM:0.75,INT4_SYM:0.75,INT4_ASYM:0.5,INT4_SYM:0.5` |
-| `QACLIP_MAX_ACCURACY_DROP` | Accuracy-Aware Quantization 允许的最大绝对精度下降 | `0.01` |
+| `QACLIP_FORCE_HF_DOWNLOAD` | 是否跳过本地 snapshot/cache，强制回源下载 Hugging Face 模型 | `false` |
 | `QACLIP_MIN_FIDELITY_SCORE` | 候选导出必须达到的最小 embedding 保真度分数 | `0.985` |
+| `QACLIP_RESET_HF_CACHE` | 启动前是否清理 Hugging Face cache | `false` |
+| `QACLIP_RESET_HF_SNAPSHOT` | 启动前是否清理本地 Hugging Face snapshot | `false` |
 | `QACLIP_SAVE_FP16` | 是否对最终 IR 中剩余浮点权重执行 FP16 压缩 | `true` |
+| `QACLIP_TORCH_DEVICE` | PyTorch 侧预热设备；支持 `AUTO` / `CPU` / `CUDA` | `AUTO` |
 
-`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本还会额外生成 `openvino_image.compression.json` 与 `openvino_text.compression.json`，用于记录当前选中的混合精度候选、保真度得分以及是否触发表征崩塌保护。
+`scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本还会额外生成 `openvino_image.precision.json` 与 `openvino_text.precision.json`，用于记录导出后常量精度分布、低比特常量检查结果、保真度得分以及 PyTorch 侧预热设备。
