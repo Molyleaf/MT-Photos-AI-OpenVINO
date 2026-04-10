@@ -15,4 +15,5 @@ models/rapidocr
 cache/
 example/
 
-# Docker
+server.log
+

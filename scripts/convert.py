@@ -1,9 +1,11 @@
 import gc
+import inspect
 import json
 import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence, Tuple
@@ -157,14 +159,27 @@ def _reset_conversion_artifacts() -> None:
 
 
 def _cleanup_hf_cache() -> None:
-    try:
-        _remove_path(CACHE_PATH)
-    except PermissionError as exc:
-        logging.warning(
-            "Best-effort cleanup skipped for %s because a file is still locked: %s",
-            CACHE_PATH,
-            exc,
+    if os.name == "nt" and not _env_flag("QACLIP_FORCE_CLEANUP_HF_CACHE", False):
+        logging.info(
+            "Skipping in-process Hugging Face cache cleanup on Windows. "
+            "huggingface_hub may keep .locks handles briefly; the next run will clean it at startup."
         )
+        return
+
+    gc.collect()
+    for attempt in range(3):
+        try:
+            _remove_path(CACHE_PATH)
+            return
+        except PermissionError as exc:
+            if attempt == 2:
+                logging.warning(
+                    "Best-effort cleanup skipped for %s because a file is still locked: %s",
+                    CACHE_PATH,
+                    exc,
+                )
+                return
+            time.sleep(0.5 * (attempt + 1))
 
 
 def _load_hf_model(auto_model_cls: Any) -> Any:
@@ -279,7 +294,18 @@ def _build_synthetic_text_samples(
 
 
 def _build_nncf_dataset(nncf: Any, samples: Sequence[Any]) -> Any:
-    return nncf.Dataset(list(samples), transform_fn=lambda sample: sample)
+    dataset_ctor = nncf.Dataset
+    identity_transform = lambda sample: sample
+    try:
+        parameters = inspect.signature(dataset_ctor).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    if "transform_func" in parameters:
+        return dataset_ctor(list(samples), transform_func=identity_transform)
+    if "transform_fn" in parameters:
+        return dataset_ctor(list(samples), transform_fn=identity_transform)
+    return dataset_ctor(list(samples), identity_transform)
 
 
 def _normalized_embeddings(embeddings: np.ndarray) -> np.ndarray:

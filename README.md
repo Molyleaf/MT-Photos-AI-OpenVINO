@@ -7,7 +7,7 @@
 - Python **3.12**
 - 已准备模型目录（至少包含）：
   - `models/qa-clip/openvino`
-  - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `python scripts/convert.py` 自动重建）
+  - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `py -3.12 scripts/convert.py` 自动重建）
   - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
 - 主服务入口：`app/server.py`
 - 主服务仍由 `app/server.py` 暴露路由；同目录 `app/bootstrap.py`、`app/image_io.py`、`app/text_clip_proxy.py` 仅用于维护性拆分，不改变启动方式和接口语义
@@ -67,7 +67,7 @@
 
 - 开发机本地验证时，主服务建议把主要后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
-- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `python scripts/convert.py` 以保持与当前 NNCF 混合精度压缩 + Accuracy-Aware Quantization 基线一致。脚本默认允许把剩余浮点权重再压到 FP16；如需保留原始浮点精度，可显式设置 `QACLIP_SAVE_FP16=false`。
+- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前 NNCF 混合精度压缩 + Accuracy-Aware Quantization 基线一致。脚本默认允许把剩余浮点权重再压到 FP16；如需保留原始浮点精度，可显式设置 `QACLIP_SAVE_FP16=false`。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。
@@ -82,13 +82,13 @@
 1. 确认 Python 版本：
 
 ```powershell
-python -V
+py -3.12 -V
 ```
 
 2. （可选）创建并激活虚拟环境：
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\activate
 ```
 
@@ -108,19 +108,19 @@ $env:LOG_LEVEL="INFO"
 
 ```powershell
 cd text-clip\app
-python server.py
+py -3.12 server.py
 ```
 
 5. 如需使用主服务接口，再另开终端启动主服务：
 
 ```powershell
 cd app
-python server.py
+py -3.12 server.py
 ```
 
-启动后，客户端可统一访问主服务端口；主服务收到 `/clip/txt` 请求时会按 `TEXT_CLIP_SERVER_URL` 把原始请求体转发到独立 Text-CLIP 服务。
+启动后，客户端可统一访问主服务端口；主服务收到 `/clip/txt` 请求时会按 `TEXT_CLIP_SERVER_URL` 把原始请求体转发到独立 Text-CLIP 服务。本地 Windows 验证和测试命令统一建议显式使用 `py -3.12`，避免落到其他解释器版本。
 
-如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，可在仓库根目录直接执行 `python image-clip\starter.py`，或进入 `image-clip\` 后执行 `python starter.py`。更完整的环境变量与冒烟说明见 [image-clip/README.md](image-clip/README.md)。
+如需在本地 Windows 开发机上单独跑 CUDA 版 Image-CLIP，可改用 `image-clip/` 子项目；该子项目使用独立依赖文件 `image-clip/requirement.txt`，可在仓库根目录直接执行 `py -3.12 image-clip\starter.py`，或进入 `image-clip\` 后执行 `py -3.12 starter.py`。更完整的环境变量与冒烟说明见 [image-clip/README.md](image-clip/README.md)。
 
 如需手动执行 `uvicorn server:app`，请显式传入 `--port` / `--log-level`，例如 `uvicorn server:app --host 0.0.0.0 --port 8060 --log-level info`。
 

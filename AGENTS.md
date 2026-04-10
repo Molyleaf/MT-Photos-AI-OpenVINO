@@ -284,23 +284,23 @@
 ## 10. 开发/自检命令（至少执行到可验证）
 
 - 开发机本地验证时，所有后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`。
-- `python -V`（确认 3.12）
+- `py -3.12 -V`（确认 3.12）
 - 如需安装依赖，仅在明确允许联网安装时执行 `pip install -r requirements.txt`；默认不把它作为本仓库 Agent 自检步骤
-- `python -m compileall app`
-- `python -m compileall text-clip/app`
-- `python -m compileall scripts`
-- `python -m compileall image-clip`
-- `cd image-clip && python starter.py`
-- `python scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
-- `python -m unittest discover -s scripts -p "test_*.py"`
-- `python scripts/smoke_non_text_process.py`
+- `py -3.12 -m compileall app`
+- `py -3.12 -m compileall text-clip/app`
+- `py -3.12 -m compileall scripts`
+- `py -3.12 -m compileall image-clip`
+- `cd image-clip && py -3.12 starter.py`
+- `py -3.12 scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
+- `py -3.12 -m unittest discover -s scripts -p "test_*.py"`
+- `py -3.12 scripts/smoke_non_text_process.py`
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
 - `uvicorn server:app --host 0.0.0.0 --port 8060`（在 `app/` 目录）
 - `uvicorn server:app --host 0.0.0.0 --port 8061`（在 `text-clip/app/` 目录）
-- 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `python server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
-- 如需验证独立 Text-CLIP 服务的 `PORT` / `LOG_LEVEL`，可在 `text-clip/app/` 目录执行 `python server.py`
+- 如需验证 `PORT` / `LOG_LEVEL` 这类由服务包装层处理的环境变量，可在 `app/` 目录执行 `py -3.12 server.py`；若继续手动执行 `uvicorn server:app`，需显式传 `--port` / `--log-level`
+- 如需验证独立 Text-CLIP 服务的 `PORT` / `LOG_LEVEL`，可在 `text-clip/app/` 目录执行 `py -3.12 server.py`
 - 关键端点冒烟：主服务 `/check`、`/clip/txt`、`/clip/img`、`/ocr`、`/represent`；独立 Text-CLIP 服务 `/check`、`/clip/txt`
 
 ---
@@ -460,6 +460,7 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `MODEL_PATH` | 模型根目录路径（导出会写入 `qa-clip/huggingface` 与 `qa-clip/openvino`） | `<PROJECT_ROOT>/models` |
 | `HF_CACHE_DIR` | Hugging Face 缓存目录路径 | `<PROJECT_ROOT>/cache/huggingface` |
 | `OV_CACHE_DIR` | OpenVINO 编译缓存目录路径（脚本启动前会清理） | `<PROJECT_ROOT>/cache/openvino` |
+| `QACLIP_FORCE_CLEANUP_HF_CACHE` | 是否在脚本退出前强制删除 Hugging Face 缓存；Windows 默认关闭以规避 `.locks` 文件短暂占用 | `false`（Windows） |
 | `QACLIP_WEIGHT_CANDIDATES` | 逗号分隔的 `MODE:RATIO` 候选集，如 `INT4_ASYM:0.75,INT4_SYM:0.5` | `INT4_ASYM:0.75,INT4_SYM:0.75,INT4_ASYM:0.5,INT4_SYM:0.5` |
 | `QACLIP_MAX_ACCURACY_DROP` | Accuracy-Aware Quantization 允许的最大绝对精度下降 | `0.01` |
 | `QACLIP_MIN_FIDELITY_SCORE` | 候选导出必须达到的最小 embedding 保真度分数 | `0.985` |
