@@ -6,10 +6,10 @@
 
 - Python **3.12**
 - 已准备模型目录（至少包含）：
-  - `models/qa-clip/openvino`（主线 FP16 IR，文件名固定为 `openvino_image_fp16.*` 与 `openvino_text_fp16.*`）
-  - `models/qa-clip/openvino_fp32`（FP32 对照组 IR，供精度观测脚本使用，文件名固定为 `openvino_image_fp32.*` 与 `openvino_text_fp32.*`）
-  - `models/qa-clip/huggingface`（仅本地 Windows CUDA `image-clip/` 子项目需要；可由 `py -3.12 scripts/convert.py` 自动重建）
-  - `models/insightface/models/antelopev2`（至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
+  - `models/qa-clip/openvino`（主线 FP16 IR；主服务镜像只打包 `openvino_image_fp16.*`，Text-CLIP 镜像只打包 `openvino_text_fp16.*`）
+  - `models/qa-clip/openvino_fp32`（FP32 对照组 IR，仅供本地精度观测脚本使用；默认不会进入 Docker 构建上下文或任一运行时镜像）
+  - `models/qa-clip/huggingface`（仅 `scripts/convert.py` 和本地 Windows CUDA `image-clip/` 子项目需要；默认不会进入 Docker 构建上下文）
+  - `models/insightface/models/antelopev2`（主服务镜像需要；至少保留 `scrfd_10g_bnkps.onnx` 与 `glintr100.onnx`）
 - 主服务入口：`app/server.py`
 - 主服务仍由 `app/server.py` 暴露路由；同目录 `app/bootstrap.py`、`app/image_io.py`、`app/text_clip_proxy.py` 仅用于维护性拆分，不改变启动方式和接口语义
 - Text-CLIP 服务入口：`text-clip/app/server.py`
@@ -21,7 +21,7 @@
 - 仓库不再保留单独的 `scripts/convert_fp16.py`；FP16 与 FP32 对照组统一由 `scripts/convert.py` 一次导出完成
 - `scripts/indicate_precision_impact.py` 默认比较 `models/qa-clip/openvino_fp32` 与主线 `models/qa-clip/openvino`，并输出 `models/qa-clip/openvino/precision_impact.json`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
-- `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`；其中 `onnx` 用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据
+- `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx` 与 `opencv-python-headless`；其中 `onnx` 用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据，主服务镜像构建时还会先卸载依赖链带入的 `opencv-python` / `opencv-contrib-python*`，再只回装 `opencv-python-headless`
 
 ## 运行时环境变量
 
@@ -153,14 +153,16 @@ apt-get update && apt-get install -y --no-install-recommends \
 说明：
 
 - 参考 OpenVINO 与 Intel GPU 官方文档，容器内 OpenVINO GPU 运行时需要 `intel-opencl-icd` + Level Zero 运行库（Debian 包名 `libze-intel-gpu1`），以及 `libze1`/`ocl-icd-libopencl1`。
-- 当前主 Dockerfile 使用两阶段构建：builder 阶段在 `/home/appuser/.venv` 与 `/home/appuser/wheels` 内完成编译链安装、wheel 预构建、离线依赖安装，并强制收敛为单一 `opencv-python-headless`；若传递依赖带入 `opencv-python` / `opencv-contrib-python*`，会在 builder 内卸载并清理对应 wheel，runtime 阶段只复制这两个用户目录并加入 `PATH`，不再重新执行 `pip install`，避免 `insightface` 一类源码包在最终镜像里再触发 `g++` 构建失败。
+- 当前主 Dockerfile 使用两阶段构建：builder 阶段在 `/home/appuser/.venv` 与 `/home/appuser/wheels` 内完成编译链安装、wheel 预构建、离线依赖安装，并沿用“先卸载所有 OpenCV Python 变体，再只回装 `opencv-python-headless`”的清洁安装链；若传递依赖带入 `opencv-python` / `opencv-contrib-python*`，会在 builder 内卸载并清理对应 wheel，runtime 阶段只复制瘦身后的 `.venv` 并加入 `PATH`，不再重新执行 `pip install`，也不再把 wheelhouse 带进最终镜像。
 - builder 还会裁剪 venv 中运行时不需要的 `pip`/`wheel` 包、`include`/`share` 目录、`__pycache__`、测试目录和静态头文件，以进一步压缩最终镜像体积；当前服务依赖会直接随用户目录下的 `.venv` 一起进入最终镜像。
+- 根目录 `.dockerignore` 会先排除 Hugging Face snapshot、FP32 IR、InsightFace 运行时派生目录和本地开发目录；在 Docker Engine 24+ / BuildKit 下，`Dockerfile.dockerignore` 与 `text-clip/DockerFile-TextCLIP.dockerignore` 还会进一步按镜像裁掉不相关的模型与源码，避免主镜像构建时混入文本 IR，或 Text-CLIP 镜像构建时混入视觉 IR / InsightFace 模型。
 - 因此当前运行时镜像不再包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不再打包 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`。
 - Intel GPU 固件属于宿主机职责；若宿主 Debian 13 需要补齐固件，请在宿主机安装 `firmware-misc-nonfree`（或兼容包名 `firmware-misc-non-free`），而不是放进应用容器。
 - Dockerfile 已固化为清华 APT + 清华 PyPI 镜像；APT 基础列表、sid pin 文件和安装包名单都直接写在仓库文件中，便于回溯与审计。
 - Dockerfile 使用 BuildKit cache mount 复用 `apt`/`pip` 下载缓存；在 Docker Engine 24+ / Compose v2 下，重复构建通常可直接命中这两类缓存。
 - 当前镜像构建阶段会临时启用 sid 源，仅安装 `intel-opencl-icd` 与 `libze-intel-gpu1`。
-- 独立 Text-CLIP 镜像使用 `text-clip/DockerFile-TextCLIP`，固定走 OpenVINO CPU，不安装 Intel GPU runtime，也不需要 `/dev/dri`。
+- 独立 Text-CLIP 镜像也改为两阶段构建，只复制瘦身后的 `.venv`、`openvino_text_fp16.*` 和 tokenizer 资源；它固定走 OpenVINO CPU，不安装 Intel GPU runtime、不需要 `/dev/dri`，也不会混入 OpenCV Python 包、视觉 FP16 IR、FP32 对照组或 Hugging Face snapshot。
+- 主服务镜像只保留 `openvino_image_fp16.*`、InsightFace `antelopev2` 和运行时必需脚本；不会混入 `openvino_text_fp16.*`、`openvino_fp32/*`、`qa-clip/huggingface/*` 或 `buffalo_l`。
 - 容器内不安装 `xserver-xorg-video-intel`（该包用于 Xorg 显示栈，不是本服务的无头推理运行前提）。
 - 服务上传读图链已统一改为 OpenCV 原生解码，镜像不再包含 `ffmpeg/ffprobe`、VAAPI/oneVPL/QSV 媒体栈，也不预装 `clinfo` 这类诊断工具。
 - 若服务日志出现 `available_devices=['CPU']`，即使 `/dev/dri` 可见，也通常意味着容器里缺少可用的 Intel GPU OpenVINO/OpenCL runtime，或 `/dev/dri` 并非真实的 Intel DRM render node。

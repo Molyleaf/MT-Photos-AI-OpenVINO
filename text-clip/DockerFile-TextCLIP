@@ -1,4 +1,56 @@
 # This Dockerfile must be built with the repository root as the Docker build context.
+# Docker 24+/BuildKit will pick up text-clip/DockerFile-TextCLIP.dockerignore to keep the CPU-only image context minimal.
+FROM python:3.12-slim-trixie AS wheels-builder
+
+WORKDIR /app
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_COMPILE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
+    PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn \
+    APP_HOME=/home/appuser \
+    VIRTUAL_ENV=/home/appuser/.venv \
+    PATH=/home/appuser/.venv/bin:/home/appuser/.local/bin:$PATH
+
+RUN rm -f /etc/apt/sources.list \
+    && rm -rf /etc/apt/sources.list.d/*
+
+COPY sources.list /etc/apt/sources.list
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates; \
+    groupadd --gid "${APP_GID}" appgroup; \
+    useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir "${APP_HOME}" --shell /usr/sbin/nologin appuser; \
+    mkdir -p "${APP_HOME}/wheels"; \
+    python -m venv "${VIRTUAL_ENV}"
+
+COPY text-clip/requirement.txt /tmp/requirement.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    set -eux; \
+    pip wheel --cache-dir /root/.cache/pip --wheel-dir "${APP_HOME}/wheels" --prefer-binary -r /tmp/requirement.txt; \
+    pip install --no-index --find-links="${APP_HOME}/wheels" -r /tmp/requirement.txt; \
+    PY_SITE_PACKAGES="$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")"; \
+    rm -rf "${PY_SITE_PACKAGES}"/pip "${PY_SITE_PACKAGES}"/pip-*.dist-info "${PY_SITE_PACKAGES}"/wheel "${PY_SITE_PACKAGES}"/wheel-*.dist-info; \
+    rm -rf "${VIRTUAL_ENV}"/include "${VIRTUAL_ENV}"/share; \
+    rm -f "${VIRTUAL_ENV}"/bin/pip "${VIRTUAL_ENV}"/bin/pip3 "${VIRTUAL_ENV}"/bin/pip3.12 "${VIRTUAL_ENV}"/bin/wheel; \
+    find "${VIRTUAL_ENV}" -type d -name '__pycache__' -prune -exec rm -rf '{}' +; \
+    find "${VIRTUAL_ENV}" -type d \( -name 'tests' -o -name 'test' \) -prune -exec rm -rf '{}' +; \
+    find "${VIRTUAL_ENV}" -type f \( -name '*.a' -o -name '*.h' -o -name '*.pyc' -o -name '*.pyo' \) -delete; \
+    python -c "from importlib import metadata as m; names = sorted({(dist.metadata.get('Name') or '').lower() for dist in m.distributions() if (dist.metadata.get('Name') or '').lower().startswith('opencv')}); assert not names, names"; \
+    rm -f /tmp/requirement.txt; \
+    chown -R appuser:appgroup "${APP_HOME}"
+
 FROM python:3.12-slim-trixie
 
 WORKDIR /app
@@ -10,8 +62,9 @@ ARG APP_GID=1000
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
-    PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn \
+    APP_HOME=/home/appuser \
+    VIRTUAL_ENV=/home/appuser/.venv \
+    PATH=/home/appuser/.venv/bin:/home/appuser/.local/bin:$PATH \
     MODEL_PATH=/models \
     OV_CACHE_DIR=/cache/openvino \
     PORT=8061
@@ -28,21 +81,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         libglib2.0-0 \
-        libgomp1
-
-COPY text-clip/requirement.txt /tmp/requirement.txt
-
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    set -eux; \
-    pip install --cache-dir /root/.cache/pip --prefer-binary -r /tmp/requirement.txt; \
-    rm -f /tmp/requirement.txt
-
-RUN set -eux; \
+        libgomp1; \
     groupadd --gid "${APP_GID}" appgroup; \
-    useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin appuser; \
-    mkdir -p /cache/openvino /models/qa-clip/openvino; \
+    useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir "${APP_HOME}" --shell /usr/sbin/nologin appuser; \
+    mkdir -p /cache/openvino /models/qa-clip/openvino "${APP_HOME}"; \
     chmod -R 777 /cache; \
-    chown -R appuser:appgroup /app /models /cache
+    chown -R appuser:appgroup /app /models /cache "${APP_HOME}"
+
+COPY --from=wheels-builder --chown=appuser:appgroup /home/appuser/.venv /home/appuser/.venv
 
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.xml /models/qa-clip/openvino/openvino_text_fp16.xml
 COPY --chown=appuser:appgroup models/qa-clip/openvino/openvino_text_fp16.bin /models/qa-clip/openvino/openvino_text_fp16.bin
@@ -52,7 +98,14 @@ RUN set -eux; \
     test -f /models/qa-clip/openvino/openvino_text_fp16.xml; \
     test -f /models/qa-clip/openvino/openvino_text_fp16.bin; \
     test -f /app/models/QA-CLIP/clip/bert_tokenizer.py; \
-    test -f /app/models/QA-CLIP/clip/vocab.txt
+    test -f /app/models/QA-CLIP/clip/vocab.txt; \
+    test ! -e /models/qa-clip/openvino/openvino_image_fp16.xml; \
+    test ! -e /models/qa-clip/openvino/openvino_image_fp16.bin; \
+    test ! -e /models/qa-clip/openvino_fp32; \
+    test ! -e /models/qa-clip/huggingface; \
+    test ! -e /models/insightface; \
+    python -c "from importlib import metadata as m; names = sorted({(dist.metadata.get('Name') or '').lower() for dist in m.distributions() if (dist.metadata.get('Name') or '').lower().startswith('opencv')}); assert not names, names"; \
+    for unwanted_pkg in clinfo intel-opencl-icd intel-media-va-driver-non-free libze-intel-gpu1 mesa-opencl-icd ocl-icd-libopencl1 xserver-xorg-video-intel; do ! dpkg-query -W \"${unwanted_pkg}\" >/dev/null 2>&1; done
 
 USER appuser
 

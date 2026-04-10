@@ -321,6 +321,7 @@
 - [ ] 是否遵守“Text-CLIP 独立 CPU 容器 + 主容器非文本单模型族串行切换”策略
 - [ ] 是否保持 OCR 默认懒加载，且显式预热后会立即释放
 - [ ] 是否采用单进程 FastAPI 异步服务 + 有界批队列/阶段执行器，并规避线程过度订阅
+- [ ] Docker 构建上下文与最终镜像是否都排除了 Hugging Face snapshot、FP32 CLIP IR、InsightFace 运行时派生目录、无关模型分支和不必要驱动/`opencv-python*` 变体
 - [ ] 是否同步更新 `README.md`、`requirements.txt` 与 `text-clip/requirement.txt`
 
 ---
@@ -348,17 +349,21 @@
 - 构建阶段使用 `apt-get install --no-install-recommends`，并清理 apt 索引。
 - 服务以非 root 用户运行，可通过 `APP_UID` / `APP_GID` 对齐宿主机权限。
 - 容器健康检查使用 `GET /`，且不依赖 API Key。
-- 仓库应提供 `.dockerignore` 以降低构建上下文体积。
+- 仓库应提供根 `.dockerignore`；在 Docker Engine 24+ / BuildKit 下，还应提供 `Dockerfile.dockerignore` 与 `text-clip/DockerFile-TextCLIP.dockerignore`，按镜像分别裁掉不相关的模型、源码和本地开发目录，避免无关大文件进入构建上下文。
 - 镜像内需包含 OpenVINO/OpenCL 运行基线依赖：`libdrm2`、`libze1`、`ocl-icd-libopencl1`、`mesa-opencl-icd`、`intel-opencl-icd`、`libze-intel-gpu1`，以及 Python/OpenCV 运行时基础库 `ca-certificates`、`libglib2.0-0`、`libgomp1`；`clinfo` 仅作为临时诊断工具，默认不随运行时镜像打包。
 - 独立 Text-CLIP 镜像固定使用 CPU；其基线依赖仅保留 Python/OpenVINO CPU 运行所需最小集合，不安装 Intel GPU runtime，也不映射 `/dev/dri`。
 - 主服务 Dockerfile 必须使用两阶段构建：builder 阶段在用户目录（当前基线 `/home/appuser/.venv` 与 `/home/appuser/wheels`）内安装编译链、预编译/下载 `requirements.txt` 及其传递依赖的 wheel，并在该用户目录内完成离线依赖安装。
-- runtime 阶段只允许复制 builder 产出的用户目录依赖（至少包含 `.venv` 与 wheel 目录）并加入 `PATH`，禁止再次执行 `pip install`；主镜像必须收敛为单一 `opencv-python-headless`，若传递依赖带入 `opencv-python` / `opencv-contrib-python*`，必须在 builder 阶段卸载包并清理对应 wheel，禁止最终镜像内重复保留多个 OpenCV Python wheel/package 变体。
+- 主服务 builder 阶段必须沿用“先卸载 `opencv-python` / `opencv-python-headless` / `opencv-contrib-python*`，再只回装 `opencv-python-headless`”的清洁安装链；若传递依赖带入其他 OpenCV Python wheel，必须在 builder 阶段一并卸载、清理 wheelhouse 中对应文件，并在构建时断言最终只剩 `opencv-python-headless`。
+- 主服务 runtime 阶段只允许复制 builder 产出的瘦身 `.venv` 并加入 `PATH`，禁止再次执行 `pip install`，也禁止把 `/home/appuser/wheels` 一并带入最终镜像。
+- 独立 Text-CLIP builder/runtime 都必须显式断言镜像内不存在任何 `opencv-python*` Python 发行版；若未来依赖链意外带入 OpenCV，构建必须失败，而不是把它静默打进 CPU-only 文本镜像。
 - builder 阶段应继续做无风险体积裁剪，例如移除 venv 中运行时不需要的 `pip`/`wheel` 包、`include`/`share` 目录、`__pycache__`、测试目录、头文件与静态库；禁止通过删改运行时必须的共享库、模型文件或 Python 包来换取体积下降。
+- Docker 构建上下文与最终镜像都必须排除 `models/qa-clip/huggingface`、`models/qa-clip/openvino_fp32`、`models/insightface/_runtime_models`、`models/insightface/models/buffalo_l`，并进一步按镜像排除不相关的 QA-CLIP 分支：主服务镜像不得带入 `openvino_text_fp16.*`，Text-CLIP 镜像不得带入 `openvino_image_fp16.*` 或 InsightFace 模型。
 - 由于当前服务仅使用 OpenCV 的图像解码、色彩转换与 CPU `resize`/`warpAffine` 路径，镜像默认不包含 `libgl1`、`libsm6`、`libxext6`、`libxrender1`，也不包含 `mesa-vulkan-drivers`、`intel-media-va-driver-non-free`、VAAPI、oneVPL、QSV 相关媒体栈依赖。
 - Intel iGPU 固件属于宿主机职责；如宿主 Debian 13 需要固件，应在宿主机安装 `firmware-misc-nonfree`（兼容包名 `firmware-misc-non-free`），而不是打包进应用容器。
 - 容器镜像不安装 `xserver-xorg-video-intel`（Xorg 显示栈组件，不属于无头推理运行基线）。
 - Debian 13 容器若要启用 OpenVINO GPU，必须补齐 Intel compute runtime（`intel-opencl-icd` / `libze-intel-gpu1`）；推荐在构建阶段通过临时 sid 源 + pin 方式安装，并在镜像层清理 sid 源文件。
-- 主服务镜像不再打包 `openvino_text_fp16.*`；这些文件仅应进入独立 Text-CLIP 镜像。
+- 主服务镜像不再打包 `openvino_text_fp16.*`、`openvino_fp32/*` 或 `qa-clip/huggingface/*`；这些文件只允许留在宿主机工具链或独立 Text-CLIP 镜像的最小必要集合中。
+- 独立 Text-CLIP 镜像不再打包 `openvino_image_fp16.*`、InsightFace 模型或任何 Intel GPU runtime 包。
 - 镜像内只打包 InsightFace `antelopev2` 模型，不保留 `buffalo_l` 分支。
 - `docker-compose` 默认不挂载 `/models`，模型随镜像静态打包。
 - `docker-compose.example.yml` 只允许引用预构建镜像（`image:`）；禁止再保留运行时 `build:`。

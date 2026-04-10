@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7
+# Docker 24+/BuildKit will pick up Dockerfile.dockerignore to keep the main-image context minimal.
 
 FROM python:3.12-slim-trixie AS wheels-builder
 
@@ -39,7 +40,7 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     set -eux; \
-    # requirements.txt includes the transitions runtime used by the non-text family state machine. \
+    # requirements.txt includes the transitions runtime used by the non-text family state machine.
     pip wheel --cache-dir /root/.cache/pip --wheel-dir "${APP_HOME}/wheels" --prefer-binary -r /tmp/requirements.txt; \
     pip wheel --cache-dir /root/.cache/pip --wheel-dir "${APP_HOME}/wheels" --prefer-binary --no-deps opencv-python-headless; \
     pip install --no-index --find-links="${APP_HOME}/wheels" -r /tmp/requirements.txt; \
@@ -58,6 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     find "${VIRTUAL_ENV}" -type d -name '__pycache__' -prune -exec rm -rf '{}' +; \
     find "${VIRTUAL_ENV}" -type d \( -name 'tests' -o -name 'test' \) -prune -exec rm -rf '{}' +; \
     find "${VIRTUAL_ENV}" -type f \( -name '*.a' -o -name '*.h' -o -name '*.pyc' -o -name '*.pyo' \) -delete; \
+    python -c "from importlib import metadata as m; names = sorted({(dist.metadata.get('Name') or '').lower() for dist in m.distributions() if (dist.metadata.get('Name') or '').lower().startswith('opencv')}); assert names == ['opencv-python-headless'], names"; \
     rm -f /tmp/requirements.txt; \
     chown -R appuser:appgroup "${APP_HOME}"
 
@@ -105,12 +107,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/intel-gpu-runtime; \
     groupadd --gid "${APP_GID}" appgroup; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir "${APP_HOME}" --shell /usr/sbin/nologin appuser; \
-    mkdir -p /cache /models/qa-clip/openvino /models/insightface/models/antelopev2 /models/cache/openvino "${APP_HOME}"; \
+    mkdir -p /cache /models/qa-clip/openvino /models/insightface/models/antelopev2 "${APP_HOME}"; \
     chmod 777 /cache; \
     chown -R appuser:appgroup /app /cache /models "${APP_HOME}"
 
 COPY --from=wheels-builder --chown=appuser:appgroup /home/appuser/.venv /home/appuser/.venv
-COPY --from=wheels-builder --chown=appuser:appgroup /home/appuser/wheels /home/appuser/wheels
 
 RUN set -eux; \
     RAPIDOCR_MODEL_ROOT="$(python -c "import pathlib, rapidocr; print(pathlib.Path(rapidocr.__file__).resolve().parent / 'models')")"; \
@@ -125,10 +126,17 @@ RUN set -eux; \
     test -f /models/qa-clip/openvino/openvino_image_fp16.xml; \
     test -f /models/qa-clip/openvino/openvino_image_fp16.bin; \
     test -f /models/insightface/models/antelopev2/glintr100.onnx; \
-    test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx
+    test -f /models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx; \
+    test ! -e /models/qa-clip/openvino/openvino_text_fp16.xml; \
+    test ! -e /models/qa-clip/openvino/openvino_text_fp16.bin; \
+    test ! -e /models/qa-clip/openvino_fp32; \
+    test ! -e /models/qa-clip/huggingface; \
+    test ! -e /models/insightface/models/buffalo_l; \
+    python -c "from importlib import metadata as m; names = sorted({(dist.metadata.get('Name') or '').lower() for dist in m.distributions() if (dist.metadata.get('Name') or '').lower().startswith('opencv')}); assert names == ['opencv-python-headless'], names"; \
+    for unwanted_pkg in clinfo intel-media-va-driver-non-free mesa-vulkan-drivers xserver-xorg-video-intel; do ! dpkg-query -W \"${unwanted_pkg}\" >/dev/null 2>&1; done
 
 COPY --chown=appuser:appgroup app /app
-COPY --chown=appuser:appgroup scripts /app/scripts
+COPY --chown=appuser:appgroup scripts/smoke_insightface.py /app/scripts/smoke_insightface.py
 
 USER appuser
 
