@@ -15,7 +15,7 @@
 - Windows 本地 CUDA Image-CLIP 子项目命令行入口：`image-clip/starter.py`
 - Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
-- `scripts/convert.py` 会先清理 `cache/huggingface`、`cache/openvino`、旧 QA-CLIP IR 和本地 QA-CLIP 快照，再重新下载原始 FP32 `TencentARC/QA-CLIP-ViT-L-14`，导出 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`
+- `scripts/convert.py` 会先清理 `cache/huggingface`、`cache/openvino`、旧 QA-CLIP IR 和本地 QA-CLIP 快照，再重新下载原始 FP32 `TencentARC/QA-CLIP-ViT-L-14`，导出未额外做 FP16 压缩的 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`，用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据；`scrfd_10g_bnkps.onnx` 保持原生 detector 路径
 
@@ -67,6 +67,7 @@
 
 - 开发机本地验证时，主服务建议把主要后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
+- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `python scripts/convert.py` 以保持与当前 FP32 转换基线一致。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。

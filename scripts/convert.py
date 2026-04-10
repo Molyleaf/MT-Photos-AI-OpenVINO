@@ -122,7 +122,7 @@ def _convert_vision_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
 
     vision_path = OV_SAVE_PATH / "openvino_image.xml"
     ov_model = ov.convert_model(vision_wrapper, example_input=dummy_input)
-    ov.save_model(ov_model, vision_path)
+    ov.save_model(ov_model, vision_path, compress_to_fp16=False)
     logging.info("Vision branch saved to %s", vision_path)
 
     del ov_model
@@ -174,7 +174,7 @@ def _convert_text_branch(model: Any, ov: Any, torch: Any, nn: Any) -> None:
 
     text_path = OV_SAVE_PATH / "openvino_text.xml"
     ov_model = ov.convert_model(text_wrapper, example_input=dummy_inputs)
-    ov.save_model(ov_model, text_path)
+    ov.save_model(ov_model, text_path, compress_to_fp16=False)
     logging.info("Text branch saved to %s", text_path)
 
     del ov_model

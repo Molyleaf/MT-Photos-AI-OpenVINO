@@ -1168,6 +1168,7 @@ class AIModels(ClipImageMixin, RapidOCRMixin, InsightFaceMixin):
         ppp.input().preprocess().resize(ov.preprocess.ResizeAlgorithm.RESIZE_LINEAR)
         ppp.input().preprocess().convert_color(ov.preprocess.ColorFormat.RGB)
         ppp.input().preprocess().convert_element_type(ov.Type.f32)
+        ppp.input().preprocess().scale([255.0, 255.0, 255.0])
         ppp.input().preprocess().mean(mean_values)
         ppp.input().preprocess().scale(std_values)
         ppp.input().model().set_layout(ov.Layout("NCHW"))

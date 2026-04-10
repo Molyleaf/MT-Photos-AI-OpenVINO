@@ -59,6 +59,7 @@
 - 当前服务上传读图链不再依赖 `ffmpeg/QSV`；Debian/Linux 容器部署与验收仍以 `/dev/dri` GPU 节点和 OpenVINO/OpenCL 可见性为准，不能把仅有 `/dev/dxg` 视作当前镜像的等价前提。
 - `/clip/img` 视觉链路必须直接消费 `numpy BGR`，禁止 `BGR -> RGB -> PIL` 的多余拷贝链。
 - CLIP 视觉预处理（`resize + 通道转换 + 归一化 + layout`）必须走 OpenVINO PrePostProcessing (PPP) API，禁止回退到手工 `numpy` 链。
+- CLIP 视觉归一化必须先把 `uint8` 像素按 `255` 缩放到 `[0,1]`，再执行 CLIP `mean/std`；禁止直接对 `0-255` 空间套用 CLIP 归一化参数。
 - 当视觉模型输入为动态 shape 时，PPP 的 `resize` 目标尺寸必须显式固定到模型期望分辨率（当前基线 `224x224`），禁止依赖隐式推断导致运行时构图失败。
 
 ### 3.2 QA-CLIP 转换（Hugging Face -> OpenVINO IR）
@@ -69,6 +70,7 @@
   - 视觉分支与文本分支按顺序转换，转换后及时释放前一阶段对象并 `gc.collect()`。
 - 必须重新下载原始 Hugging Face FP32 模型后再转换；本地 `models/qa-clip/huggingface` 只允许保存原始 FP32 权重快照。
 - 转换目标仅限“格式转换到 OpenVINO IR”，禁止做 FP16 压缩、量化、NNCF 权重压缩或任何改变权重精度/结构的额外处理。
+- 保存 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=False)`，禁止依赖 OpenVINO 默认行为把浮点权重压成 FP16。
 - OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`。
 
 ### 3.3 RapidOCR
