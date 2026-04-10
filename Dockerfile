@@ -99,7 +99,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libglib2.0-0 \
         libgomp1 \
         libze1 \
-        mesa-opencl-icd \
         ocl-icd-libopencl1; \
     apt-get install -y --no-install-recommends -t sid \
         intel-opencl-icd \
