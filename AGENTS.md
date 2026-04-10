@@ -72,6 +72,8 @@
 - 转换链路固定为顺序导出视觉分支与文本分支到 OpenVINO IR；禁止引入 NNCF、AWQ、AccuracyAwareQuantization、FP16 压缩、INT8/INT4 量化或任何手工改图/私有后处理。
 - 保存 IR 时必须显式使用 `ov.save_model(..., compress_to_fp16=False)`，保持原始精度与结构不变。
 - OpenVINO IR 文件基线固定为：`models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`。
+- 如需评估 OpenVINO 原生 FP16 浮点压缩，只允许通过独立脚本 `scripts/convert_fp16.py` 基于原始 IR 额外生成实验性产物到 `models/qa-clip/openvino-fp16`；该产物不得替换主服务默认使用的 `models/qa-clip/openvino`。
+- `scripts/indicate_precision_impact.py` 只用于比较原始 IR 与实验性 FP16 IR 的 embedding 保真度、结构差异、低比特常量检查和文件体积变化，不得把它当作服务上线前自动改写模型的链路。
 
 ### 3.3 RapidOCR
 
@@ -288,6 +290,8 @@
 - `py -3.12 -m compileall text-clip/app`
 - `py -3.12 -m compileall scripts`
 - `py -3.12 -m compileall image-clip`
+- `py -3.12 scripts/convert_fp16.py`
+- `py -3.12 scripts/indicate_precision_impact.py`
 - `cd image-clip && py -3.12 starter.py`
 - `py -3.12 scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
 - `py -3.12 -m unittest discover -s scripts -p "test_*.py"`
@@ -464,3 +468,5 @@ curl -s -X POST http://127.0.0.1:8061/clip/txt -H "api-key: mt_photos_ai_extra" 
 | `QACLIP_RESET_HF_SNAPSHOT` | 启动前是否清理本地 Hugging Face snapshot | `false` |
 
 `scripts/convert.py` 在未预设时还会自动设置以下变量：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TRANSFORMERS_CACHE`、`HF_HUB_DISABLE_SYMLINKS_WARNING`。脚本只输出 QA-CLIP 原始精度/结构对应的 OpenVINO IR 文件，不会额外生成精度元数据。
+
+`scripts/convert_fp16.py` 默认读取 `models/qa-clip/openvino` 并输出到 `models/qa-clip/openvino-fp16`；`scripts/indicate_precision_impact.py` 默认比较这两个目录并输出 `models/qa-clip/openvino-fp16/precision_impact.json`。
