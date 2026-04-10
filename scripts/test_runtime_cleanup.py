@@ -1,10 +1,9 @@
+import logging
 import sys
-import threading
 import types
 import unittest
 from concurrent.futures import Future
 from importlib.util import find_spec
-import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 

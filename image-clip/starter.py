@@ -1,6 +1,5 @@
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 IMAGE_CLIP_ROOT = Path(__file__).resolve().parent
 IMAGE_CLIP_APP_DIR = IMAGE_CLIP_ROOT / "app"

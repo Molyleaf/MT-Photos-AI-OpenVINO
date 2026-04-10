@@ -14,7 +14,6 @@ from transitions import Machine
 from .clip_image import ClipImageMixin
 from .common import (
     _AdmissionController,
-    _FaceInferenceTask,
     _ManagedLease,
     NonTextFamily,
     _ClipImageTask,
@@ -30,7 +29,6 @@ from .common import (
     _trim_process_memory,
 )
 from .constants import (
-    INSIGHTFACE_REQUEST_CAPACITY,
     INSIGHTFACE_SINGLE_LANE,
     LOG,
 )

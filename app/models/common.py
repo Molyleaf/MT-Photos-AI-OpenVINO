@@ -9,6 +9,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Literal, Optional, Tuple
+
 import numpy as np
 import openvino as ov
 

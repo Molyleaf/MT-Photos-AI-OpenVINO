@@ -6,7 +6,6 @@ from typing import Any, Sequence
 
 import numpy as np
 
-
 EMBEDDING_DIMS = 768
 INPUT_RESOLUTION = 224
 CONTEXT_LENGTH = 77

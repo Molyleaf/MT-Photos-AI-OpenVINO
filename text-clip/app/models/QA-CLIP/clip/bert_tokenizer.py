@@ -20,12 +20,13 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import re
-import unicodedata
-import six
-from functools import lru_cache
 import os
+import re
+from functools import lru_cache
 from typing import cast
+
+import six
+import unicodedata
 
 unicode = str
 

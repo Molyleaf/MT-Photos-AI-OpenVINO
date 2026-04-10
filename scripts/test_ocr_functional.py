@@ -9,8 +9,6 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = PROJECT_ROOT / "app"
 if str(APP_DIR) not in sys.path:
