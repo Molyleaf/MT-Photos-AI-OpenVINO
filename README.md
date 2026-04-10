@@ -16,7 +16,7 @@
 - Windows 本地 CUDA Image-CLIP 子项目服务实现入口：`image-clip/app/server.py`
 - QA-CLIP 离线转换脚本：`scripts/convert.py`
 - `scripts/convert.py` 默认只清理 OpenVINO 导出产物与 OpenVINO cache，不会重复删除 Hugging Face cache 或本地 QA-CLIP snapshot；脚本会优先复用 `models/qa-clip/huggingface` 本地 snapshot，其次复用 `cache/huggingface`，仅在本地都缺失时才回源下载 `TencentARC/QA-CLIP-ViT-L-14`
-- `scripts/convert.py` 会先导出临时 FP32 IR，再写出最终 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；最终 IR 仅允许执行 OpenVINO `compress_to_fp16=True` 的 FP16 权重压缩，禁止导出 INT8/INT4 低比特权重，并额外生成 `openvino_image.precision.json` / `openvino_text.precision.json` 记录导出后常量精度分布、保真度和低比特检查结果
+- `scripts/convert.py` 会按原始精度和结构直接导出 `models/qa-clip/openvino/openvino_image.xml` 与 `models/qa-clip/openvino/openvino_text.xml`；保存时固定使用 `ov.save_model(..., compress_to_fp16=False)`，不会执行 FP16 压缩、INT8/INT4 量化、NNCF 权重压缩或任何改图后处理
 - 独立 Text-CLIP 服务已自带 tokenizer 与词表资源，不再依赖主服务 `app/` 目录
 - `requirements.txt` 当前固定 `insightface==0.7.3`，并显式包含 `onnx`；其中 `onnx` 用于 InsightFace 首次懒加载时在受控 runtime copy 中修正 `glintr100.onnx` 的识别输出 batch 元数据
 
@@ -68,8 +68,7 @@
 
 - 开发机本地验证时，主服务建议把主要后端统一设为 `CPU`：`INFERENCE_DEVICE=CPU`、`CLIP_INFERENCE_DEVICE=CPU`、`INSIGHTFACE_OV_DEVICE=CPU`；如需走主服务 `/clip/txt` 代理，请同时把 `TEXT_CLIP_SERVER_URL` 设为本机 Text-CLIP 服务地址。
 - 主容器的 Vision-CLIP / OCR / InsightFace 统一由 `/app` 内的非文本子进程管理，按请求懒加载，并可按 `NON_TEXT_IDLE_RELEASE_SECONDS` 自动释放；Text-CLIP 容器启动即加载文本模型，进程存活期间常驻内存，不参与空闲释放或主容器 `/restart*`，主服务对 `/clip/txt` 只做原始请求体 HTTP 转发。
-- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前“FP32 基线 + FP16 权重压缩 + FP32 中间精度”基线一致。脚本默认允许把浮点权重压到 FP16；如需保留全量 FP32，可显式设置 `QACLIP_SAVE_FP16=false`。
-- `scripts/convert.py` 会在导出前 best-effort 尝试使用 `QACLIP_TORCH_DEVICE=AUTO|CPU|CUDA` 指定的 PyTorch 设备做一次预热；若本机可用 CUDA，默认会先尝试 CUDA 预热后再回到 CPU 执行 OpenVINO 导出。该步骤只用于加速/验证 PyTorch 侧准备，不会把最终 IR 转成 CUDA 依赖。
+- 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前“原始精度 + 原始结构 + 纯 IR 格式转换”基线一致。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。

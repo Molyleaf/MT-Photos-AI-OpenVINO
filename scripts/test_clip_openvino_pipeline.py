@@ -1,4 +1,3 @@
-import json
 import logging
 import math
 import sys
@@ -104,22 +103,6 @@ class _SyntheticVisionModel(torch.nn.Module):
         repeat_factor = math.ceil(convert_module.EMBEDDING_DIMS / features.shape[1])
         tiled = features.repeat(1, repeat_factor)
         return tiled[:, : convert_module.EMBEDDING_DIMS]
-
-
-class _WeightedSyntheticVisionModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.features = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=1),
-            torch.nn.GELU(),
-            torch.nn.AdaptiveAvgPool2d((4, 4)),
-        )
-        self.head = torch.nn.Linear(8 * 4 * 4, convert_module.EMBEDDING_DIMS)
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        features = self.features(pixel_values)
-        flattened = features.reshape(pixel_values.shape[0], -1)
-        return self.head(flattened)
 
 
 class ClipOpenvinoPipelineTests(unittest.TestCase):
@@ -282,23 +265,6 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
             if temp_dir is not None:
                 temp_dir.cleanup()
 
-    def test_embedding_fidelity_score_rejects_representation_collapse(self) -> None:
-        reference = np.asarray(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        collapsed = np.repeat(reference[:1], repeats=3, axis=0)
-        healthy = reference.copy()
-
-        self.assertTrue(convert_module._is_representation_collapsed(collapsed))
-        self.assertFalse(convert_module._is_representation_collapsed(healthy))
-        self.assertLess(convert_module._embedding_fidelity_score(reference, collapsed), 0.1)
-        self.assertGreater(convert_module._embedding_fidelity_score(reference, healthy), 0.99)
-
     def test_load_hf_model_prefers_existing_local_snapshot(self) -> None:
         fake_model = Mock()
         fake_model.eval = Mock()
@@ -368,65 +334,47 @@ class ClipOpenvinoPipelineTests(unittest.TestCase):
             self.assertTrue((hf_path / "sentinel.txt").exists())
             self.assertTrue((cache_path / "sentinel.txt").exists())
 
-    def test_precision_summary_reports_fp16_without_low_bit_quantization(self) -> None:
-        model = _WeightedSyntheticVisionModel().eval()
-        ov_model = ov.convert_model(
-            model,
-            example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
-        )
+    def test_convert_vision_branch_saves_original_precision_ir(self) -> None:
+        fake_ov = Mock()
+        fake_ov_model = object()
+        fake_ov.convert_model.return_value = fake_ov_model
 
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            model_path = Path(temp_dir_name) / "synthetic_fp16.xml"
-            ov.save_model(ov_model, model_path, compress_to_fp16=True)
-            summary = convert_module._summarize_model_precision(ov=ov, model_path=model_path)
-
-        self.assertGreater(summary["constant_type_counts"].get("f16", 0), 0)
-        self.assertEqual({}, summary["low_bit_constant_type_counts"])
-        self.assertIn("f32", summary["output_type_names"])
-
-    def test_export_branch_models_saves_fp16_and_writes_precision_metadata(self) -> None:
-        model = _WeightedSyntheticVisionModel().eval()
-        ov_model = ov.convert_model(
-            model,
-            example_input=torch.randn(1, 3, CLIP_IMAGE_RESOLUTION, CLIP_IMAGE_RESOLUTION),
-        )
-        validation_samples = convert_module._build_synthetic_vision_samples(8)
-
-        with tempfile.TemporaryDirectory() as temp_dir_name:
-            output_model_path = Path(temp_dir_name) / "openvino_image.xml"
-            metadata_path = Path(temp_dir_name) / "openvino_image.precision.json"
-            with (
-                patch.object(convert_module, "_fp16_compression_enabled", return_value=True),
-                patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)),
-            ):
-                convert_module._export_branch_models(
-                    branch_name="vision",
-                    ov_model=ov_model,
-                    final_model_path=output_model_path,
-                    metadata_path=metadata_path,
-                    validation_samples=validation_samples,
-                    ov=ov,
-                    export_context={
-                        "requested_torch_device": "AUTO",
-                        "warmup_torch_device": "CPU",
-                        "openvino_conversion_device": "CPU",
-                    },
+            with patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)):
+                convert_module._convert_vision_branch(
+                    model=_FakeLoadedModel(),
+                    ov=fake_ov,
+                    torch=torch,
+                    nn=torch.nn,
                 )
 
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual("fp16_weights_fp32_compute", metadata["conversion_policy"])
-            self.assertTrue(metadata["compress_to_fp16"])
-            self.assertFalse(metadata["representation_collapsed"])
-            self.assertEqual({}, metadata["exported_precision_summary"]["low_bit_constant_type_counts"])
-            self.assertGreater(metadata["fidelity_score"], 0.99)
-            self.assertIn("f16", metadata["exported_precision_summary"]["constant_type_counts"])
+        fake_ov.convert_model.assert_called_once()
+        fake_ov.save_model.assert_called_once()
+        args, kwargs = fake_ov.save_model.call_args
+        self.assertIs(args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino_image.xml", args[1])
+        self.assertFalse(kwargs["compress_to_fp16"])
 
-    def test_resolve_torch_export_device_prefers_cuda_when_available(self) -> None:
-        with patch.object(torch.cuda, "is_available", return_value=True):
-            device, requested = convert_module._resolve_torch_export_device(torch)
+    def test_convert_text_branch_saves_original_precision_ir(self) -> None:
+        fake_ov = Mock()
+        fake_ov_model = object()
+        fake_ov.convert_model.return_value = fake_ov_model
 
-        self.assertEqual("cuda", device.type)
-        self.assertEqual("AUTO", requested)
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            with patch.object(convert_module, "OV_SAVE_PATH", Path(temp_dir_name)):
+                convert_module._convert_text_branch(
+                    model=_FakeLoadedModel(),
+                    ov=fake_ov,
+                    torch=torch,
+                    nn=torch.nn,
+                )
+
+        fake_ov.convert_model.assert_called_once()
+        fake_ov.save_model.assert_called_once()
+        args, kwargs = fake_ov.save_model.call_args
+        self.assertIs(args[0], fake_ov_model)
+        self.assertEqual(Path(temp_dir_name) / "openvino_text.xml", args[1])
+        self.assertFalse(kwargs["compress_to_fp16"])
 
 
 if __name__ == "__main__":
