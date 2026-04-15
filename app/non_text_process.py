@@ -201,6 +201,10 @@ class NonTextProcessManager:
             self._last_request_activity_monotonic = time.monotonic()
         self._idle_release_wakeup.set()
 
+    def _has_pending_business_activity(self) -> bool:
+        with self._family_condition:
+            return self._switching or any(self._inflight.values())
+
     def _snapshot_last_request_activity_monotonic(self) -> float:
         with self._request_activity_lock:
             return self._last_request_activity_monotonic
@@ -230,11 +234,16 @@ class NonTextProcessManager:
                 self._idle_release_wakeup.clear()
                 continue
 
+            if self._has_pending_business_activity():
+                with self._request_activity_lock:
+                    self._last_request_activity_monotonic = time.monotonic()
+                continue
+
             try:
                 family = self.get_loaded_runtime_family()
                 if family is not None:
                     LOG.info(
-                        "No business request for %.1fs; releasing non-text worker family: %s.",
+                        "No non-text business activity for %.1fs; releasing non-text worker family: %s.",
                         self._idle_release_timeout_seconds,
                         family,
                     )
@@ -334,6 +343,12 @@ class NonTextProcessManager:
     def _close_queue_handle(handle: Any) -> None:
         if handle is None:
             return
+        cancel_join_thread = getattr(handle, "cancel_join_thread", None)
+        if callable(cancel_join_thread):
+            try:
+                cancel_join_thread()
+            except Exception:
+                pass
         close = getattr(handle, "close", None)
         if callable(close):
             try:
@@ -427,17 +442,25 @@ class NonTextProcessManager:
             worker_family or "none",
         )
 
+        shutdown_put_timeout_seconds = 0.1 if reason.endswith("-timeout") else 1.0
+        graceful_exit_timeout_seconds = max(
+            0.5,
+            min(2.0, float(self._execution_timeout_seconds)),
+        )
+
         if process.is_alive() and request_queue is not None:
             try:
-                request_queue.put({"kind": "shutdown"}, timeout=1.0)
-                request_queue.join()
+                request_queue.put(
+                    {"kind": "shutdown"},
+                    timeout=shutdown_put_timeout_seconds,
+                )
             except Exception as exc:
                 LOG.warning("Graceful non-text worker shutdown request failed: %s", exc)
-            process.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+            process.join(timeout=graceful_exit_timeout_seconds)
 
         if process.is_alive():
             process.terminate()
-            process.join(timeout=max(2.0, float(self._execution_timeout_seconds)))
+            process.join(timeout=graceful_exit_timeout_seconds)
         if process.is_alive() and hasattr(process, "kill"):
             process.kill()
             process.join(timeout=1.0)
@@ -514,6 +537,7 @@ class NonTextProcessManager:
             self._inflight[family] = current - 1
             if self._inflight[family] == 0:
                 self._family_condition.notify_all()
+                self._idle_release_wakeup.set()
 
     def _clear_active_family_after_forced_release(self, family: _NonTextFamily) -> None:
         with self._family_condition:

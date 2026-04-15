@@ -83,6 +83,28 @@ def _slow_non_text_worker(request_queue, response_queue) -> None:
     response_queue.put({"kind": "stopped", "pid": pid})
 
 
+def _hung_non_text_worker(request_queue, response_queue) -> None:
+    pid = os.getpid()
+    response_queue.put({"kind": "ready", "pid": pid})
+    while True:
+        message = request_queue.get()
+        kind = str(message.get("kind", ""))
+        if kind == "shutdown":
+            request_queue.task_done()
+            break
+        time.sleep(60.0)
+        response_queue.put(
+            {
+                "kind": "result",
+                "request_id": str(message["request_id"]),
+                "operation": str(message["operation"]),
+                "result": [float(pid)],
+            }
+        )
+        request_queue.task_done()
+    response_queue.put({"kind": "stopped", "pid": pid})
+
+
 class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._env = patch.dict(
@@ -183,6 +205,56 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Idle release did not stop the worker process in time.")
 
         memory_log_mock.assert_any_call("idle-timeout-worker-stop")
+
+    async def test_idle_release_waits_for_active_request_completion(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        with patch.dict(os.environ, {"NON_TEXT_IDLE_RELEASE_SECONDS": "0.2"}, clear=False):
+            self.manager = NonTextProcessManager(worker_target=_slow_non_text_worker)
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        with patch("non_text_process._log_current_process_memory") as memory_log_mock:
+            request_task = asyncio.create_task(self.manager.get_image_embedding_async(image))
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self.manager.get_loaded_runtime_family() == "vision":
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                self.fail("Vision worker did not start in time.")
+
+            await asyncio.sleep(0.35)
+            self.assertFalse(request_task.done())
+            self.assertEqual("vision", self.manager.get_loaded_runtime_family())
+            memory_log_mock.assert_not_called()
+
+            await request_task
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if self.manager.get_loaded_runtime_family() is None:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                self.fail("Idle release did not stop the worker process after request completion.")
+
+        memory_log_mock.assert_any_call("idle-timeout-worker-stop")
+
+    async def test_hung_worker_timeout_does_not_block_on_joinable_queue(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        self.manager = NonTextProcessManager(worker_target=_hung_non_text_worker)
+        self.manager._execution_timeout_seconds = 1
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        started = time.monotonic()
+        with patch("non_text_process._log_current_process_memory") as memory_log_mock:
+            with self.assertRaisesRegex(RuntimeError, "执行超时"):
+                await self.manager.get_image_embedding_async(image)
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 6.0)
+        self.assertIsNone(self.manager.get_loaded_runtime_family())
+        memory_log_mock.assert_called_once_with("vision-timeout-worker-stop")
 
 
 if __name__ == "__main__":
