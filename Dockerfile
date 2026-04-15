@@ -40,7 +40,6 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     set -eux; \
-    # requirements.txt includes the transitions runtime used by the non-text family state machine.
     pip wheel --cache-dir /root/.cache/pip --wheel-dir "${APP_HOME}/wheels" --prefer-binary -r /tmp/requirements.txt; \
     pip wheel --cache-dir /root/.cache/pip --wheel-dir "${APP_HOME}/wheels" --prefer-binary --no-deps opencv-python-headless; \
     pip install --no-index --find-links="${APP_HOME}/wheels" -r /tmp/requirements.txt; \
