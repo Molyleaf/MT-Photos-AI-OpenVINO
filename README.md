@@ -74,6 +74,7 @@
 - 主服务 `/clip/img` 的视觉 PPP 预处理固定为 `resize -> center crop -> BGR->RGB -> /255 -> mean/std -> NCHW`；如果需要重建 QA-CLIP IR，请重新执行 `py -3.12 scripts/convert.py` 以保持与当前“主线 FP16 + FP32 对照组”导出基线一致。
 - 如需评估主线 FP16 与 FP32 对照组之间的 embedding 保真度、结构差异和体积变化，直接执行 `py -3.12 scripts/indicate_precision_impact.py` 即可。
 - 主容器在 `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 或空闲释放完成后，会直接结束当前非文本子进程；匿名内存由子进程退出统一回收，下一次 `/clip/img`、`/ocr`、`/represent` 请求再按需重建新的非文本子进程与对应模型。
+- 当 `/represent`、`/clip/img`、`/ocr` 混合到达时，主服务会继续保持“单活非文本模型族”串行切换，但等待旧模型族退场的过程不会再阻塞整个事件循环；后来的异族请求会异步排队，而不是把前一个请求卡死。
 - 主服务会在非文本子进程退出后输出一条进程/cgroup 内存拆分日志，至少包含 `VmRSS/RssAnon/RssFile/RssShmem` 与 `cgroup_anon/cgroup_file/cgroup_shmem`，用于判断释放后剩余内存主要来自匿名内存、文件页缓存还是 shared memory。
 - InsightFace 现在会以低残留 ORT session 基线加载：关闭 CPU memory arena、关闭 memory pattern，并固定单 lane session `inter_op/intra_op` 线程数为 `1`。这会优先减少 `/represent` 卸载后的匿名内存残留，而不是追求极限吞吐。
 - `/restart`、`/restart_v2`、`/restartV2`、`/restartv2` 现已统一语义：同步释放当前非文本子进程，不重启主服务进程。
@@ -314,6 +315,14 @@ docker run --rm -it \
 - 原生 detector.detect 与 batched recognition 路径均保持稳定
 - 并发 `/represent` 聚合路径与顺序 `/represent` 路径一致，不改变检测框、分数和 embedding 语义
 - `release_models_for_restart()` 后 face runtime 引用已释放，且能够重新加载
+
+如需专项验证混合 `/represent`、`/clip/img`、`/ocr` 请求的乱序到达与轻量压力场景，可直接运行：
+
+```bash
+python scripts/smoke_non_text_process.py --mixed-burst 24 --concurrency 6
+```
+
+该脚本会依次做顺序切换校验、`/represent -> /clip/img` 乱序回归，以及一个使用假子进程 worker 的轻量微压测，并输出各操作的平均延迟、P95 和 worker 重启次数。
 
 服务启动后，也可以再做基础端点检查：
 

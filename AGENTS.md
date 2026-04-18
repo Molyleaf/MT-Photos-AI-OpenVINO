@@ -225,6 +225,7 @@
 - 必须在运行时对单进程做硬约束；同一工作目录下的第二个服务进程必须因运行锁直接失败，而不是并行持有另一份非文本模型。
 - 非文本模型族准入必须显式串行化，确保“单活模型族 + 独立 Text-CLIP 容器”的内存上界可控。
 - 非文本子进程与父进程之间的任务派发/结果回传必须优先复用标准库 `multiprocessing.JoinableQueue` / `multiprocessing.Queue`，不要再维护自定义 pipe/轮询协议。
+- 父进程 `NonTextProcessManager` 的模型族等待、子进程启动和 `JoinableQueue.put` 都属于阻塞控制路径；异步端点若需调用这些同步步骤，必须通过线程桥接，禁止在事件循环里直接执行会进入 `Condition.wait` / `Queue.put` 的同步方法，否则混合 `/represent` + `/clip/img` / `/ocr` 请求会卡住。
 - 必须控制总并行度：
   - `总并行度 = 各阶段执行器线程数之和`
 - 原因：
@@ -297,7 +298,7 @@
 - `cd image-clip && py -3.12 starter.py`
 - `py -3.12 scripts/smoke_image_clip.py --device cuda`（独立 Windows 本地 CUDA Image-CLIP 子项目）
 - `py -3.12 -m unittest discover -s scripts -p "test_*.py"`
-- `py -3.12 scripts/smoke_non_text_process.py`
+- `py -3.12 scripts/smoke_non_text_process.py --mixed-burst 24 --concurrency 6`
 - `docker build -t mt-photos-ai-openvino .`
 - `docker build -f text-clip/DockerFile-TextCLIP -t mt-photos-ai-text-clip .`
 - `docker run --rm -it -e INFERENCE_DEVICE=CPU -e CLIP_INFERENCE_DEVICE=CPU -e INSIGHTFACE_OV_DEVICE=CPU mt-photos-ai-openvino python scripts/smoke_insightface.py --device CPU`
@@ -374,8 +375,12 @@
 
 - InsightFace 已进一步简化为“原生 detector.detect + 本地五点对齐 + 原生 get_feat”的 CPU 执行链，仓库内不再维护 batched detector head 解包与 detector 动态 batch 补丁；当前回归重点收敛为 `/represent` 语义一致性、recognition 批处理一致性和 release/reload 生命周期。
 
+### 13.3 最近稳定性修复（2026-04）
 
-### 13.3 `/dev/dri` Intel iGPU 上线验收
+- 非文本父进程管理器已修复混合输入死锁：当 `/represent` 尚未完成时，新到达的 `/clip/img` / `/ocr` 请求改为异步等待模型族切换，不再把事件循环卡在 `Condition.wait` 上；对应回归新增了 `/represent -> /clip/img` 乱序请求测试和轻量 mixed burst 压测脚本。
+
+
+### 13.4 `/dev/dri` Intel iGPU 上线验收
 
 #### A. `docker-compose.yml` 必备参数
 

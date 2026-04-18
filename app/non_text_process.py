@@ -489,15 +489,31 @@ class NonTextProcessManager:
         _log_current_process_memory(f"{reason}-worker-stop")
         return True
 
-    def _acquire_family(self, family: _NonTextFamily) -> None:
+    @staticmethod
+    async def _run_blocking_control_call(
+        callback: Callable[..., Any],
+        *args: Any,
+    ) -> Any:
+        control_task = asyncio.create_task(asyncio.to_thread(callback, *args))
+        return await asyncio.shield(control_task)
+
+    def _acquire_family(
+        self,
+        family: _NonTextFamily,
+        abort_event: Optional[threading.Event] = None,
+    ) -> bool:
         while True:
             previous_family: Optional[_NonTextFamily]
             with self._family_condition:
                 while self._switching:
+                    if abort_event is not None and abort_event.is_set():
+                        return False
                     if self._stopping:
                         raise RuntimeError("模型服务已关闭")
                     self._family_condition.wait(timeout=0.1)
 
+                if abort_event is not None and abort_event.is_set():
+                    return False
                 if self._stopping:
                     raise RuntimeError("模型服务已关闭")
 
@@ -508,11 +524,11 @@ class NonTextProcessManager:
                         continue
                     self._active_family = family
                     self._inflight[family] += 1
-                    return
+                    return True
 
                 if previous_family == family:
                     self._inflight[family] += 1
-                    return
+                    return True
 
                 if self._inflight[previous_family] > 0:
                     self._family_condition.wait(timeout=0.1)
@@ -523,11 +539,16 @@ class NonTextProcessManager:
             self._release_worker_process(reason=f"family-switch:{previous_family}->{family}")
 
             with self._family_condition:
+                if abort_event is not None and abort_event.is_set():
+                    self._active_family = None
+                    self._switching = False
+                    self._family_condition.notify_all()
+                    return False
                 self._active_family = family
                 self._inflight[family] += 1
                 self._switching = False
                 self._family_condition.notify_all()
-                return
+                return True
 
     def _release_family(self, family: _NonTextFamily) -> None:
         with self._family_condition:
@@ -616,6 +637,40 @@ class NonTextProcessManager:
             raise RuntimeError("提交非文本任务到子进程失败。") from exc
         return future
 
+    async def _acquire_family_async(self, family: _NonTextFamily) -> None:
+        abort_event = threading.Event()
+        control_task = asyncio.create_task(
+            asyncio.to_thread(self._acquire_family, family, abort_event)
+        )
+        try:
+            acquired = await asyncio.shield(control_task)
+        except asyncio.CancelledError:
+            abort_event.set()
+            acquired = False
+            try:
+                acquired = await control_task
+            except Exception:
+                raise
+            if acquired:
+                await self._run_blocking_control_call(self._release_family, family)
+            raise
+        if not acquired:
+            raise RuntimeError("模型服务已关闭")
+
+    async def _submit_request_async(
+        self,
+        operation: str,
+        image: np.ndarray,
+    ) -> Future[Any]:
+        return await self._run_blocking_control_call(
+            self._submit_request,
+            operation,
+            image,
+        )
+
+    async def _release_family_async(self, family: _NonTextFamily) -> None:
+        await self._run_blocking_control_call(self._release_family, family)
+
     async def _invoke_async(
         self,
         *,
@@ -624,10 +679,10 @@ class NonTextProcessManager:
         image: np.ndarray,
         timeout_seconds: int,
     ) -> Any:
-        self._acquire_family(family)
+        await self._acquire_family_async(family)
         try:
-            await asyncio.to_thread(self._ensure_worker_started, family)
-            future = self._submit_request(operation, image)
+            await self._run_blocking_control_call(self._ensure_worker_started, family)
+            future = await self._submit_request_async(operation, image)
             wrapped = asyncio.wrap_future(future)
             try:
                 return await asyncio.wait_for(
@@ -645,7 +700,7 @@ class NonTextProcessManager:
                 await asyncio.gather(wrapped, return_exceptions=True)
                 raise timeout_message from exc
         finally:
-            self._release_family(family)
+            await self._release_family_async(family)
 
     async def get_image_embedding_async(self, image: np.ndarray) -> list[float]:
         return list(

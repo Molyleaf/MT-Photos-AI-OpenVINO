@@ -105,6 +105,57 @@ def _hung_non_text_worker(request_queue, response_queue) -> None:
     response_queue.put({"kind": "stopped", "pid": pid})
 
 
+def _mixed_latency_non_text_worker(request_queue, response_queue) -> None:
+    pid = os.getpid()
+    response_queue.put({"kind": "ready", "pid": pid})
+    operation_delay_seconds = {
+        "clip_img": 0.05,
+        "ocr": 0.08,
+        "represent": 0.35,
+    }
+    while True:
+        message = request_queue.get()
+        kind = str(message.get("kind", ""))
+        if kind == "shutdown":
+            request_queue.task_done()
+            break
+        request_id = str(message["request_id"])
+        operation = str(message["operation"])
+        time.sleep(operation_delay_seconds.get(operation, 0.02))
+        if operation == "clip_img":
+            result = [float(pid)]
+        elif operation == "ocr":
+            result = {
+                "texts": [str(pid)],
+                "scores": ["1.0"],
+                "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
+            }
+        elif operation == "represent":
+            result = [
+                {
+                    "embedding": [float(pid)],
+                    "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
+                    "face_confidence": 1.0,
+                }
+            ]
+        else:
+            response_queue.put(
+                {"kind": "error", "request_id": request_id, "error": f"unsupported {operation}"}
+            )
+            request_queue.task_done()
+            continue
+        response_queue.put(
+            {
+                "kind": "result",
+                "request_id": request_id,
+                "operation": operation,
+                "result": result,
+            }
+        )
+        request_queue.task_done()
+    response_queue.put({"kind": "stopped", "pid": pid})
+
+
 class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._env = patch.dict(
@@ -255,6 +306,83 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 6.0)
         self.assertIsNone(self.manager.get_loaded_runtime_family())
         memory_log_mock.assert_called_once_with("vision-timeout-worker-stop")
+
+    async def test_mixed_family_out_of_order_requests_do_not_deadlock(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        self.manager = NonTextProcessManager(worker_target=_mixed_latency_non_text_worker)
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        face_task = asyncio.create_task(self.manager.get_face_representation_async(image))
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.manager.get_loaded_runtime_family() == "face":
+                break
+            await asyncio.sleep(0.05)
+        else:
+            self.fail("Face request did not acquire the worker in time.")
+
+        clip_task = asyncio.create_task(self.manager.get_image_embedding_async(image))
+        face_result, clip_result = await asyncio.wait_for(
+            asyncio.gather(face_task, clip_task),
+            timeout=6.0,
+        )
+
+        face_pid = int(face_result[0].embedding[0])
+        clip_pid = int(clip_result[0])
+        self.assertNotEqual(face_pid, clip_pid)
+        self.assertEqual("vision", self.manager.get_loaded_runtime_family())
+
+    async def test_mixed_family_burst_requests_complete_under_pressure(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        self.manager = NonTextProcessManager(worker_target=_mixed_latency_non_text_worker)
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        operations = [
+            ("represent", 0.00),
+            ("clip_img", 0.01),
+            ("ocr", 0.02),
+            ("clip_img", 0.03),
+            ("represent", 0.04),
+            ("ocr", 0.05),
+            ("clip_img", 0.06),
+            ("represent", 0.07),
+            ("ocr", 0.08),
+        ]
+
+        async def invoke(operation: str, delay_seconds: float):
+            await asyncio.sleep(delay_seconds)
+            if operation == "clip_img":
+                return operation, await self.manager.get_image_embedding_async(image)
+            if operation == "ocr":
+                return operation, await self.manager.get_ocr_results_async(image)
+            return operation, await self.manager.get_face_representation_async(image)
+
+        started = time.monotonic()
+        results = await asyncio.wait_for(
+            asyncio.gather(*(invoke(operation, delay) for operation, delay in operations)),
+            timeout=12.0,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(operations), len(results))
+        self.assertLess(elapsed, 12.0)
+
+        clip_pids = []
+        ocr_pids = []
+        face_pids = []
+        for operation, payload in results:
+            if operation == "clip_img":
+                clip_pids.append(int(payload[0]))
+            elif operation == "ocr":
+                ocr_pids.append(int(payload.texts[0]))
+            else:
+                face_pids.append(int(payload[0].embedding[0]))
+
+        self.assertTrue(clip_pids)
+        self.assertTrue(ocr_pids)
+        self.assertTrue(face_pids)
+        self.assertGreaterEqual(len(set(clip_pids + ocr_pids + face_pids)), 2)
 
 
 if __name__ == "__main__":
