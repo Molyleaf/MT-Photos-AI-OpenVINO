@@ -17,6 +17,50 @@ if str(APP_DIR) not in sys.path:
 from non_text_process import NonTextProcessManager
 
 
+_ORDERED_OPERATIONS = ("clip_img", "ocr", "represent")
+_ORDERED_FAMILIES = {
+    "clip_img": "vision",
+    "ocr": "ocr",
+    "represent": "face",
+}
+
+
+def _build_operation_result(operation: str, pid: int):
+    if operation == "clip_img":
+        return [float(pid)]
+    if operation == "ocr":
+        return {
+            "texts": [str(pid)],
+            "scores": ["1.0"],
+            "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
+        }
+    if operation == "represent":
+        return [
+            {
+                "embedding": [float(pid)],
+                "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
+                "face_confidence": 1.0,
+            }
+        ]
+    raise RuntimeError(f"unsupported {operation}")
+
+
+async def _invoke_operation(manager: NonTextProcessManager, operation: str, image: np.ndarray):
+    if operation == "clip_img":
+        return await manager.get_image_embedding_async(image)
+    if operation == "ocr":
+        return await manager.get_ocr_results_async(image)
+    return await manager.get_face_representation_async(image)
+
+
+def _extract_operation_pid(operation: str, payload) -> int:
+    if operation == "clip_img":
+        return int(payload[0])
+    if operation == "ocr":
+        return int(payload.texts[0])
+    return int(payload[0].embedding[0])
+
+
 def _fake_non_text_worker(request_queue, response_queue) -> None:
     pid = os.getpid()
     response_queue.put({"kind": "ready", "pid": pid})
@@ -34,25 +78,11 @@ def _fake_non_text_worker(request_queue, response_queue) -> None:
         request_id = str(message["request_id"])
         operation = str(message["operation"])
         time.sleep(operation_delay_seconds.get(operation, 0.02))
-        if operation == "clip_img":
-            result = [float(pid)]
-        elif operation == "ocr":
-            result = {
-                "texts": [str(pid)],
-                "scores": ["1.0"],
-                "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
-            }
-        elif operation == "represent":
-            result = [
-                {
-                    "embedding": [float(pid)],
-                    "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
-                    "face_confidence": 1.0,
-                }
-            ]
-        else:
+        try:
+            result = _build_operation_result(operation, pid)
+        except RuntimeError as exc:
             response_queue.put(
-                {"kind": "error", "request_id": request_id, "error": f"unsupported {operation}"}
+                {"kind": "error", "request_id": request_id, "error": str(exc)}
             )
             request_queue.task_done()
             continue
@@ -119,7 +149,7 @@ async def _run_sequential_sanity(manager: NonTextProcessManager, image: np.ndarr
 
 
 async def _run_out_of_order_round(manager: NonTextProcessManager, image: np.ndarray) -> dict[str, int | str]:
-    face_task = asyncio.create_task(manager.get_face_representation_async(image))
+    face_task = asyncio.create_task(_invoke_operation(manager, "represent", image))
 
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
@@ -129,13 +159,21 @@ async def _run_out_of_order_round(manager: NonTextProcessManager, image: np.ndar
     else:
         raise RuntimeError("Face request did not acquire the worker in time.")
 
-    clip_task = asyncio.create_task(manager.get_image_embedding_async(image))
+    clip_task = asyncio.create_task(_invoke_operation(manager, "clip_img", image))
+    first_done, _pending = await asyncio.wait(
+        {face_task, clip_task},
+        timeout=6.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if face_task not in first_done:
+        raise RuntimeError("Out-of-order round violated first-request-first-complete ordering.")
+
     face_result, clip_result = await asyncio.wait_for(
         asyncio.gather(face_task, clip_task),
         timeout=6.0,
     )
-    face_pid = int(face_result[0].embedding[0])
-    clip_pid = int(clip_result[0])
+    face_pid = _extract_operation_pid("represent", face_result)
+    clip_pid = _extract_operation_pid("clip_img", clip_result)
     if face_pid == clip_pid:
         raise RuntimeError("Out-of-order round did not recycle the worker between face and clip.")
     if manager.get_loaded_runtime_family() != "vision":
@@ -147,6 +185,52 @@ async def _run_out_of_order_round(manager: NonTextProcessManager, image: np.ndar
         "clip_pid": clip_pid,
         "loaded_family": manager.get_loaded_runtime_family() or "none",
     }
+
+
+async def _run_pairwise_rotation_rounds(
+    manager: NonTextProcessManager,
+    image: np.ndarray,
+) -> list[dict[str, object]]:
+    rounds = []
+    for first_operation in _ORDERED_OPERATIONS:
+        for second_operation in _ORDERED_OPERATIONS:
+            if first_operation == second_operation:
+                continue
+
+            await asyncio.to_thread(manager.release_models_for_restart)
+            first_task = asyncio.create_task(_invoke_operation(manager, first_operation, image))
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if manager.get_loaded_runtime_family() == _ORDERED_FAMILIES[first_operation]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise RuntimeError(f"{first_operation} did not acquire the worker in time.")
+
+            second_task = asyncio.create_task(_invoke_operation(manager, second_operation, image))
+            first_completed, _pending = await asyncio.wait(
+                {first_task, second_task},
+                timeout=6.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if first_task not in first_completed:
+                raise RuntimeError(
+                    f"Rotation {first_operation}->{second_operation} let the second request complete first."
+                )
+
+            first_result = await asyncio.wait_for(first_task, timeout=6.0)
+            second_result = await asyncio.wait_for(second_task, timeout=6.0)
+            rounds.append(
+                {
+                    "first_operation": first_operation,
+                    "second_operation": second_operation,
+                    "first_pid": _extract_operation_pid(first_operation, first_result),
+                    "second_pid": _extract_operation_pid(second_operation, second_result),
+                    "loaded_family": manager.get_loaded_runtime_family() or "none",
+                }
+            )
+    return rounds
 
 
 async def _run_pressure_round(
@@ -166,15 +250,8 @@ async def _run_pressure_round(
         await asyncio.sleep(delay_seconds)
         async with semaphore:
             started = time.perf_counter()
-            if operation == "clip_img":
-                payload = await manager.get_image_embedding_async(image)
-                pid = int(payload[0])
-            elif operation == "ocr":
-                payload = await manager.get_ocr_results_async(image)
-                pid = int(payload.texts[0])
-            else:
-                payload = await manager.get_face_representation_async(image)
-                pid = int(payload[0].embedding[0])
+            payload = await _invoke_operation(manager, operation, image)
+            pid = _extract_operation_pid(operation, payload)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             records.append(
                 {
@@ -231,6 +308,7 @@ async def main() -> int:
         summary = {
             "sequential_sanity": await _run_sequential_sanity(manager, image),
             "out_of_order_round": await _run_out_of_order_round(manager, image),
+            "pairwise_rotations": await _run_pairwise_rotation_rounds(manager, image),
             "pressure_round": await _run_pressure_round(
                 manager,
                 image,

@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import logging
 import multiprocessing as mp
 import os
@@ -178,6 +179,8 @@ class NonTextProcessManager:
             "ocr": 0,
             "face": 0,
         }
+        self._wait_queue: deque[tuple[int, _NonTextFamily]] = deque()
+        self._next_wait_ticket = 0
 
         self._stopping = False
         self._last_request_activity_monotonic = time.monotonic()
@@ -203,7 +206,7 @@ class NonTextProcessManager:
 
     def _has_pending_business_activity(self) -> bool:
         with self._family_condition:
-            return self._switching or any(self._inflight.values())
+            return self._switching or bool(self._wait_queue) or any(self._inflight.values())
 
     def _snapshot_last_request_activity_monotonic(self) -> float:
         with self._request_activity_lock:
@@ -494,27 +497,45 @@ class NonTextProcessManager:
         callback: Callable[..., Any],
         *args: Any,
     ) -> Any:
-        control_task = asyncio.create_task(asyncio.to_thread(callback, *args))
-        return await asyncio.shield(control_task)
+        return await asyncio.shield(asyncio.to_thread(callback, *args))
 
     def _acquire_family(
         self,
         family: _NonTextFamily,
         abort_event: Optional[threading.Event] = None,
     ) -> bool:
+        waiter: Optional[tuple[int, _NonTextFamily]] = None
         while True:
             previous_family: Optional[_NonTextFamily]
             with self._family_condition:
+                if waiter is None:
+                    waiter = (self._next_wait_ticket, family)
+                    self._next_wait_ticket += 1
+                    self._wait_queue.append(waiter)
                 while self._switching:
                     if abort_event is not None and abort_event.is_set():
+                        self._discard_waiter_locked(waiter)
                         return False
                     if self._stopping:
+                        self._discard_waiter_locked(waiter)
                         raise RuntimeError("模型服务已关闭")
                     self._family_condition.wait(timeout=0.1)
 
+                if not self._wait_queue or self._wait_queue[0] != waiter:
+                    if abort_event is not None and abort_event.is_set():
+                        self._discard_waiter_locked(waiter)
+                        return False
+                    if self._stopping:
+                        self._discard_waiter_locked(waiter)
+                        raise RuntimeError("模型服务已关闭")
+                    self._family_condition.wait(timeout=0.1)
+                    continue
+
                 if abort_event is not None and abort_event.is_set():
+                    self._discard_waiter_locked(waiter)
                     return False
                 if self._stopping:
+                    self._discard_waiter_locked(waiter)
                     raise RuntimeError("模型服务已关闭")
 
                 previous_family = self._active_family
@@ -522,18 +543,23 @@ class NonTextProcessManager:
                     if any(self._inflight.values()):
                         self._family_condition.wait(timeout=0.1)
                         continue
+                    self._wait_queue.popleft()
                     self._active_family = family
                     self._inflight[family] += 1
+                    self._family_condition.notify_all()
                     return True
 
                 if previous_family == family:
+                    self._wait_queue.popleft()
                     self._inflight[family] += 1
+                    self._family_condition.notify_all()
                     return True
 
                 if self._inflight[previous_family] > 0:
                     self._family_condition.wait(timeout=0.1)
                     continue
 
+                self._wait_queue.popleft()
                 self._switching = True
 
             self._release_worker_process(reason=f"family-switch:{previous_family}->{family}")
@@ -576,9 +602,23 @@ class NonTextProcessManager:
         with self._process_lock:
             return self._stop_worker_locked(reason)
 
+    def _discard_waiter_locked(
+        self,
+        waiter: Optional[tuple[int, _NonTextFamily]],
+    ) -> None:
+        if waiter is None:
+            return
+        try:
+            self._wait_queue.remove(waiter)
+        except ValueError:
+            return
+        self._family_condition.notify_all()
+
     def _release_worker_when_drained(self, reason: str) -> None:
         with self._family_condition:
             while self._switching:
+                self._family_condition.wait(timeout=0.1)
+            while self._wait_queue:
                 self._family_condition.wait(timeout=0.1)
             while any(self._inflight.values()):
                 self._family_condition.wait(timeout=0.1)

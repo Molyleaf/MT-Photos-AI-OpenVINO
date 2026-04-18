@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import os
 import sys
 import time
@@ -16,6 +17,50 @@ if str(APP_DIR) not in sys.path:
 from non_text_process import NonTextProcessManager
 
 
+_ORDERED_OPERATIONS = ("clip_img", "ocr", "represent")
+_ORDERED_FAMILIES = {
+    "clip_img": "vision",
+    "ocr": "ocr",
+    "represent": "face",
+}
+
+
+def _build_operation_result(operation: str, pid: int):
+    if operation == "clip_img":
+        return [float(pid)]
+    if operation == "ocr":
+        return {
+            "texts": [str(pid)],
+            "scores": ["1.0"],
+            "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
+        }
+    if operation == "represent":
+        return [
+            {
+                "embedding": [float(pid)],
+                "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
+                "face_confidence": 1.0,
+            }
+        ]
+    raise RuntimeError(f"unsupported {operation}")
+
+
+def _extract_operation_pid(operation: str, payload) -> int:
+    if operation == "clip_img":
+        return int(payload[0])
+    if operation == "ocr":
+        return int(payload.texts[0])
+    return int(payload[0].embedding[0])
+
+
+async def _invoke_operation(manager: NonTextProcessManager, operation: str, image: np.ndarray):
+    if operation == "clip_img":
+        return await manager.get_image_embedding_async(image)
+    if operation == "ocr":
+        return await manager.get_ocr_results_async(image)
+    return await manager.get_face_representation_async(image)
+
+
 def _fake_non_text_worker(request_queue, response_queue) -> None:
     pid = os.getpid()
     response_queue.put({"kind": "ready", "pid": pid})
@@ -27,25 +72,11 @@ def _fake_non_text_worker(request_queue, response_queue) -> None:
             break
         request_id = str(message["request_id"])
         operation = str(message["operation"])
-        if operation == "clip_img":
-            result = [float(pid)]
-        elif operation == "ocr":
-            result = {
-                "texts": [str(pid)],
-                "scores": ["1.0"],
-                "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
-            }
-        elif operation == "represent":
-            result = [
-                {
-                    "embedding": [float(pid)],
-                    "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
-                    "face_confidence": 1.0,
-                }
-            ]
-        else:
+        try:
+            result = _build_operation_result(operation, pid)
+        except RuntimeError as exc:
             response_queue.put(
-                {"kind": "error", "request_id": request_id, "error": f"unsupported {operation}"}
+                {"kind": "error", "request_id": request_id, "error": str(exc)}
             )
             request_queue.task_done()
             continue
@@ -122,25 +153,11 @@ def _mixed_latency_non_text_worker(request_queue, response_queue) -> None:
         request_id = str(message["request_id"])
         operation = str(message["operation"])
         time.sleep(operation_delay_seconds.get(operation, 0.02))
-        if operation == "clip_img":
-            result = [float(pid)]
-        elif operation == "ocr":
-            result = {
-                "texts": [str(pid)],
-                "scores": ["1.0"],
-                "boxes": [{"x": "0", "y": "0", "width": "1", "height": "1"}],
-            }
-        elif operation == "represent":
-            result = [
-                {
-                    "embedding": [float(pid)],
-                    "facial_area": {"x": 0, "y": 0, "w": 1, "h": 1},
-                    "face_confidence": 1.0,
-                }
-            ]
-        else:
+        try:
+            result = _build_operation_result(operation, pid)
+        except RuntimeError as exc:
             response_queue.put(
-                {"kind": "error", "request_id": request_id, "error": f"unsupported {operation}"}
+                {"kind": "error", "request_id": request_id, "error": str(exc)}
             )
             request_queue.task_done()
             continue
@@ -312,7 +329,7 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = NonTextProcessManager(worker_target=_mixed_latency_non_text_worker)
 
         image = np.zeros((4, 4, 3), dtype=np.uint8)
-        face_task = asyncio.create_task(self.manager.get_face_representation_async(image))
+        face_task = asyncio.create_task(_invoke_operation(self.manager, "represent", image))
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
@@ -322,16 +339,95 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         else:
             self.fail("Face request did not acquire the worker in time.")
 
-        clip_task = asyncio.create_task(self.manager.get_image_embedding_async(image))
+        clip_task = asyncio.create_task(_invoke_operation(self.manager, "clip_img", image))
         face_result, clip_result = await asyncio.wait_for(
             asyncio.gather(face_task, clip_task),
             timeout=6.0,
         )
 
-        face_pid = int(face_result[0].embedding[0])
-        clip_pid = int(clip_result[0])
+        face_pid = _extract_operation_pid("represent", face_result)
+        clip_pid = _extract_operation_pid("clip_img", clip_result)
         self.assertNotEqual(face_pid, clip_pid)
         self.assertEqual("vision", self.manager.get_loaded_runtime_family())
+
+    async def test_pairwise_family_rotation_is_symmetric(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        self.manager = NonTextProcessManager(worker_target=_mixed_latency_non_text_worker)
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        for first_operation, second_operation in itertools.permutations(_ORDERED_OPERATIONS, 2):
+            with self.subTest(first=first_operation, second=second_operation):
+                await asyncio.to_thread(self.manager.release_models_for_restart)
+
+                first_task = asyncio.create_task(
+                    _invoke_operation(self.manager, first_operation, image)
+                )
+                deadline = time.monotonic() + 3.0
+                expected_first_family = _ORDERED_FAMILIES[first_operation]
+                while time.monotonic() < deadline:
+                    if self.manager.get_loaded_runtime_family() == expected_first_family:
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    self.fail(f"{first_operation} did not acquire the worker in time.")
+
+                second_task = asyncio.create_task(
+                    _invoke_operation(self.manager, second_operation, image)
+                )
+                done, _pending = await asyncio.wait(
+                    {first_task, second_task},
+                    timeout=6.0,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                self.assertIn(first_task, done)
+                self.assertNotIn(second_task, done)
+
+                first_result = await asyncio.wait_for(first_task, timeout=6.0)
+                second_result = await asyncio.wait_for(second_task, timeout=6.0)
+                first_pid = _extract_operation_pid(first_operation, first_result)
+                second_pid = _extract_operation_pid(second_operation, second_result)
+                self.assertNotEqual(first_pid, second_pid)
+                self.assertEqual(
+                    _ORDERED_FAMILIES[second_operation],
+                    self.manager.get_loaded_runtime_family(),
+                )
+
+    async def test_round_robin_three_family_requests_complete_without_deadlock(self) -> None:
+        await asyncio.to_thread(self.manager.release_all_models)
+        self.manager = NonTextProcessManager(worker_target=_mixed_latency_non_text_worker)
+
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        operation_order = ("represent", "clip_img", "ocr")
+        tasks = []
+        for index, operation in enumerate(operation_order):
+            if index == 0:
+                task = asyncio.create_task(_invoke_operation(self.manager, operation, image))
+                tasks.append(task)
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if self.manager.get_loaded_runtime_family() == _ORDERED_FAMILIES[operation]:
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    self.fail(f"{operation} did not acquire the worker in time.")
+                continue
+            tasks.append(asyncio.create_task(_invoke_operation(self.manager, operation, image)))
+
+        first_done, _pending = await asyncio.wait(
+            set(tasks),
+            timeout=6.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        self.assertIn(tasks[0], first_done)
+
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=12.0)
+        pids = [
+            _extract_operation_pid(operation, payload)
+            for operation, payload in zip(operation_order, results)
+        ]
+        self.assertEqual(3, len(results))
+        self.assertEqual(3, len(set(pids)))
+        self.assertEqual("ocr", self.manager.get_loaded_runtime_family())
 
     async def test_mixed_family_burst_requests_complete_under_pressure(self) -> None:
         await asyncio.to_thread(self.manager.release_all_models)
@@ -352,11 +448,7 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
 
         async def invoke(operation: str, delay_seconds: float):
             await asyncio.sleep(delay_seconds)
-            if operation == "clip_img":
-                return operation, await self.manager.get_image_embedding_async(image)
-            if operation == "ocr":
-                return operation, await self.manager.get_ocr_results_async(image)
-            return operation, await self.manager.get_face_representation_async(image)
+            return operation, await _invoke_operation(self.manager, operation, image)
 
         started = time.monotonic()
         results = await asyncio.wait_for(
@@ -372,12 +464,13 @@ class NonTextProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         ocr_pids = []
         face_pids = []
         for operation, payload in results:
+            operation_pid = _extract_operation_pid(operation, payload)
             if operation == "clip_img":
-                clip_pids.append(int(payload[0]))
+                clip_pids.append(operation_pid)
             elif operation == "ocr":
-                ocr_pids.append(int(payload.texts[0]))
+                ocr_pids.append(operation_pid)
             else:
-                face_pids.append(int(payload[0].embedding[0]))
+                face_pids.append(operation_pid)
 
         self.assertTrue(clip_pids)
         self.assertTrue(ocr_pids)
